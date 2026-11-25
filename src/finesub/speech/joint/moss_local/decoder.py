@@ -48,9 +48,10 @@ PREFILL_PER_TOKEN = 24_000
 #: Reserved runs 0.25-0.5 GiB above allocated on Windows (no expandable segments); a second pass in the same process
 #: went out of memory at 0.3.
 MARGIN_GIB = 0.5
-#: Prompt tokens per second of audio (50 048 for an hour), and the prompt's text around them.
+#: Prompt tokens per second of audio (50 048 for an hour), and the prompt's text around them (the upstream prompt is
+#: 64 tokens, a later part's with the Japanese example 130, plus the chat template).
 AUDIO_TOKENS_PER_SECOND = 13.9
-PROMPT_TEXT_TOKENS = 100
+PROMPT_TEXT_TOKENS = 200
 #: Upstream's prompt and its English recipe (`moss_transcribe_diarize.inference_utils.DEFAULT_PROMPT` and
 #: `examples/prompts.md`, github.com/OpenMOSS/MOSS-Transcribe-Diarize, Apache-2.0). Other languages get the default:
 #: MOSS has no language parameter, and under the Chinese prompt an English talk came out in German.
@@ -60,12 +61,29 @@ PROMPTS = {
     "en": "Transcribe the audio. For each segment, start with the timestamp and speaker ID ([S01], [S02], [S03], ...), "
           "then the spoken text, and end with the segment timestamp.",
 }
+#: Appended to the prompt of a later part's main pass (a part that starts mid-recording), per language. Without it
+#: about one later part in four wrote no commas or no sentence ends for the whole part; with it none of 77 Japanese
+#: later parts did (docs/joint-asr.md, design table, 本地 MOSS 的后段). One concrete sentence and a checked example in
+#: plain text (no timestamps or labels: given in the model's own format, it skipped the part's opening or wrote
+#: next to nothing); the example is everyday talk with no names, so there is nothing in it to read out. Gap windows
+#: keep the plain prompt; comma re-decodes (`rescue.punctuate`) take the Japanese one in every part.
+MIDSTART = {
+    "ja": "正文照常加上标点符号（如「、」「。」「？」），例如：\n" + "\n".join((
+        "そう考えると、結構前からやってたんですね。",
+        "そうだね、もう3年ぐらいかな。",
+        "え、そんなに？",
+        "うん、最初の頃はまだ全然慣れてなくて、毎回緊張してました。")),
+}
 #: MOSS_FAST_KV forces the K/V format (bf16 | fp8), to test the path the card would not pick.
 KV_FORMATS = ("bf16", "fp8")
 
 
-def prompt_for(language: str | None) -> str:
-    return PROMPTS.get((language or "").lower(), DEFAULT_PROMPT)
+def prompt_for(language: str | None, later: bool = False) -> str:
+    """The prompt for `language`; `later`: with the language's `MIDSTART` where it has one (a later part's main pass,
+    and every comma re-decode)."""
+    language = (language or "").lower()
+    prompt = PROMPTS.get(language, DEFAULT_PROMPT)
+    return prompt + MIDSTART.get(language.split("-")[0], "") if later else prompt
 
 
 def load(plan: hf_weights.HfLoad):
@@ -97,20 +115,23 @@ def fits(model, prompt_tokens: int, budget_gib: float) -> dict[str, int]:
             for kv, b in kv_row_bytes(model).items()}
 
 
-def plan_kv(model, prompt_tokens: int, want: int, budget_gib: float) -> tuple[str, int]:
+def plan_kv(model, prompt_tokens: int, want: int, budget_gib: float, kv: str | None = None) -> tuple[str, int]:
     """How to store K/V for a pass wanting `want` positions (prompt + output), and how many fit: bf16 when they all
     fit, else fp8 (about twice the positions), capped at the model's context. bf16 first because 8-bit K/V is not
     only noise: int8 flipped an English talk into Spanish; fp8 with a one-forward prefill flipped nothing on the 11
-    test clips, its divergence the size of the fused kernels'."""
+    test clips, its divergence the size of the fused kernels'. `kv` given: that format, whatever fits (the forced
+    decode's blocks write bf16 only, `blocks`)."""
     room = fits(model, prompt_tokens, budget_gib)
-    kv = _forced_kv() or ("bf16" if room["bf16"] >= want or not fp8_kernels() else "fp8")
+    kv = kv or _forced_kv() or ("bf16" if room["bf16"] >= want or not fp8_kernels() else "fp8")
     return kv, room[kv]
 
 
-def longest_pass(model, out_per_second: float, budget_gib: float, text_tokens: int = PROMPT_TEXT_TOKENS) -> float:
+def longest_pass(model, out_per_second: float, budget_gib: float, text_tokens: int = PROMPT_TEXT_TOKENS,
+                 kv: str | None = None) -> float:
     """Seconds of audio one pass holds within the budget, in whole minutes: its prompt and `out_per_second` output
-    tokens (+ 512) in the most compact K/V format the card runs. A longer source is cut into parts."""
-    kv = _forced_kv() or ("fp8" if fp8_kernels() else "bf16")
+    tokens (+ 512) in the most compact K/V format the card runs (`kv` given: in that one). A longer source is cut
+    into parts."""
+    kv = kv or _forced_kv() or ("fp8" if fp8_kernels() else "bf16")
     for minutes in range(90, 0, -1):  # upstream: up to 90 minutes in one pass
         prompt = int(AUDIO_TOKENS_PER_SECOND * 60 * minutes) + text_tokens
         if fits(model, prompt, budget_gib)[kv] >= prompt + out_per_second * 60 * minutes + 512:
@@ -282,20 +303,21 @@ def _into_buffers():
     return IntoBuffers
 
 
-def check_transformers() -> None:
+def check_transformers(backend: str = "moss-local") -> None:
     """Fail with a sentence, not a traceback, when transformers is missing or its internals moved: the prefill
-    writes through `Cache` / `DynamicLayer` and swaps `use_gqa_in_sdpa` (verified on transformers 5.14.1)."""
+    writes through `Cache` / `DynamicLayer` and swaps `use_gqa_in_sdpa` (verified on transformers 5.14.1).
+    `backend`: the `--asr` value the sentence names."""
     try:
         import transformers
     except ImportError as e:
-        raise RuntimeError('--asr moss-local needs the [asr] extra: pip install -e ".[asr]"') from e
+        raise RuntimeError(f'--asr {backend} needs the [asr] extra: pip install -e ".[asr]"') from e
     try:
         import transformers.integrations.sdpa_attention as hf_sdpa
         from transformers.cache_utils import Cache, DynamicLayer  # noqa: F401
 
         hf_sdpa.use_gqa_in_sdpa  # noqa: B018
     except (ImportError, AttributeError) as e:
-        raise RuntimeError(f"--asr moss-local does not run on transformers {transformers.__version__}: {e} "
+        raise RuntimeError(f"--asr {backend} does not run on transformers {transformers.__version__}: {e} "
                            "(verified on 5.14.1)") from e
 
 
@@ -316,9 +338,10 @@ def _expanded_kv_sdpa() -> Iterator[None]:
 
 class Decoder:
     """Greedy-capable single-sequence decoder over one prompt. `logits(token)` appends `token` at `self.pos` and
-    returns the next-token logits (float32, on the GPU); `self.pos = k` rewinds."""
+    returns the next-token logits (float32, on the GPU); `self.pos = k` rewinds. `kv`: the K/V format, else as
+    `plan_kv` picks."""
 
-    def __init__(self, model, inputs, budget: int, budget_gib: float):
+    def __init__(self, model, inputs, budget: int, budget_gib: float, kv: str | None = None):
         from transformers.cache_utils import Cache
 
         lm = model.model.language_model
@@ -329,7 +352,7 @@ class Decoder:
         self.inv_freq = lm.rotary_emb.inv_freq.float()
         self.scaling = self.d ** -0.5
         n = inputs["input_ids"].shape[1]
-        kv, room = plan_kv(model, n, n + budget, budget_gib)
+        kv, room = plan_kv(model, n, n + budget, budget_gib, kv)
         self.max = min(room, -(-(n + budget) // BUCKET) * BUCKET)
         if self.max - n < 256:
             raise RuntimeError(f"prompt {n} tokens leaves no room in the VRAM budget ({room} K/V positions)")

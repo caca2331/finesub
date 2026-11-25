@@ -52,6 +52,7 @@ from ..knowledge.style import StyleCatalog, StyleChoice
 from ..prepare_prompts import (
     STYLE_SELECTION_TAG,
     build_prepare_results_message,
+    prepare_collects_feedback,
     build_prepare_task_messages,
 )
 from ..prompts import ContextPack, r1_request_cap
@@ -411,6 +412,9 @@ def run_prepare_task(
     knowledge_indexes = glossary_store.with_index(load_index_texts(knowledge_root), knowledge_root) if knowledge_enabled else {}
     entries_available = index_texts_present(knowledge_indexes)
     local_search = profile.external_injection
+    collect_task_feedback = prepare_collects_feedback(
+        collect_task_feedback, correct_only=profile.correct_only, emits_entries=entries_available,
+        searches=local_search or profile.native_search)
     # Stage C: an agentic executor (a tool session on the harness server)
     # fetches for itself -- the request channel closes and one reply delivers.
     strategy, _source = resolve_execution_strategy(
@@ -615,6 +619,7 @@ def run_prepare_task(
                     emits_keep=emits_keep,
                     style_selection=bool(catalog_text),
                     knowledge=entries_available,
+                    correct_only=profile.correct_only,
                 ),
             ]
             return _call(history, turn="t2", allow_requests=False, kind=DELIVERY_TURN_KIND)

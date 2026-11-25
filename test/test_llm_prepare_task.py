@@ -741,7 +741,7 @@ def test_a_requested_game_glossary_is_picked_not_read_as_an_entry(tmp_path) -> N
 
     root = _knowledge_root(tmp_path, with_index=True)
     glossary = glossary_store.install(root, json.dumps({
-        "format": 1, "game": {"name": "原神", "aliases": ["Genshin"], "intro": "原神的官方日中专名对照"},
+        "format": 2, "game": {"name": "原神", "aliases": ["Genshin"], "intro": "原神的官方日中专名对照"},
         "built": "2026-11-12", "terms": [{"ja": "テイワット", "zh": "提瓦特", "core": True}],
     }, ensure_ascii=False).encode("utf-8"))
     client = RecordingClient([REQUEST.replace("主播A\n</requested_entries>", "主播A\nglossary/原神\n</requested_entries>"),

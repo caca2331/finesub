@@ -1,1 +1,1 @@
- and the web search and page fetch tools this project entitles, which you may use to look up facts the task asks about
+ and your own CLI's built-in web search and page fetch tools, where it has them (not `finesub` ones), which you may use to look up facts the task asks about

@@ -50,7 +50,12 @@ FRAME = lab.FRAME
 
 
 def timeline_probs(tracks, frames):
-    """(frames, tracks) 0/1 activity from a `-diar.json` track list."""
+    """(frames, tracks) 0/1 activity from a `-diar.json` track list.
+
+    Columns are the sorted track ids renumbered 0..K-1, not the raw ids (production Nemotron-3 + vbx ids often
+    start at 1). Map `cost_metrics.owner_of_tracks` results back to raw ids (`llm_retrack.owners()`) before
+    matching them against raw tracks, or stay on column numbers throughout.
+    """
     ids = sorted({int(t["track"]) for t in tracks})
     index = {track: i for i, track in enumerate(ids)}
     probs = np.zeros((frames, max(1, len(ids))), dtype=np.float32)

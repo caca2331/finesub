@@ -17,8 +17,8 @@ duplicated across the physical window overlaps) the pack groups
 - ``refined_csv``     — (refined mode only) the user-refined SRT rows whose
                         time range falls into the window.
 
-Packs are then chunked so the combined CSV text stays under the 100k-token
-budget; chunk boundaries always sit on window boundaries.
+Packs are then chunked (`plan_knowledge_chunks`, the budget from `update._plan_chunks`) so what travels with
+the windows stays under the chunk budget; chunk boundaries always sit on window boundaries.
 """
 
 from __future__ import annotations
@@ -50,9 +50,9 @@ from ..routing.config import DEFAULT_LIMITS
 from finesub.subtitles.model import SrtSegment, parse_srt
 
 
-# §1.7: combined window/refined CSV text per LLM call, when no route declaration says otherwise (the
+# §1.7: the material travelling with a chunk's windows (CSV, feedback, context slices) per LLM call, when no route declaration says otherwise (the
 # knowledge group's rows may each state their own: `routing.config.QUALITY_CAPS`).
-KNOWLEDGE_CSV_TOKEN_BUDGET = DEFAULT_LIMITS.knowledge_csv_tokens
+KNOWLEDGE_CHUNK_TOKEN_BUDGET = DEFAULT_LIMITS.knowledge_chunk_tokens
 
 # Evidence modes (§1.3).
 MODE_ARTIFACTS_ONLY = "artifacts_only"
@@ -525,7 +525,8 @@ class KnowledgeChunk:
 
     index: int
     windows: tuple[WindowMaterials, ...]
-    csv_tokens: int
+    #: what travels with the windows (`WindowMaterials.pack_text`), as planned; 0 for a half of a split chunk
+    material_tokens: int
 
     @property
     def window_ids(self) -> tuple[str, ...]:
@@ -551,9 +552,10 @@ def plan_knowledge_chunks(
     window_materials: Sequence[WindowMaterials],
     *,
     count_tokens: Callable[[str], int],
-    csv_token_budget: int = KNOWLEDGE_CSV_TOKEN_BUDGET,
+    token_budget: int = KNOWLEDGE_CHUNK_TOKEN_BUDGET,
 ) -> list[KnowledgeChunk]:
-    """Sequentially group window packs so CSV text stays under the budget.
+    """Sequentially group window packs so what travels with them (`WindowMaterials.pack_text`: the CSVs, the
+    feedback and context slices) stays under ``token_budget``.
 
     Cuts only on window boundaries and never overlaps chunks. A single window
     over the budget still becomes its own chunk (windows are never split);
@@ -563,24 +565,20 @@ def plan_knowledge_chunks(
     chunks: list[KnowledgeChunk] = []
     current: list[WindowMaterials] = []
     current_tokens = 0
+
+    def close() -> None:
+        chunks.append(KnowledgeChunk(index=len(chunks), windows=tuple(current), material_tokens=current_tokens))
+
     for materials in window_materials:
-        tokens = count_tokens(materials.csv_text)
-        if current and current_tokens + tokens > csv_token_budget:
-            chunks.append(
-                KnowledgeChunk(
-                    index=len(chunks), windows=tuple(current), csv_tokens=current_tokens
-                )
-            )
+        tokens = count_tokens(materials.pack_text())
+        if current and current_tokens + tokens > token_budget:
+            close()
             current = []
             current_tokens = 0
         current.append(materials)
         current_tokens += tokens
     if current:
-        chunks.append(
-            KnowledgeChunk(
-                index=len(chunks), windows=tuple(current), csv_tokens=current_tokens
-            )
-        )
+        close()
     return chunks
 
 
@@ -590,17 +588,18 @@ def plan_knowledge_chunks(
 
 @dataclass(frozen=True)
 class KnowledgeMaterials:
-    """Everything the unified knowledge update needs, ready for prompting."""
+    """Everything the unified knowledge update needs, ready for prompting; the update cuts the windows into
+    chunks (`plan_knowledge_chunks`) once it knows how much the rest of its prompt takes."""
 
     mode: str
-    chunks: tuple[KnowledgeChunk, ...]
+    windows: tuple[WindowMaterials, ...]
     feedback: FeedbackAggregate
     general_context: str
     warnings: tuple[str, ...] = ()
 
     @property
     def window_count(self) -> int:
-        return sum(len(chunk.windows) for chunk in self.chunks)
+        return len(self.windows)
 
 
 def _load_context_pack(path: str | Path | None) -> ContextPack:
@@ -623,10 +622,8 @@ def build_knowledge_materials(
     research_context: str | Path | None = None,
     artifact_dirs: Sequence[str | Path] = (),
     refined_srt: str | Path | None = None,
-    count_tokens: Callable[[str], int],
-    csv_token_budget: int = KNOWLEDGE_CSV_TOKEN_BUDGET,
 ) -> KnowledgeMaterials:
-    """Load task outputs and assemble the chunked window packs."""
+    """Load task outputs and assemble the window packs."""
 
     warnings: list[str] = []
     stable_segments, layer = load_product_segments(stable_json)
@@ -681,14 +678,9 @@ def build_knowledge_materials(
         )
         for group in groups
     ]
-    chunks = plan_knowledge_chunks(
-        window_materials,
-        count_tokens=count_tokens,
-        csv_token_budget=csv_token_budget,
-    )
     return KnowledgeMaterials(
         mode=mode,
-        chunks=tuple(chunks),
+        windows=tuple(window_materials),
         feedback=feedback,
         general_context=context_pack.general_text_whole(),
         warnings=tuple(warnings),

@@ -65,7 +65,7 @@ note = "自己的 DeepSeek key"
 | `max_output_tokens` | | 65536 |
 | `context_window` | | **不写 = 输入与输出是两份独立的上限**（Gemini 的形态）。**输入与输出共用一个上限的服务必须填**（Codex、Anthropic：答案和提示词花的是同一份预算）；填了之后一窗能放的输入会比 `max_input_tokens` 略小，差额留给答案。⚠ 填得比 `max_input_tokens` 或 `max_output_tokens` 小会**直接报错**。出厂各行为什么这样填，见 [`llm_harness_routing.md`](../llm_harness_routing.md)「模型配置、速率限制与显式 reasoning」（开发者参考） |
 | `supports_audio` / `supports_video` | | `false`。能不能听音频、看视频；做不了的调用会跳过它，交给组里下一个。`openai_compat` / `anthropic` 两种接口**不允许**声明音视频；只有 Gemini API 与 agy 的行可以 |
-| `supports_native_search` | | Gemini 两档、五个本地 agent 与 `anthropic` 接口的端点为 `true`；`openai_compat` 端点写了 `search_request` 才为 `true`；会话 agent 为 `false`。这个模型能不能用它那家的搜索工具；只有 `--llm-retrieval native` 的调用才会真的把工具交给它，见[检索开关](model-routing.md#检索开关优先-native)。出厂只有免费档的 Gemini 3.x 写了 `false`。⚠ dsh 的搜索要绑 DeepSeek 的 API key，每次搜索扣少量费用（[`agent.md`](agent.md) 4.1）。自定义端点见[自己的端点联网搜索](#自己的端点联网搜索) |
+| `supports_native_search` | | Gemini 两档、五个本地 agent 与 `anthropic` 接口的端点为 `true`；`openai_compat` 端点写了 `search_request` 才为 `true`；会话 agent 为 `false`。这个模型能不能用它那家的搜索工具；只有 `--llm-retrieval native` 的调用才会真的把工具交给它，见[检索开关](model-routing.md#检索开关优先-native)。出厂只有免费档的 Gemini（3.x 与 4 Hydrogen）写了 `false`。⚠ dsh 的搜索要绑 DeepSeek 的 API key，每次搜索扣少量费用（[`agent.md`](agent.md) 4.1）。自定义端点见[自己的端点联网搜索](#自己的端点联网搜索) |
 | `search_request` | | 空。只给 `openai_compat` 端点：这家 API 开搜索要加的请求字段，写成内联表，`--llm-retrieval native` 的调用才并进请求体，见[自己的端点联网搜索](#自己的端点联网搜索) |
 | `video_high_resolution_only` | | `false`。为 `true` 时，该模型参与的媒体格按高分辨率视频的费率算 token（窗口切得更小）；出厂只为 agy 的 Gemini 开 |
 | `thinking` | | `true`（high / medium / low 原样发出），见下 |
@@ -77,8 +77,8 @@ note = "自己的 DeepSeek key"
 | `capability` | | 能力档，四档之一：`very-low`（极低）/ `low`（低）/ `medium`（中）/ `high`（高），写成字符串（`"medium"`）。只用来生成告警，不参与路由。**不写 = 没有判断**，按「高」算并在日志里记一条 note；想让能力下限对它生效就填一档。也收 0–100 的整数分数，读成它够得着的最高一档：50 起是低、70 起是中、90 起是高，不到 50 是极低（写成字符串的 `"77"` 会报错） |
 | `avoid` | | 空。不推荐用于哪些任务组、为什么：`avoid = { knowledge = "原因" }`（组名是 `correction-mm` / `correction-text` / `research` / `knowledge`，拼错加载报错）。把这个模型绑进这些组的**任何一档**格子时告警一次，带上原因；不参与路由。出厂 GPT-6 Luna 与 Haiku 写了 `knowledge` |
 | `note` | | 空。给人看的备注，程序不读 |
-| `quota_pool` | | 取 `provider_tier`。**只对本地 agent 有意义**：一个订阅额度用完时，同池的模型会一起被停用（见 [`agent.md`](agent.md) [§6 异常处理](agent.md#6-异常处理)）。三种写法——**留空** = 该 tier 一份额度；**`per-model`** = 这一行自己一份（池名自动派生，所以新增一条独立计量的线不用起名字）；**写一个名字** = 明确和写了同一个名字的行共用。出厂 agy 的行写了 `AGY_GEMINI` / `AGY_ANTHROPIC` / `AGY_ARGON`（Gemini 4 Argon 单独一份），CodeBuddy 的免费线写 `per-model`、付费行写 `CODEBUDDY_CREDITS`（它们花的是同一份积分）。⚠ **这两个 tier 上不写会直接报错**：一个 CLI 背后有好几份分开计量的额度，「按 tier」在那里不是答案，猜哪边都会把某类行记错——报错文本会告诉你该写哪个 |
-| `prepare_chunk_tokens` / `window_subtitle_tokens` / `knowledge_csv_tokens` | | 50000 / 10000 / 100000。三个**质量上限**，见下面的[三个质量上限](#三个质量上限) |
+| `quota_pool` | | 取 `provider_tier`。**只对本地 agent 有意义**：一个订阅额度用完时，同池的模型会一起被停用（见 [`agent.md`](agent.md) [§6 异常处理](agent.md#6-异常处理)）。三种写法——**留空** = 该 tier 一份额度；**`per-model`** = 这一行自己一份（池名自动派生，所以新增一条独立计量的线不用起名字）；**写一个名字** = 明确和写了同一个名字的行共用。出厂 agy 的行写了 `AGY_GEMINI` / `AGY_ANTHROPIC`，CodeBuddy 的免费线写 `per-model`、付费行写 `CODEBUDDY_CREDITS`（它们花的是同一份积分）。⚠ **这两个 tier 上不写会直接报错**：一个 CLI 背后有好几份分开计量的额度，「按 tier」在那里不是答案，猜哪边都会把某类行记错——报错文本会告诉你该写哪个 |
+| `prepare_chunk_tokens` / `window_subtitle_tokens` / `knowledge_chunk_tokens` | | 50000 / 10000 / 110000。三个**质量上限**，见下面的[三个质量上限](#三个质量上限) |
 
 ### 三个质量上限
 
@@ -88,9 +88,10 @@ note = "自己的 DeepSeek key"
 | --- | --- | --- | --- | --- |
 | 准备任务一块转写多长就分块 | `research` | `prepare_chunk_tokens` | `research_transcript_max_tokens` | 50000 |
 | 一个纠错窗口的字幕多长 | 纠错（准备任务规划的是同一批窗口，也看它） | `window_subtitle_tokens` | `max_window_subtitle_tokens` | 10000 |
-| 知识更新一块的三份 CSV 合计多长 | `knowledge` | `knowledge_csv_tokens` | 没有 | 100000 |
+| 知识更新一块里随窗口走的材料（这几窗的 CSV 与反馈、上下文切片）合计多长；整块放不进模型的输入上限时还会切得更小 | `knowledge` | `knowledge_chunk_tokens` | 没有 | 110000 |
 
 - 只影响规划（窗口与块怎么切），不影响调用本身。catalog 里只收 ≥1 的整数，0 与负数加载即报错。
+- 旧的键名 `knowledge_csv_tokens`（只数 CSV、出厂 100000）已经改名：catalog 里还写着它时加载即报错，提示改写成 `knowledge_chunk_tokens`。
 - 一个组按**组内最小值**规划，没写的成员按出厂值参与比较——**想调大，组里每个成员都要写**；组内不一致时启动告警一次，点名是谁定的。
 - `config.toml` 里写了就压过模型的值。想关掉纠错窗口的字幕上限，写 `max_window_subtitle_tokens = 0`：窗口只随模型的输出上限变大，
   这道上限原本挡住的「窗口太大、纠错变粗」就没人管了。

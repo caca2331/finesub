@@ -91,7 +91,7 @@ agy 的 native 调用走**另一个 project**（2026-08-15 打通，见 [§5 Boo
 | `local-agy-opus-5_5` | `LOCAL_AGY` | Opus 5.5（`claude-opus-5-5`），同上但**不进任何模型组**，只能 `--llm-model` 点名（2026-10-03 起组里换成 Sonnet） |
 | `local-agy-gemini-3_8-flash` | `LOCAL_AGY` | Gemini 3.8 Flash，收音视频，额度池 `AGY_GEMINI`（3.7 Flash 2026-10-12 从 agy 下线）；2026-11-13 起不进出厂 agy 组，只能点名 |
 | `local-agy-gemini-4-hydrogen` | `LOCAL_AGY` | Gemini 4 Hydrogen（`gemini-4-hydrogen`），收音视频，参数照 3.8 Flash，额度池按 `AGY_GEMINI` 记（与 3.8 同池是估计，没实测）；2026-11-13 起是每个出厂 agy 组里的 Gemini，替下 3.8 Flash |
-| `local-agy-gemini-4-argon` | `LOCAL_AGY` | Gemini 4 Argon（`gemini-4-argon`），收音视频，参数照 3.8 Flash；额度池 `AGY_ARGON`（Pro 订阅上单独一份、只按周计，2026-10-18）；每个出厂 agy 组里紧跟 Hydrogen，当它的替补 |
+| `local-agy-gemini-4-neon` | `LOCAL_AGY` | Gemini 4 Neon（`gemini-4-neon`），收音视频，窗口照 Hydrogen，额度池 `AGY_GEMINI`；每个出厂 agy 组里紧跟 Hydrogen，当它的故障替补；额度用完时同池，通常各失败一次、探一次后一起冻结（2026-11-23） |
 
 Claude 的几行给 CLI 的是别名 `opus` / `sonnet` / `haiku`，Claude Code 每次解析到该系列的最新模型（2026-11-08，Claude Code 2.1.302：`claude-opus-5-5`、`claude-sonnet-5-5`、`claude-haiku-5-5`），升级不用改 catalog，名字里因此不带版本号（2026-11-09 起）。catalog 这几行的窗口与输出上限不随升级更新，换代时要核一次。
 
@@ -120,8 +120,8 @@ Claude 是分开计量的：冻结一个不该带走另一个。
 
 | 模型组 | 成员顺序 | 绑定的格子 |
 | --- | --- | --- |
-| `agy-capable` | free Gemini 4 Hydrogen → free 3.8 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Argon | correction-mm/text 的 quality+intermediate、knowledge/quality |
-| `agy-basic` | free 3.6 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Argon | research 的 quality |
+| `agy-capable` | free Gemini 4 Hydrogen → free 3.8 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Neon | correction-mm/text 的 quality+intermediate、knowledge/quality |
+| `agy-basic` | free 3.6 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Neon | research 的 quality |
 
 Sonnet 是纯文本，排在媒体 target 之前是**有意的**：文本窗优先用它，带剪辑的窗在能力过滤时自动
 跳过、落到 agy 前置的那个 Gemini。一个组、一次绑定，不需要为多模态再开一格。
@@ -140,9 +140,9 @@ provenance 完整；agy 见 [§5 Bootstrap、授权与 Goal](#5-bootstrap授权�
 Claude 在后使得只装了其中一个 CLI 的机器仍有可用链路（readiness 预筛会丢掉缺失的那一家）。
 
 能力档（2026-11-08 从分数改成四档，取自 owner 的派遣目标表，表里没有的由 owner 定）：Luna 低、Terra 中、Sol 高、
-Claude Code 的 Opus 与 Sonnet 高、Haiku 低；agy 的 Opus 5.5、Sonnet 5.5 高（与 Claude Code 那两行是同一个模型）、Gemini 3.8 Flash 中、Gemini 4 Argon 高。抽象 high/medium/low 的映射为
+Claude Code 的 Opus 与 Sonnet 高、Haiku 低；agy 的 Opus 5.5、Sonnet 5.5 高（与 Claude Code 那两行是同一个模型）、Gemini 3.8 Flash 与 Gemini 4 Hydrogen 中、Gemini 4 Neon 高。抽象 high/medium/low 的映射为
 Luna `xhigh/high/medium`、Sol 与 Terra `high/high/low`、Opus 5 `xhigh/high/low`、
-Sonnet `high/medium/low`、Haiku `xhigh/high/medium`（2026-11-08 owner 提一档，与 Luna 同）、agy 的 Claude 两行恒等，而 **agy Gemini 3.8 与 Gemini 4 Argon 是 `medium/medium/low`**
+Sonnet `high/medium/low`、Haiku `xhigh/high/medium`（2026-11-08 owner 提一档，与 Luna 同）、agy 的 Claude 两行恒等，而 **agy Gemini 3.8、Gemini 4 Hydrogen 与 Gemini 4 Neon 是 `medium/medium/low`**
 （它同档多想约 1.5 倍，high 被压回 medium；medium 那格故意不再下探，见
 [`llm_harness_routing.md`](llm_harness_routing.md)「LLM thinking effort」）。
 **agy 的每个模型都收 `--effort low|medium|high`，Claude 不带就拒绝发车**（2026-10-03 实测，agy 1.2.16：
@@ -812,8 +812,8 @@ Codex 模型直接走到同订阅的另一个，再从一个 Claude 模型连走
 **额度是厂商计量那条线的属性，catalog 行只是指向它**。`quota_pool` 列三种写法：留空 = 该
 provider tier 一份（一个订阅背着整个 tier 时才对）；哨兵 `per-model` = **这一行自己一份**，
 池名派生成 `<tier>:<model>`，于是新增一条独立计量的线不用起名字；写字面量 = 明确共享那个池。
-两家不是「一个订阅一份」：agy 的 `AGY_GEMINI` / `AGY_ANTHROPIC` / `AGY_ARGON`（一个 CLI 后面三份分开计量的
-额度，按 tier 冻结会因为 Gemini 用尽而把还能用的 Claude 一起停掉；Argon 那份是 Pro 订阅上单独给的，只有周额度；Ultra 上 Argon 从 Gemini 那份里花、另有自己的上限，`AGY_ARGON` 照样单独记——额度只从失败推断，所以 Argon 自己的上限用完只停 Argon，Gemini 那份用完时 Argon 最多再失败两次、ping 一次才停（报错明说用尽时立即停），代价就是这几次调用），以及 codebuddy 的
+两家不是「一个订阅一份」：agy 的 `AGY_GEMINI` / `AGY_ANTHROPIC`（一个 CLI 后面两份分开计量的
+额度，按 tier 冻结会因为 Gemini 用尽而把还能用的 Claude 一起停掉），以及 codebuddy 的
 **一条免费线一份 + 全部付费共用 `CODEBUDDY_CREDITS`**（见 [§12.1.5 codebuddy](#1215-codebuddy第五家-driverclaude-code-的分支2026-09-04-接线)）。
 
 ✱ **这两个 tier 上留空是加载期错误**（`TIERS_METERED_PER_LINE`），报错文本直接给出两个可写的

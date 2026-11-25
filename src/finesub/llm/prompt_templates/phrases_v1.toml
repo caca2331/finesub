@@ -41,7 +41,7 @@ duty_request_search = "需要时先提出值得联网查证的搜索 query"
 duty_tools = "需要查证的内容用授权的工具自己取得"
 # The closing reminder, before the trailing blocks: with a request channel, or delivering at once
 closing_may_request = "需要外部输入时按 system 指令只输出 `<analysis_notes>` 与请求块并结束；否则直接输出有且仅有一个 `<context_pack>` 块"
-closing_deliver = "输出有且仅有一个 `<context_pack>` 块"
+closing_deliver = "交付终稿时先写有且仅有一个 `<context_pack>` 块"
 
 [prepare_background]
 # The preparation's background list, in order; Python numbers the items it keeps (`prompts._numbered`):
@@ -84,6 +84,55 @@ proofread_style_rank = "其中的风格要求与下面翻译风格里的「特�
 # 「整批校验不过时的拒收」.
 one_by_one = "被拒绝的行只记录在 apply 报告里，不影响其余行。"
 whole_batch = "格式不对、句柄对不上这类只关一行的问题，那一行单独被拒、记在 apply 报告里，其余行照常；整批写进去之后才查得出的问题（例如挪动或改写之后，同一节里出现两行同一个 `[标记]`）会让这一批全部不提交。"
+
+[name_check]
+# One line of the name check's `$claims_text` (`knowledge/name_check.render_name_check_prompt`): the row, the note on a
+# line sent because its name contains another's, and each clue a task's search left on it (`knowledge/name_check_step.py`):
+# where it came from (`origin_*`), the spelling found with its page and quote, or the query that found nothing.
+row = "- ${claim_id}（条目「${subject}」）：${surface}|${zh}|${desc}"
+derived = "\n  一并送来：它的中文定名里含着 ${parent} 的中文定名"
+origin_prepare = "准备任务"
+origin_window = "窗口 ${window}"
+clue = "\n  线索（${origin}）：搜到写法「${found}」"
+clue_source = "，页面 ${url}"
+clue_quote = "，摘录「${quote}」"
+clue_none = "\n  线索（${origin}）：搜了「${query}」，没搜到中文写法"
+# How the session searches: the model's own search, or the harness's (the local path: the clue pages fetched ahead,
+# then the queries the session lists, `kb_name_check_local_results_v1.md`), with what heads each fetched page and
+# each query's results, and what round two says when there is nothing to read.
+search_native = "联网搜。"
+# the native route only: a search that failed is the session's to report (`name_check.SEARCH_FAILED`); on the local
+# route the harness searched and already leaves a line it read nothing for unanswered
+search_failed_native = "搜索工具报错、连不上网，或者根本没法搜，以致没能照上面的做法查完时，`kind` 判 `search_failed`，不写 `set`，`note` 写碰到了什么；其余 "
+search_local = "你这次不能自己联网，只读这里给的页面与搜索结果：还要查的行，这一轮列出要搜的 query，下一轮给你搜索结果，再逐行下结论。"
+page_owner = "${ids} 的线索页面："
+result_owner = "${ids} 的 query："
+no_queries = "（这一轮没有搜索：你没有列 query）"
+no_material = "这几行没取到任何页面、也没有搜索结果，这次不用给结论：${ids}\n"
+
+[name_check_repair]
+# What the name check's repair round says is wrong with a line (`knowledge/name_check._repair_prompt`), one per
+# problem `parse_name_check_answer` finds.
+missing = "- ${id}：没有给结论"
+verdict = "- ${id}：verdict 只能是 confirmed、corrected、not_found 之一"
+url = "- ${id}：confirmed 与 corrected 要在 url 里填你读到的、写着中文定名的那个页面的地址"
+set = "- ${id}：set 不合格：要是一个对象，只写 source、zh、desc 里要改的列，值是不带换行的文字，原文与中文定名不能为空、不能含「|」；corrected 至少要改一列，not_found 不写 zh"
+
+[name_check_retry]
+# Why the name check's answer does not read at all (`knowledge/name_check.parse_name_check_answer`), the
+# `$error` of `kb_name_check_retry_v1.md`.
+blocks = "要有且仅有一个 `<${tag}>` 块，这份回答里有 ${count} 个"
+array = "`<${tag}>` 里要是一个 JSON 数组"
+json = "`<${tag}>` 里的 JSON 解析不了（第 ${line} 行第 ${column} 列附近）"
+
+[name_checks]
+# The 未核 name conflicts a searching session records (`prompt_compose.search_rules_shared`), and where a correct-only
+# task's name-check-only feedback block goes (`prompts._name_checks_feedback_block`); `settled_by_background` is what
+# a window's term-line note adds to the spellings it takes (`prompt_compose.kb_term_lines_note`).
+settled_by_background = "、或背景调查定下的"
+conflict_record = "（`（未核）`、`（未核，查不到）` 行的定名与搜索结果不一致的不在此列，只记在 `<task_update_feedback>` 的 `name_checks`）"
+position_prepare = "交付时，在上述全部规定输出之后，最后"
+position_window = "请在${clause}，最后"
 
 [proofread_requests]
 # Pass 3's user-requests block (`proofread_user_requests_v1.md`) opens by saying where the requests are: the

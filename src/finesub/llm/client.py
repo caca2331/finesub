@@ -296,11 +296,17 @@ def _agent_task_inputs(
         metadata["kb_root"] = knowledge_binding["root"]
         metadata["kb_tools"] = knowledge_binding["entitlement"]
         # The MCP server books `exposed` from its own process; the gate is
-        # decided here, where the knowledge root was chosen.
-        from .knowledge.base import knowledge_signals_enabled
+        # decided here, where the knowledge root was chosen. So is the run's
+        # reading: a correct-only task's kb tools answer in its projection,
+        # and the server cannot see this thread's context.
+        from .knowledge.base import entry_signals_enabled, reads_correct_only, reads_trust_marks
 
-        if not knowledge_signals_enabled(knowledge_binding["root"]):
+        if not entry_signals_enabled(knowledge_binding["root"]):
             metadata["kb_signals"] = "off"
+        if reads_correct_only():
+            metadata["kb_correct_only"] = True
+        if reads_trust_marks():
+            metadata["kb_trust_marks"] = True
         # Signal identity for the exposure ledger (plan §5.1): the runtime's
         # own task_id is a constant ("call") on per-call assignments, so the
         # caller names the run task and window its events should join with.
@@ -516,6 +522,12 @@ def write_agent_session_usage(artifact_dir: Path | str, registry: Any) -> Path |
 # is the route chain's problem.
 AGENT_PREMATURE_STOP_RETRIES = 1
 
+# The conversation key of a resumable single-task tool session. To the driver
+# a key is only the CLI's working directory (where it finds its sessions); the
+# conversation is the handle. So every tool session shares one: a key per call
+# would leave a directory per call in the domain and in the CLI's own store.
+TOOL_SESSION_CONVERSATION_KEY = "tool-session"
+
 
 def _harness_request_id(session_id: str, operation: str) -> str:
     """``H(caller_session_id, caller_sequence)`` for the harness itself.
@@ -596,6 +608,140 @@ def _retire_agent_task(
         )
     except StaleLeaseError:
         return
+
+
+def _accept_session_text(
+    runtime: Any, assignment_id: str, record: Mapping[str, Any], *, input_hash: str, session_id: str, text: str
+) -> Mapping[str, Any] | None:
+    """Offer a finished session's final chat text as its answer (docs §4).
+
+    For a session that never submitted and still holds its lease; ``None``
+    when there is nothing to judge (no text, or the lease is gone). The
+    runtime accepts only a pass and otherwise changes nothing; the verdict
+    says under ``passed`` whether it delivered (accepted, or owing its
+    proofread turn), and either way the run gets an `agent-session-text`
+    warning.
+    """
+
+    from .agent.agent_task_runtime import StaleLeaseError
+
+    if not text.strip() or not record.get("lease_owner"):
+        return None
+    try:
+        verdict = runtime.accept_session_text(
+            assignment_id=assignment_id,
+            task_id=str(record["task_id"]),
+            worker_id=str(record["lease_owner"]),
+            lease_generation=int(record["lease_generation"]),
+            request_id=_harness_request_id(session_id, "session-text"),
+            input_hash=input_hash,
+            candidate=text,
+        )
+    except StaleLeaseError:
+        return None
+    if verdict.get("status") == "submitted":
+        return None
+    now = runtime.task_record(assignment_id=assignment_id, task_id=str(record["task_id"]))
+    passed = now["status"] == "accepted" or _proofread_left(
+        dict(now.get("proofread") or {}), now.get("last_candidate")
+    ) is not None
+    current_reporter().warning(
+        "agent-session-text",
+        f"agent session {session_id} left its answer as text, not a submit; "
+        + ("it passed validation and is taken as the answer" if passed else
+           f"it did not pass: {'; '.join(verdict.get('validation_errors') or []) or verdict.get('status')}"),
+    )
+    return {**verdict, "passed": passed}
+
+
+def _resumes_tool_session(driver: Any) -> bool:
+    """Whether this driver runs the single-task tool session as a resumable
+    conversation (`resumes_tool_sessions`, and a probe that says it can)."""
+
+    if not getattr(driver, "resumes_tool_sessions", False):
+        return False
+    try:
+        return bool(driver.probe().supports_session_reuse)
+    except Exception:
+        return False
+
+
+def _session_followup(
+    text: str, verdict: Mapping[str, Any] | None, *, resumed: bool, opening: str, limits: Any
+) -> str:
+    """The turn after a premature stop (docs §4): resumed, it asks again in the
+    session's own conversation; otherwise it follows ``opening`` (the fresh
+    session's) and carries the last chat text, which is left out when the two
+    together would pass the driver's opening limit."""
+
+    from .agent.channels import text_units
+    from .prompts import agent_tool_session_followup
+
+    errors = list((verdict or {}).get("validation_errors") or [])
+    if resumed:
+        return agent_tool_session_followup(resumed=True, errors=errors)
+    followup = agent_tool_session_followup(resumed=False, chat_text=text, errors=errors)
+    if limits.opening_max_chars and text_units(
+        json.dumps([{"role": "user", "content": f"{opening}\n\n{followup}"}], ensure_ascii=False),
+        limits.opening_unit,
+    ) > limits.opening_max_chars:
+        followup = agent_tool_session_followup(resumed=False, errors=errors)
+    return f"{opening}\n\n{followup}"
+
+
+def _tool_session_server(
+    driver: Any,
+    root: Path,
+    *,
+    assignment_id: str,
+    worker_id: str,
+    session_id: str,
+    tool_names: Sequence[str],
+    knowledge_root: str,
+    exit_on_accept: bool,
+) -> dict[str, Any]:
+    """The `finesub` MCP server one CLI session of a tool-protocol call declares."""
+
+    import os
+
+    from .agent.agent_mcp_server import ACCEPTED_REPLY_HOLD_ENV
+    from .agent.agent_session_host import absolute_pythonpath
+    from .agent.channels import server_channel
+    from .agent.local_agent import ACCEPTED_REPLY_HOLD_SECONDS
+
+    env = {
+        "FINESUB_MCP_ROOT": str(root),
+        "FINESUB_MCP_ASSIGNMENT": assignment_id,
+        "FINESUB_MCP_WORKER": worker_id,
+        "FINESUB_MCP_SESSION": session_id,
+        "FINESUB_MCP_LOG": str(root / "control" / "mcp-frames.jsonl"),
+    }
+    if knowledge_root:
+        env["FINESUB_MCP_KNOWLEDGE_ROOT"] = knowledge_root
+    # The server is a Python process: it must find this package the
+    # way the harness did. A packaged install has it on the
+    # interpreter's path; a checkout carries it in PYTHONPATH -- made
+    # absolute, because the CLI spawns the server in its own cwd.
+    if os.environ.get("PYTHONPATH"):
+        env["PYTHONPATH"] = absolute_pythonpath(os.environ["PYTHONPATH"])
+    channel_env, view_roots, extra_tools = server_channel(driver, root)
+    env.update(channel_env)
+    # What this server exposes is what the CLI is told it may call:
+    # without the list the server falls back to "every kb tool when a
+    # root is set", which would show `kb_index` / `kb_search` to a task
+    # holding the narrow `style` grant. The channel's own tools
+    # (`read_spill`, `batch`) ride on every call of the driver.
+    env["FINESUB_MCP_TOOLS"] = ",".join([*tool_names, *extra_tools])
+    if exit_on_accept:
+        env[ACCEPTED_REPLY_HOLD_ENV] = f"{ACCEPTED_REPLY_HOLD_SECONDS:g}"
+    mcp_server = {
+        "command": sys.executable,
+        "args": ["-m", "finesub.llm.agent.agent_mcp_server"],
+        "env": env,
+        "tools": [*tool_names, *extra_tools],
+        "view_roots": view_roots,
+    }
+    return mcp_server
 
 
 def _claim_for_opening(
@@ -796,7 +942,9 @@ def _book_opening(
 ) -> dict[str, Any]:
     """Book what this attempt's opening carries and tell its server and
     driver; returns the claim it booked. Per attempt: a premature stop's reset
-    clears the ledger, and the fresh CLI gets the same opening again.
+    clears the ledger, and the fresh CLI gets the same opening again; a
+    resumed conversation keeps the ledger, and booking the same blocks again
+    changes nothing in it.
 
     The lease is checked first. The last CLI may have taken the task again
     with `next_task` (a new generation, the same worker), or the claim lapsed
@@ -2474,10 +2622,16 @@ class RoleClient:
         The harness's part is small by design (docs/llm_agent_tool_protocol.md
         §4): declare the server, hand the agent the bootstrap, and
         when the process is gone read the runtime -- `accepted` is the only
-        completion; the final assistant text carries no artifact. An agent
-        that leaves without ever submitting is a premature stop: one fresh
-        CLI on the same worker (the lease is renewed, not re-claimed) before
-        the call fails to the route chain.
+        completion. An agent that never submitted but left a final assistant
+        text is offered that text as its answer (`_accept_session_text`): it
+        delivers only if it passes as a submit would. Any other agent that
+        leaves without ever submitting is a premature stop, asked once more
+        before the call fails to the route chain (the lease is renewed, not
+        re-claimed): on a driver that `resumes_tool_sessions`, in the same
+        conversation (the session runs at assignment scope, so the CLI keeps
+        it), with the read ledger kept; otherwise in a fresh CLI whose opening
+        also carries the last chat text. Either way the turn says the answer
+        counts only as a `submit` and what that text failed.
 
         With ``opening`` (`mcp_opening`) the harness claims the task first and
         the opening carries it; the CLI goes straight to reading and
@@ -2486,12 +2640,11 @@ class RoleClient:
 
         import copy
         from dataclasses import is_dataclass
-        import os
         import uuid
 
         from types import SimpleNamespace
 
-        from .agent.agent_mcp_server import ACCEPTED_REPLY_HOLD_ENV, TOOL_NAMES
+        from .agent.agent_mcp_server import TOOL_NAMES
         from .agent.agent_session_host import (
             capsule_retained,
             fold_task_ledgers,
@@ -2500,10 +2653,9 @@ class RoleClient:
         )
         from .agent.agent_transports import AgentRuntimeCallError
         from .agent.local_agent import (
-            ACCEPTED_REPLY_HOLD_SECONDS,
             LocalAgentError,
         )
-        from .agent.channels import channel_limits, server_channel
+        from .agent.channels import channel_limits
 
         worker_id = "worker-1"
         tool_names = list(tools) or list(TOOL_NAMES)
@@ -2519,55 +2671,38 @@ class RoleClient:
             if opening
             else None
         )
+        resumable = _resumes_tool_session(driver)
+        scope: dict[str, Any] = (
+            {"session_scope": "assignment", "conversation_key": TOOL_SESSION_CONVERSATION_KEY}
+            if resumable
+            else {"session_scope": "task"}
+        )
         attempts: List[Mapping[str, Any]] = []
         result: Any = None
         record: Mapping[str, Any] = {}
+        handle, left_text, verdict = "", "", None  # after a premature stop: what the next turn resumes / quotes
         for attempt in range(1 + AGENT_PREMATURE_STOP_RETRIES):
             session_id = uuid.uuid4().hex
-            env = {
-                "FINESUB_MCP_ROOT": str(root),
-                "FINESUB_MCP_ASSIGNMENT": assignment_id,
-                "FINESUB_MCP_WORKER": worker_id,
-                "FINESUB_MCP_SESSION": session_id,
-                "FINESUB_MCP_LOG": str(root / "control" / "mcp-frames.jsonl"),
-            }
-            if knowledge_root:
-                env["FINESUB_MCP_KNOWLEDGE_ROOT"] = knowledge_root
-            # The server is a Python process: it must find this package the
-            # way the harness did. A packaged install has it on the
-            # interpreter's path; a checkout carries it in PYTHONPATH -- made
-            # absolute, because the CLI spawns the server in its own cwd.
-            from .agent.agent_session_host import absolute_pythonpath
-
-            if os.environ.get("PYTHONPATH"):
-                env["PYTHONPATH"] = absolute_pythonpath(os.environ["PYTHONPATH"])
-            channel_env, view_roots, extra_tools = server_channel(driver, root)
-            env.update(channel_env)
-            # What this server exposes is what the CLI is told it may call:
-            # without the list the server falls back to "every kb tool when a
-            # root is set", which would show `kb_index` / `kb_search` to a task
-            # holding the narrow `style` grant. The channel's own tools
-            # (`read_spill`, `batch`) ride on every call of the driver.
-            env["FINESUB_MCP_TOOLS"] = ",".join([*tool_names, *extra_tools])
-            if exit_on_accept:
-                env[ACCEPTED_REPLY_HOLD_ENV] = f"{ACCEPTED_REPLY_HOLD_SECONDS:g}"
-            mcp_server = {
-                "command": sys.executable,
-                "args": ["-m", "finesub.llm.agent.agent_mcp_server"],
-                "env": env,
-                "tools": [*tool_names, *extra_tools],
-                "view_roots": view_roots,
-            }
+            mcp_server = _tool_session_server(
+                driver, root, assignment_id=assignment_id, worker_id=worker_id, session_id=session_id,
+                tool_names=tool_names, knowledge_root=knowledge_root, exit_on_accept=exit_on_accept,
+            )
             if claimed:
                 claimed = _book_opening(
                     runtime, claimed, assignment_id=assignment_id, worker_id=worker_id,
                     attempt=attempt, mcp_server=mcp_server, mode=opening, limits=limits,
                     native_search=native_search,
                 )
-            bootstrap = [{"role": "user", "content": _tool_session_bootstrap(
-                claimed, assignment_id=assignment_id, worker_id=worker_id,
-                native_search=native_search,
-            )}]
+            if handle:
+                content = _session_followup(left_text, verdict, resumed=True, opening="", limits=limits)
+            else:
+                content = _tool_session_bootstrap(
+                    claimed, assignment_id=assignment_id, worker_id=worker_id,
+                    native_search=native_search,
+                )
+                if attempt:
+                    content = _session_followup(left_text, verdict, resumed=False, opening=content, limits=limits)
+            bootstrap = [{"role": "user", "content": content}]
             driver_error: BaseException | None = None
 
             def task_accepted() -> bool:
@@ -2579,7 +2714,8 @@ class RoleClient:
             try:
                 result = driver.run(
                     bootstrap,
-                    session_scope="task",
+                    **scope,
+                    **({"conversation_handle": handle, "continuation": True} if handle else {}),
                     mcp_server=mcp_server,
                     completion=task_accepted,
                     exit_on_completion=exit_on_accept,
@@ -2645,22 +2781,37 @@ class RoleClient:
             # submit it is a premature stop like any other and the session is
             # asked again; after one, the session left rejected (below).
             submitted = bool(record.get("last_candidate"))
+            verdict = None
+            if not submitted and record.get("lease_owner"):
+                # A session that never submitted but left its answer as chat
+                # text (docs §4): judged as a submit would be, under the lease
+                # it left; a pass delivers, anything else is the premature stop.
+                verdict = _accept_session_text(
+                    runtime, assignment_id, record, input_hash=input_hash, session_id=session_id,
+                    text=str(getattr(result, "content", "") or ""),
+                )
+                if verdict is not None and verdict["passed"]:
+                    record = runtime.task_record(assignment_id=assignment_id, task_id="call")
+                    break
             if submitted or attempt == AGENT_PREMATURE_STOP_RETRIES:
                 break
-            # Premature stop, first time (docs §0-3): the session keeps its
-            # lease and generation -- this is a transport fault, not a
-            # replacement -- but its context is gone, so the conversation is
-            # reset with the lease held, which also clears the pull ledger.
-            # The fresh CLI on the same worker id resumes the same lease and
-            # has to be handed its blocks again.
-            _reset_agent_context(
-                runtime, assignment_id, record, session_id=session_id, reason="premature stop"
-            )
-            record = runtime.task_record(assignment_id=assignment_id, task_id="call")
+            # Premature stop, first time (docs §0-3): the session keeps its lease
+            # and generation (a transport fault, not a replacement). Resumed, the
+            # conversation and its pull ledger stay; otherwise the conversation is
+            # reset with the lease held (clearing the ledger) and the fresh CLI is
+            # handed its blocks again.
+            left_text = str(getattr(result, "content", "") or "")
+            handle = str(getattr(result, "conversation_handle", "") or "") if resumable else ""
+            if not handle:
+                _reset_agent_context(
+                    runtime, assignment_id, record, session_id=session_id, reason="premature stop"
+                )
+                record = runtime.task_record(assignment_id=assignment_id, task_id="call")
             attempts.extend(no_submit_starts(result))
             current_reporter().warning(
                 "agent-premature-stop",
-                f"agent session {session_id} ended without a submit; retrying once",
+                f"agent session {session_id} ended without a submit; asking once more "
+                + ("in the same conversation" if handle else "in a new session"),
             )
         assert result is not None
         # Read before the retire below: it starts the submit ledger over (an owed proofread turn included).

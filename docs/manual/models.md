@@ -95,7 +95,7 @@
 | --- | ---: | --- |
 | [OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)（固定版本，下完校验） | 约 1.7 GB | Apache-2.0 |
 
-它代替人声分离、Whisper 与说话人分离那一串，只在 RTX 30 系列或更新的 NVIDIA 卡（计算能力 8.0 以上）上跑，见[转写后端「本地 MOSS」](asr-backend-choice.md#本地-moss--asr-moss-local)。
+它代替人声分离、Whisper 转写与说话人分离那一串（有 GPU 时长段里没把握的切点仍借 Whisper 重对一遍，第一次用时下载它），只在 RTX 30 系列或更新的 NVIDIA 卡（计算能力 8.0 以上）上跑，见[转写后端「本地 MOSS」](asr-backend-choice.md#本地-moss--asr-moss-local)。
 
 ## 3. LLM（纠错与翻译）
 
@@ -114,7 +114,6 @@
 | --- | --- | --- |
 | **Gemini（API 或 agy）的 full Flash** | ✅ 音频/视频 | 新的 Flash 档（3.8）**质量足以胜任**，是默认预设的主力 |
 | **Gemini 4 Hydrogen**（API 或 agy） | ✅ 音频（视频未实测） | 对标 Flash，纠错与知识更新和 3.8 比过：**质量分不出高低**；在 agy 上想得少得多（思考约是 3.8 的四分之一到一半）、快得多，在免费 API 上反而想得更多。是 agy 预设的主力，免费档排在纠错组首位 |
-| **agy 的 Gemini 4 Argon** | ✅ 音频/视频 | 在日语直播素材上与 3.8 Flash 比过一次（带音频、说话人分离开着）：**质量略好**，用的 token 少一些，字幕切得稍碎；单价更贵 |
 | **3.5 Flash Lite** | ✅ | **能力偏弱，不适合纠错**；仅绑定于 `efficiency` 这一已声明的降档位 |
 | **Claude Code**（Opus / Sonnet / Haiku 的最新版）与 **agy 的 Claude**（Sonnet 5.5 / Opus 5.5） | ❌ 纯文本 | 质量尚可，但 **token 效率偏低**——相同的工作需要更多 token。这是在 Claude Code 上的观察，agy 上尚未实测。Haiku 5.5 在 API 上试跑过：纠错与准备任务只**摸到能力档「中」的下界**（准备任务交给纠错的背景里漏的专名多），**不推荐用于知识更新**（出过写坏的条目）；Claude Code 这条通道没测 |
 | **Codex**（GPT-6 Luna / GPT-6.1 Terra / GPT-6.2 Sol） | ❌ 纯文本 | GPT-6 Luna 试跑过：纠错与准备任务只**摸到能力档「中」的下界**（合并得少，靠译文撑着），**不推荐用于知识更新**（提的条目比 3.6 Flash 还少）。Terra 与 Sol 的纠错质量未经这样验证，可手动绑定 |
@@ -123,14 +122,14 @@
 两条会直接影响选择的结构性事实：
 
 - **只有出厂的 Gemini API 与 agy 的 Gemini 能处理音视频。** 自己经 OpenAI 兼容接口（如 OpenRouter）接的 Gemini 也只能纯文本（见[接自己的模型](custom-models.md#自己接的端点现在的三条限制)）。纯文本后端要加 `--llm-media text` 才接得到纠错，见[模型路由「媒体开关」](model-routing.md#媒体开关---llm-media)。
-- **agy 的两个出厂预设里，文字任务先交给 agy 的 Sonnet 5.5，带音视频的落到 agy 的 Gemini**；组里完整的先后见 [`model-routing.md`](model-routing.md)「agent 的两个出厂预设」。
+- **agy 的两个出厂预设里，agy 的成员中文字任务先交给 Sonnet 5.5，带音视频的落到 agy 的 Gemini**（`agy-hybrid` 里免费 Gemini API 排在它们前面）；组里完整的先后见 [`model-routing.md`](model-routing.md)「agent 的两个出厂预设」。
 
 ### 免费档的两个代价
 
 - **知识更新为尽力而为（best-effort）。** 知识更新（`knowledge`）与准备任务（`research`）均以免费的强模型（Gemini 3.6 / 3.8 Flash 与 Gemini 4 Hydrogen）优先，
   而免费档每个模型每天只有 20 次请求，且**无 lite 后备**（有意不静默降质）。带准备任务的运行先花掉准备任务的次数，
   再分块做知识更新，所以免费档很容易在知识更新时用完当天的次数。
-- **`--llm-retrieval native` 需要具备联网能力的成员。** 出厂由付费 Flash 提供联网；免费 3.x 完全
+- **`--llm-retrieval native` 需要具备联网能力的成员。** 出厂由付费 Flash 提供联网；免费档（3.x 与 4 Hydrogen）完全
   无法联网，纯免费档运行 native 会在启动校验时报错。这时可配上付费 key，或显式绑定出厂的
   `gemini-native-search` 组（含免费 2.5 Flash，但它的能力档「低」够不着纠错与知识更新要的「中」）。
 

@@ -539,8 +539,9 @@ def test_a_verdict_from_an_older_prompt_is_reused_not_judged_again(tmp_path, mon
 def test_after_a_prompt_bump_only_the_owed_window_is_judged_by_the_new_prompt(tmp_path, monkeypatch):
     stable = judge_files(tmp_path)
     run(stable, FakeClient(), tmp_path)
-    first = judge_run.PROMPT_VERSION
     payload = json.loads(jd.sidecar_path(stable).read_text(encoding="utf-8"))
+    first = payload["windows"][0]["prompt_version"]
+    assert first == judge_run.PROMPT_VERSION
     payload["windows"][1]["status"] = "failed"
     jd.sidecar_path(stable).write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(judge_run, "PROMPT_VERSION", "speaker-judge-next")
@@ -712,8 +713,13 @@ def test_the_preparation_task_asks_for_speakers_only_with_the_judge():
     assert '"speakers": [{"name"' in asked and "不为这一项另外检索" in asked
     unsearched = build_prepare_task_messages(transcript="t", speakers=True, emits_queries=False,
                                              emits_entries=False)[0]["content"]
-    assert "不逐句细查" in unsearched and "不为这一项另外检索" not in unsearched, "nothing to look up, nothing to forbid"
-    assert asked.replace(asked[asked.index("\n6. 列出"):asked.index("\n", asked.index("\n6. 列出") + 1)], "").replace(
+    assert "不逐句核对转写" in unsearched and "不为这一项另外检索" not in unsearched, "nothing to look up, nothing to forbid"
+    assert "已经取得的检索结果" in asked and "已经取得的检索结果" not in unsearched
+    # v2 (speaker judge v27): every speaker but a clip's characters (as v1), each with a description to tell them by
+    assert "插播视频、音频片段里的角色不列" in asked and "被叫：" in asked and "80 字" in asked and "不凭记忆补" in asked
+    duty = asked.index("\n6. 列出")
+    duty_end = asked.index("\n", asked.index("\n   每人的 `note`", duty) + 1)
+    assert asked.replace(asked[duty:duty_end], "").replace(
         asked[asked.index('\n    "speakers"'):asked.index("\n", asked.index('\n    "speakers"') + 1)], "") == plain
 
 

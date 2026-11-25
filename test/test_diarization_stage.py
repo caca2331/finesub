@@ -107,6 +107,53 @@ def test_the_lossless_vocal_delivery_is_brought_to_16k_mono(tmp_path, monkeypatc
     assert seen.get("closed"), "the runner's GPU modules are handed back, not left to the allocator"
 
 
+@pytest.mark.parametrize(("device", "family"), [("cuda", "diarization"), ("cuda:0", "diarization"), ("cpu", None)])
+def test_the_timeline_is_computed_alone_on_the_card(tmp_path, monkeypatch, device, family):
+    # A batch's network task re-times its lines with Whisper on the GPU (CT2: out of memory ends the process), so
+    # on a card the backend's activity holds its own `GPU_STAGE_GATE` family, frees what it left on the card before
+    # letting go (a failure's frames, which hold the model, cleared), and lets go when it fails too.
+    import gc
+    import weakref
+
+    torch = pytest.importorskip("torch")
+    soundfile = pytest.importorskip("soundfile")
+    import numpy as np
+
+    from finesub.speech.diarization import stage as stage_module
+    from finesub.speech.diarization.backend import Backend, BackendOutput
+    from finesub.speech.runtime import gpu_stage_gate
+
+    gate = gpu_stage_gate.GpuStageGate()
+    monkeypatch.setattr(gpu_stage_gate, "GPU_STAGE_GATE", gate)
+    emptied = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(gate._family))
+    wav = tmp_path / "clip-vocal.wav"
+    soundfile.write(str(wav), np.zeros(16000, np.float32), 16000)
+    held, models = [], []
+
+    class Model:
+        pass
+
+    def activity(waveform, *, handle, device, max_speakers=None):
+        held.append(gate._family)
+        model = Model()
+        models.append(weakref.ref(model))
+        if len(held) == 2:
+            raise RuntimeError("out of memory")
+        return BackendOutput(torch.zeros((50, 2)))
+
+    fake = Backend(name="fake", model="fake", frame_seconds=0.02, ensure=lambda artifacts, device: None,
+                   activity=activity)
+    monkeypatch.setattr(stage_module, "resolve_backend", lambda name: fake)
+    stage_module.run_diarization(wav, device=device)
+    with pytest.raises(RuntimeError, match="out of memory") as failure:
+        stage_module.run_diarization(wav, device=device)
+    gc.collect()
+    assert models[1]() is None and failure.value  # the caught error no longer holds the model
+    assert held == [family, family] and gate._family is None and gate._active == 0
+    assert emptied == ([family, family] if family else [])
+
+
 @pytest.fixture
 def machine(tmp_path, monkeypatch):
     """A machine whose card and model files a test can switch off one at a time."""

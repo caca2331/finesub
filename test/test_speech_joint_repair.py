@@ -5,7 +5,7 @@ No model, no network: Live, Silero and the voiceprint model are fakes.
 
 from __future__ import annotations
 
-import importlib.util
+import itertools
 import json
 from pathlib import Path
 
@@ -176,6 +176,23 @@ def source(tmp_path, monkeypatch) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def exhaustive_assignment(monkeypatch):
+    """Matching by voice pairs labels with scipy's Hungarian (`relink._assign`), a [cloud] dependency; the handful of
+    labels here are paired by trying every one-to-one pairing instead, so the suite needs no scipy."""
+    from finesub.speech.joint import relink
+
+    def assign(sim):
+        rows, cols = sim.shape
+        if rows > cols:
+            c, r = assign(sim.T)
+            return r, c
+        best = max(itertools.permutations(range(cols), rows), key=lambda p: sum(sim[i, j] for i, j in enumerate(p)))
+        return list(range(rows)), list(best)
+
+    monkeypatch.setattr(relink, "_assign", assign)
+
+
 class FakeVoiceprints:
     """A voice is the PCM's level: every 1000 is another person."""
 
@@ -263,6 +280,24 @@ def test_off_leaves_the_transcript_as_it_was(source, tmp_path):
     assert asked == [] and not any("repair" in e for e in off.log)
     assert [(x.start, x.end, x.text, x.speaker) for x in off.units()] == [
         (pytest.approx(a), pytest.approx(b), text, s) for a, b, text, s in words]
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["out-to-pauses", "old-name"])
+def test_a_wide_windows_edges_go_out_to_the_pauses_they_lie_in_and_an_old_window_replays(source, tmp_path,
+                                                                                          monkeypatch, cached):
+    words = talk(0, 10, "spk:0") + talk(20, 30, "spk:1")
+    pcm = levels(31, [(0, 10, 1), (20, 30, 2), (12, 18, 2)])
+    wide = said(words, 5, 10) + " 打球吧走吧 " + said(words, 20, 25)
+    # the edges 4.7 s and 25.2 s (35t's words, 0.3 s out) lie in pauses with their middles at 4.5 s and 25.5 s
+    voiced = [(0.0, 4.0), (5.0, 10.0), (12.0, 18.0), (20.0, 25.0), (26.0, 30.0)]
+    name = "ctx-4.7-25.2" if cached else "ctx-4.5-25.5"
+    if cached:  # cached before 2026-11-22 at the edges themselves
+        monkeypatch.setattr(CallCache, "names", lambda self: [name] if self.dir.name == gemini35t.LIVE_WIDE_CACHE else [])
+    t, asked, _ = run_35t(source, tmp_path, words, texts={name: wide}, voiced=voiced, pcm=pcm)
+    assert asked == [name]
+    entry = next(e for e in t.log if e.get("repair") == "miss")
+    assert entry["heard"] == "wide" and entry["window"] == [float(x) for x in name.split("-")[1:]]
+    assert "打球吧走吧" in "".join(x.text for x in t.units())
 
 
 def test_a_gap_silero_hears_is_filled_from_live_as_its_own_turn_with_the_nearest_voice(source, tmp_path):
@@ -445,10 +480,22 @@ def test_quota_re_asks_35t_up_to_the_cap_and_leaves_the_rest_to_live(source, tmp
     assert len(filled) == 18 * gemini35t.REASK_CAP and {x.speaker for x in filled} == {t.units()[0].speaker}
 
 
+@pytest.mark.parametrize("end, matched", [(14.0, False), (16.0, True)])
+def test_a_repair_s_piece_takes_a_voice_only_from_five_seconds_of_it(end, matched):
+    """`Voices.nearest` (35t Live's pieces): a piece with under `relink.RESCUE_MIN` s of voice is no one, however
+    alike it sounds (owner 2026-11-21)."""
+    from finesub.speech.joint.relink import Voices
+
+    pcm = levels(31, [(0, 10, 1), (20, 30, 2), (10, 20, 2)])
+    voices = Voices(lambda: pcm, FakeVoiceprints(), [{"start": 0.0, "end": 10.0, "speaker": "A"},
+                                                     {"start": 20.0, "end": 30.0, "speaker": "B"}])
+    assert voices.nearest({"start": 10.0, "end": end}) == ("B" if matched else None)
+
+
 # --- MAI2 -----------------------------------------------------------------------------------------------------
 
 
-def run_mai2(source, tmp_path, words, reask, *, voiced, pcm, total, merge_speakers=False):
+def run_mai2(source, tmp_path, words, reask, *, voiced, pcm, total):
     from finesub.speech.joint import mai2
 
     asked = []
@@ -467,7 +514,7 @@ def run_mai2(source, tmp_path, words, reask, *, voiced, pcm, total, merge_speake
     try:
         t = mai2.transcribe(source, cache_root=tmp_path / "cloud", language="en", via="openrouter", repair="on",
                             caller=object(), duration=total, speech=mosspro.SpeechSpans(source, voiced, pcm),
-                            voiceprints=FakeVoiceprints(), merge_speakers=merge_speakers)
+                            voiceprints=FakeVoiceprints())
     finally:
         mp.undo()
     return t, asked
@@ -477,33 +524,33 @@ def eng(a, b, speaker):
     return [(a + 0.5 * k, a + 0.5 * k + 0.4, f"s{speaker}w{a}{k}", speaker) for k in range(int((b - a) / 0.5))]
 
 
-def test_mai2_re_asks_a_gap_and_links_its_speakers_by_the_padding(source, tmp_path):
+def test_mai2_re_asks_a_gap_and_matches_its_speakers_by_voice(source, tmp_path):
     words = eng(0, 10, 0) + eng(20, 30, 1)
 
     def reask(lo, hi):  # numbers its speakers the other way round, and repeats the left neighbour's last word
         return ([(x, y, t, 1 - s) for x, y, t, s in words if lo <= x < hi]
                 + [(13.0, 13.3, "s0w019", 0), (13.5, 13.9, "hello", 0), (14.0, 14.4, "there", 0)])
 
-    t, asked = run_mai2(source, tmp_path, words, reask, voiced=[(12, 18)], pcm=np.zeros(31 * 16000, np.int16),
-                        total=31.0)
+    pcm = levels(31.0, [(0, 10, 1), (13, 14.5, 2), (20, 30, 2)])
+    t, asked = run_mai2(source, tmp_path, words, reask, voiced=[(12, 18)], pcm=pcm, total=31.0)
     assert asked == [(0.2, 29.7)]
     got = [(x.text, x.speaker) for x in t.units() if x.text in ("hello", "there")]
-    assert got == [("hello", "S1"), ("there", "S1")]  # the re-ask's 0 is the transcript's S1 by the padding
+    assert got == [("hello", "S1"), ("there", "S1")]  # the re-ask's 0 sounds like the transcript's S1
     assert [x.text for x in t.units()].count("s0w019") == 1  # the echo of the left neighbour is dropped
     entry = next(e for e in t.log if e.get("repair") == "miss")
     assert entry["via"] == "mai2" and entry["inserted"] == 2
 
 
-@pytest.mark.parametrize("voices, merge, labels", [((1, 1), True, {"S1"}), ((1, 2), True, {"S0", "S1"}),
-                                                   ((1, 1), False, {"S0", "S1"})])
-def test_mai2_merges_one_voice_s_labels_only_when_asked(source, tmp_path, voices, merge, labels):
-    """`--asr-speaker-merge on`: two labels with one voice become the one with more speech; two voices, or the
-    merge off, stay apart."""
-    words = eng(0, 8, 0) + eng(20, 30, 1)
-    pcm = levels(31.0, [(0, 8, voices[0]), (20, 30, voices[1])])
-    t, _ = run_mai2(source, tmp_path, words, lambda lo, hi: [], voiced=[], pcm=pcm, total=31.0, merge_speakers=merge)
-    assert {x.speaker for x in t.units()} == labels
-    assert any("merge" in e for e in t.log) == (labels == {"S1"})
+@pytest.mark.parametrize("end, matched", [(17.0, False), (18.0, True)])
+def test_a_re_ask_s_label_with_under_five_seconds_of_voice_is_no_one(source, tmp_path, end, matched):
+    """A re-asked label is matched by voice only from `relink.RESCUE_MIN` s of it (owner 2026-11-21): 4 s that
+    sound like S1 stay unknown, 6 s are S1. The talk in the padding no longer links it."""
+    words = eng(0, 10, 0) + eng(20, 30, 1)
+    pcm = levels(31.0, [(0, 10, 1), (12, 18, 2), (20, 30, 2)])
+    t, _ = run_mai2(source, tmp_path, words, lambda lo, hi: eng(12 if matched else 13, end, 7), voiced=[(12, 18)],
+                    pcm=pcm, total=31.0)
+    said = {x.speaker for x in t.units() if 12 <= x.start < end}
+    assert said == ({"S1"} if matched else {None})  # no speaker: written as `unknown`
 
 
 def test_mai2_failed_re_ask_is_given_up_and_the_rest_goes_on(source, tmp_path):
@@ -522,7 +569,7 @@ def test_mai2_failed_re_ask_is_given_up_and_the_rest_goes_on(source, tmp_path):
     assert "failed" in next(e for e in t.log if e.get("repair") == "miss")
 
 
-def run_scribe(source, tmp_path, answer, reask, *, total, repair="on", pcm=None):
+def run_scribe(source, tmp_path, answer, reask, *, total, repair="on", pcm=None, voiceprints=None):
     """Scribe answering `answer`, a re-ask `reask` (absolute words; an exception is raised); `pcm` the voices."""
     from finesub.speech.joint import scribe
 
@@ -546,7 +593,7 @@ def run_scribe(source, tmp_path, answer, reask, *, total, repair="on", pcm=None)
                               duration=total, speech=mosspro.SpeechSpans(
                                   source, [(0, total)], pcm if pcm is not None else
                                   np.zeros(int(total) * 16000, np.int16)),
-                              voiceprints=FakeVoiceprints())
+                              voiceprints=voiceprints or FakeVoiceprints())
     finally:
         mp.undo()
     return t, asked
@@ -644,6 +691,68 @@ def test_scribe_runs_a_minute_apart_are_one_re_ask_stored_beside_the_call_and_re
     assert len(alone.units()) == len(two_collapses()["words"])
 
 
+def test_scribe_pads_a_re_ask_out_to_silero_pauses_and_replays_one_padded_at_fixed_times(source, tmp_path,
+                                                                                          monkeypatch):
+    from finesub.speech.joint import scribe
+
+    warnings_of(monkeypatch, scribe)
+    spans = []
+    monkeypatch.setattr(scribe, "upload_flac", lambda src, out, span=None: spans.append(span) or Path(out))
+    reask = {"words": [sw(13.0 + k, 13.6 + k, f"r{k}", "speaker_3") for k in range(10)]}  # 25-35 s from 12 s
+    heard = [(0.0, 11.5), (12.5, 87.0), (88.0, 120.0)]  # pauses at 12 s and 87.5 s, just outside the 10 s pads
+
+    def run(root, *, offline, caller):
+        return scribe.transcribe(source, cache_root=root, language="ja", repair="on", caller=caller, offline=offline,
+                                 duration=120.0,
+                                 speech=mosspro.SpeechSpans(source, heard, np.zeros(120 * 16000, np.int16)),
+                                 voiceprints=FakeVoiceprints())
+
+    answers = iter([two_collapses(), reask])
+    first = run(tmp_path / "new", offline=False, caller=lambda audio, **kw: next(answers))
+    assert spans == [None, (12.0, 87.5)]
+    assert "r0" in [x.text for x in first.units()]
+
+    # a task re-asked before the cuts moved to pauses keeps its answer
+    old = tmp_path / "old" / scribe.REPAIR_CACHE
+    old.mkdir(parents=True)
+    (old / "r-15.0-85.0.raw.json").write_text(json.dumps({"words": [sw(10.0 + k, 10.6 + k, f"r{k}", "speaker_3")
+                                                                    for k in range(10)]}), encoding="utf-8")
+    whole = tmp_path / "old" / scribe.SCRIBE
+    whole.mkdir()
+    (whole / f"{scribe.CALL}.raw.json").write_text(json.dumps(two_collapses()), encoding="utf-8")
+    replay = run(tmp_path / "old", offline=True, caller=asked_nothing("Scribe"))
+    assert [x.text for x in replay.units()] == [x.text for x in first.units()]
+    assert not any("failed" in e for e in replay.log)
+
+
+def test_scribe_repairs_each_piece_on_its_own_words_so_a_collapse_at_a_seam_keeps_the_other_pieces(source, tmp_path,
+                                                                                                     monkeypatch):
+    from finesub.speech.joint import scribe
+
+    monkeypatch.setattr(scribe, "LIMIT", 660.0)  # 15 h in production
+    monkeypatch.setattr(scribe, "LONGEST", 600.0)
+    spans = []
+    monkeypatch.setattr(scribe, "upload_flac", lambda src, out, span=None: spans.append(span) or Path(out))
+
+    def caller(audio, *, language, seconds, whole):
+        lo, hi = spans[-1]
+        if not whole:  # the re-ask hears the left piece's collapse right
+            return {"words": [sw(t - lo, t - lo + 0.5, f"w{t}", "speaker_0") for t in range(int(lo) + 1, int(hi)) if t % 2]}
+        # the left piece collapses over 531-569 s, across the hand-over in the middle of the overlap (550 s)
+        return {"words": [sw(t - lo, t - lo + (0.0 if lo == 0 and 530 < t < 570 else 0.5), f"w{t}", "speaker_0")
+                          for t in range(int(lo) + 1, int(hi) - 1, 2)]}
+
+    t = scribe.transcribe(source, cache_root=tmp_path / "cloud", language="ja", repair="on", caller=caller,
+                          duration=1000.0, voiceprints=FakeVoiceprints(),
+                          speech=mosspro.SpeechSpans(source, [(0.0, 579.5), (580.5, 1000.0)],
+                                                     np.zeros(1000 * 16000, np.int16)))
+    assert spans[:2] == [(0.0, 580.0), (520.0, 1000.0)]
+    assert [e["collapse"] for e in t.log if e.get("repair") == "collapse"] == [[531.0, 569.0]]
+    units = t.units()
+    assert [u.text for u in units] == [f"w{x}" for x in range(1, 999, 2)]  # each once, in order
+    assert all(u.end > u.start for u in units if 510 < u.start < 590)  # no collapsed word left
+
+
 @pytest.mark.parametrize("reask", [None, []], ids=["error", "nothing-in-the-hole"])
 def test_scribe_keeps_a_collapse_it_could_not_re_ask_and_warns_once(source, tmp_path, monkeypatch, reask):
     from finesub.speech.joint import scribe
@@ -680,31 +789,43 @@ def glued_answer():
             + [sw(90 + 0.5 * k, 90.45 + 0.5 * k, f"v{k}", "speaker_1") for k in range(20)]}
 
 
-# Matching the re-ask's labels by voice (`relink._match`) imports scipy, a [cloud] dependency: CI's main job
-# installs [harness,dev] only, the extras job runs this.
-@pytest.mark.skipif(importlib.util.find_spec("scipy") is None, reason="needs scipy (the [cloud] extra)")
 def test_scribe_re_asks_a_glued_word_and_joins_its_speakers_to_the_transcripts(source, tmp_path):
     answer = glued_answer()
     # the re-ask numbers its speakers anew: speaker_5 is speaker_0 in the padding, speaker_8 speaker_1; speaker_7
     # has speaker_1's voice; speaker_6 a voice heard only under the glued word's label
     reask = ([sw(20 + 0.5 * k, 20.45 + 0.5 * k, f"w{k}", "speaker_5") for k in range(8)]
              + [sw(25 + 0.5 * k, 25.45 + 0.5 * k, f"a{k}", "speaker_5") for k in range(50)]
-             + [sw(50 + 0.5 * k, 50.45 + 0.5 * k, f"b{k}", "speaker_6") for k in range(70)]
-             + [sw(85 + 0.5 * k, 85.45 + 0.5 * k, f"c{k}", "speaker_7") for k in range(8)]
+             + [sw(50 + 0.5 * k, 50.45 + 0.5 * k, f"b{k}", "speaker_6") for k in range(60)]
+             + [sw(80 + 0.5 * k, 80.45 + 0.5 * k, f"c{k}", "speaker_7") for k in range(18)]
              + [sw(90 + 0.5 * k, 90.45 + 0.5 * k, f"v{k}", "speaker_8") for k in range(8)])
-    pcm = levels(120.0, [(20, 50, 1), (50, 85, 2), (85, 100, 4)])
+    pcm = levels(120.0, [(20, 50, 1), (50, 80, 2), (80, 100, 4)])  # speaker_7: RESCUE_MIN s of speaker_1's voice
     t, asked = run_scribe(source, tmp_path, answer, reask, total=120.0, pcm=pcm)
     assert asked == [(15.0, 94.1)]
     said = [(x.text, x.speaker) for x in t.units()]
     assert [x for x, _ in said] == ([f"w{k}" for k in range(8)] + [f"a{k}" for k in range(50)]
-                                    + [f"b{k}" for k in range(70)] + [f"c{k}" for k in range(8)]
+                                    + [f"b{k}" for k in range(60)] + [f"c{k}" for k in range(18)]
                                     + [f"v{k}" for k in range(20)])
     speakers = {x[0]: s for x, s in said}
     # by the padding, by voice, and a new person: the glued word's label taught speaker_0 no voice
-    assert (speakers["a"], speakers["c"], speakers["b"]) == ("speaker_0", "speaker_1", "r1:speaker_6")
+    assert (speakers["a"], speakers["c"], speakers["b"]) == ("speaker_0", "speaker_1", "c1:speaker_6")
     entry = next(e for e in t.log if e.get("repair") == "glued")
     assert entry["via"] == "scribe" and entry["glued"] == [25.0, 84.1] and entry["chars"] == 198
     assert entry["dropped"] == 197 and entry["inserted"] == 128
+
+
+def test_with_no_voiceprints_a_glued_word_s_re_asked_speakers_are_new_people(source, tmp_path):
+    class Offline:
+        error = "offline"
+
+        def embed(self):
+            return None
+
+    reask = ([sw(20 + 0.5 * k, 20.45 + 0.5 * k, f"w{k}", "speaker_5") for k in range(8)]
+             + [sw(50 + 0.5 * k, 50.45 + 0.5 * k, f"b{k}", "speaker_6") for k in range(60)]
+             + [sw(90 + 0.5 * k, 90.45 + 0.5 * k, f"v{k}", "speaker_8") for k in range(8)])
+    t, _ = run_scribe(source, tmp_path, glued_answer(), reask, total=120.0, voiceprints=Offline())
+    speakers = {x.text[0]: x.speaker for x in t.units()}
+    assert speakers["b"] == "c1:speaker_6"  # not unknown: with no voice to tell, a new person for the judge
 
 
 @pytest.mark.parametrize("how", ["off", "error", "glued-again", "not-cached"])

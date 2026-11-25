@@ -116,6 +116,59 @@ def _passes_section(records: Sequence[Mapping[str, Any]]) -> list[str]:
     return lines
 
 
+def _name_check_lines(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    """What the name check at the start of the knowledge update stage did (`knowledge/name_check_step.py`;
+    docs/knowledge.md「中文定名的核查」): the lines sent with their clues, each batch's landing, the records dropped."""
+
+    from .knowledge.name_check import landing_lines
+    from .knowledge.name_check_step import CHECK_ARTIFACT, DROPPED_LABELS, UNPROCESSED
+
+    check = _last(records, CHECK_ARTIFACT)
+    if not check:
+        return []
+    batches = [batch for batch in check.get("batches") or () if isinstance(batch, Mapping)]
+    how = "（本地搜索）" if check.get("route") == "local" else ""
+    lines = [_bullet(f"中文定名核查{how}：送去 {check.get('lines', 0)} 行，{len(batches)} 批")]
+    for item in check.get("sent") or ():
+        clues = "；".join(
+            (f"{clue.get('found')}" + (f"（{clue['url']}）" if clue.get("url") else "")) if clue.get("found")
+            else f"搜了「{clue.get('query', '')}」没搜到"
+            for clue in item.get("clues") or ())
+        lines.append(_bullet(f"「{item.get('subject', '')}」{item.get('line', '')}"
+                             + (f"：线索 {clues}" if clues else ""), indent=1))
+    for batch in batches:
+        if batch.get("status") == "not_applied":
+            continue
+        lines.extend(_bullet(line, indent=1) for line in landing_lines(batch.get("report") or {}))
+        if batch.get("search"):
+            lines.append(_bullet(_local_search_text(batch["search"]), indent=1))
+        if batch.get("status") == "answered":
+            lines.append(_bullet("这一批答了、还没落库，这个任务下次续跑时再落", indent=1))
+    if any(batch.get("status") == "not_applied" for batch in batches):
+        lines.append(_bullet(f"判了 {len(check.get('rows') or ())} 行，没落库（--no-apply）", indent=1))
+    dropped = check.get("dropped") or {}
+    if dropped:
+        lines.append(_bullet("丢掉的记录：" + "、".join(f"{DROPPED_LABELS.get(why, why)} {count} 条"
+                                                   for why, count in dropped.items()), indent=1))
+    if check.get("skipped") or check.get("failed"):
+        lines.append(_bullet(f"没跑完（{check.get('skipped') or check.get('failed')}）：{UNPROCESSED}", indent=1))
+    return lines
+
+
+def _local_search_text(search: Mapping[str, Any]) -> str:
+    """What a batch of the name check's local path searched (`name_check.SessionResult.search`)."""
+
+    from .knowledge.name_check import LOCAL_QUERIES_PER_LINE
+
+    parts = [f"取线索页 {search.get('pages', 0)} 页（没取到 {search.get('pages_failed', 0)}）",
+             f"搜 {search.get('queries', 0)} 条 query（失败 {search.get('queries_failed', 0)}）"]
+    if search.get("queries_dropped"):
+        parts.append(f"丢掉 {search['queries_dropped']} 条 query（超出每行 {LOCAL_QUERIES_PER_LINE} 条或对不上行）")
+    if search.get("no_material"):
+        parts.append(f"{len(search['no_material'])} 行什么都没读到，记作没答")
+    return "本地搜索：" + "，".join(parts)
+
+
 def _speaker_judge_line(payload: Mapping[str, Any]) -> str:
     if payload.get("skipped"):
         return _bullet(f"skipped: {payload['skipped']}")
@@ -482,7 +535,7 @@ def render_task_report(
     lines.extend(postprocess_lines or ["- No retained postprocess summary."])
 
     lines.extend(["", "## Knowledge"])
-    lines.extend(knowledge_lines or ["- No retained knowledge update summary."])
+    lines.extend([*knowledge_lines, *_name_check_lines(records)] or ["- No retained knowledge update summary."])
 
     lines.extend(
         [

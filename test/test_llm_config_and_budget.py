@@ -177,15 +177,16 @@ def test_model_catalog_loads_gemini_tier_facts() -> None:
     assert agy.supports_native_search is True
     assert agy.video_high_resolution_only is True
     assert agy.capability is Capability.MEDIUM
-    # Argon takes 3.8 Flash's capped mapping (owner 2026-10-19) and has its own pool.
-    argon = get_model_catalog_entry_for_tier("gemini-4-argon", "LOCAL_AGY")
-    assert argon is not None and argon.fact_id == "local-agy-gemini-4-argon"
-    assert [thinking_value_for(argon, level) for level in ("high", "medium", "low")] == [
+    # Neon (2026-11-23) takes Hydrogen's capped mapping (owner) and spends the Gemini pool.
+    neon = get_model_catalog_entry_for_tier("gemini-4-neon", "LOCAL_AGY")
+    assert neon is not None and neon.fact_id == "local-agy-gemini-4-neon"
+    assert neon.capability is Capability.HIGH
+    assert [thinking_value_for(neon, level) for level in ("high", "medium", "low")] == [
         "medium",
         "medium",
         "low",
     ]
-    assert argon.quota_pool == "AGY_ARGON"
+    assert neon.quota_pool == "AGY_GEMINI"
     # Hydrogen (2026-11-12) is compared with 3.8 Flash at the same mapped level and, with no group of its own
     # in agy's /usage, spends the Gemini pool on agy; the free API row has 3.8 Flash's free-tier limits.
     for tier, model, pool in (

@@ -27,6 +27,7 @@ from .importer import (
     parse_entry_text,
     storable_term_payload,
 )
+from .name_trust import strip_check_note
 from .model import METADATA_SECTION, NodeVersion, entry_name_problem
 from .presets import preset_for_category
 from .render import format_line, node_aliases, render_subject
@@ -141,13 +142,13 @@ def _stage_unparseable(parsed, preset) -> list[str]:  # type: ignore[no-untyped-
             # section goes with them (an empty one would only be re-rendered
             # away on the next refresh).
             parked.extend(
-                raw for raw in (_strip_bullet(line[1]) for line in section.lines)
+                raw for raw in (_bare_line(line[1]) for line in section.lines)
                 if raw.strip() and not EMPTY_SLOT_RE.match(raw)
             )
             continue
         survivors = []
         for entry in section.lines:
-            raw = _strip_bullet(entry[1])
+            raw = _bare_line(entry[1])
             if (
                 not raw.strip()
                 or EMPTY_SLOT_RE.match(raw)
@@ -280,7 +281,7 @@ def edit_subject(
         # a revision that changes nothing, and endorse a value nobody touched.
         new_lines = [
             line
-            for line in (_strip_bullet(raw).strip() for _, raw, _ in section.lines if raw.strip())
+            for line in (_bare_line(raw).strip() for _, raw, _ in section.lines if raw.strip())
             # Dropping empty slots here gives the three states of plan §6.3 for
             # free: a slot nobody filled disappears (no-op), a line the user
             # EMPTIED disappears from the new text so the diff retires its node
@@ -531,14 +532,17 @@ def _has_alias_row(parsed, preset) -> bool:  # type: ignore[no-untyped-def]
     "clear it" (plan §6.3)."""
 
     return any(
-        _is_alias_line(_strip_bullet(raw), section.name, preset)
+        _is_alias_line(_bare_line(raw), section.name, preset)
         for section in parsed.sections
         for _lineno, raw, _blank in section.lines
     )
 
 
-def _strip_bullet(raw: str) -> str:
-    """Remove the human-projection entry bullet ONLY — everything else stays
+def _bare_line(raw: str) -> str:
+    """Remove what the human projection adds to a line: the entry bullet and a term line's check note
+    (`name_trust.strip_check_note`, worked out from evidence, never content).
+
+    The bullet: only that -- everything else stays
     verbatim (legacy empty facts render as ``口癖: `` with a trailing space,
     and the round-trip diff must still see them as unchanged).
 
@@ -549,7 +553,7 @@ def _strip_bullet(raw: str) -> str:
     2026-09-01); the archive projection is unaffected, it carries no
     bullets."""
 
-    return _BULLET_RE.sub("", raw, count=1)
+    return strip_check_note(_BULLET_RE.sub("", raw, count=1))
 
 
 def _differs(old: Any, new: Any) -> bool:
@@ -567,7 +571,7 @@ def _derived_reading(text: str) -> str:
     line = next(
         (
             row.split("]", 1)[1] if row.startswith("[") else row
-            for row in map(_strip_bullet, text.splitlines())
+            for row in map(_bare_line, text.splitlines())
             if row.startswith("[本名]") or row.startswith("本名")
         ),
         "",

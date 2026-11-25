@@ -13,6 +13,17 @@ answer (＝ kept, 弃权 abstained, or the track it moved the row to) with the p
 judge gave the track; then the refined reference lines (the ruler) in the clip. Every line turns green
 while it is spoken; ticks along the bottom mark where each clip starts, for seeking. No right / wrong mark is shown.
 
+The labelling-video recipe, for any new video the owner labels (owner 2026-10-06/07, each point a snag met while labelling).
+Start from this script or `row_truth_review_video.py`, not `judge_review_video.py`:
+- Pick 2-3 representative long windows (later prompt tests rerun only these); draw stratified at random with a fixed seed,
+  shuffle the order, and settle what the strata are first.
+- Each clip is the labelled row +/- 3 s, at most 15 s, 0.8 s of silence between clips. For the whole clip show the labelled
+  row and a few rows around it with their start in clip seconds; the row being spoken lights up.
+- Under the title, one line of person numbers (ranked by each person's truth-row count in the window, the same number throughout a window), so
+  the owner answers "C03 2"; show every arm's label, with ＝ for unchanged; the truth subtitle may show, right / wrong never.
+- At the very bottom, a `|<number>` tick where each clip starts.
+- Record labels by (file, row), not clip number; record the owner's "？" separately.
+
     python tools/diarization_explore/judge_missed_video.py     # <MAIN>/out/judge-missed/judge-missed.mp4
 """
 from __future__ import annotations

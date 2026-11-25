@@ -1,0 +1,1 @@
+ The task is the one earlier in this conversation and is still assigned to you; the blocks you read for it still count.

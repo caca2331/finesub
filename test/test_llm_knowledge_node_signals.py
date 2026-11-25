@@ -10,6 +10,7 @@ import pytest
 from finesub.llm.knowledge.node.model import digest
 from finesub.llm.knowledge.node.repo import KnowledgeRepo
 from finesub.llm.knowledge.node.signals import (
+    EVIDENCE_KIND_REFINED,
     log_exposed_entries,
     log_landed_windows,
     record_evidence,
@@ -204,12 +205,16 @@ def test_refined_alignment_confirms_and_refutes_the_item_claim(tmp_path) -> None
         assert refined_alignment_evidence(store, windows, task_id="t1", rev=1) == (1, 1)
         assert refined_alignment_evidence(store, windows, task_id="t1", rev=1) == (0, 0)
         rows = store.conn.execute(
-            "SELECT field_path, verdict, span FROM evidence ORDER BY span"
+            "SELECT field_path, verdict, span, evidence_kind FROM evidence ORDER BY span, field_path"
         ).fetchall()
+        # a refinement that kept the name confirms the term's name too (one of the two checks 已核 needs); one that
+        # overturned the correction refutes the mishearing only, not the name
         assert [(r["field_path"], r["verdict"], r["span"]) for r in rows] == [
             ("items/I1", "confirmed", "w1"),
+            ("payload.zh", "confirmed", "w1"),
             ("items/I1", "refuted", "w2"),
         ]
+        assert {r["evidence_kind"] for r in rows} == {EVIDENCE_KIND_REFINED}
 
 
 def test_refined_evidence_runs_inside_the_update_when_applied(tmp_path, monkeypatch) -> None:
@@ -226,22 +231,18 @@ def test_refined_evidence_runs_inside_the_update_when_applied(tmp_path, monkeypa
         lambda **kwargs: SimpleNamespace(
             mode=update_module.MODE_REFINED_ALIGNED,
             warnings=[],
-            chunks=[
+            windows=[
                 SimpleNamespace(
-                    windows=[
-                        SimpleNamespace(
-                            chunk_id="w1", raw_text="残表が出た",
-                            product_text="散兵が出た", refined_csv="散兵登场了",
-                        )
-                    ]
+                    chunk_id="w1", raw_text="残表が出た",
+                    product_text="散兵が出た", refined_csv="散兵登场了",
                 )
             ],
         ),
     )
-    # Stop right after the write-back: fingerprinting pulls routing/config.
+    # Stop right after the write-back: the rest needs the whole materials.
     monkeypatch.setattr(
-        update_module, "_task_fingerprint",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("stop here")),
+        update_module, "_writable_style_keys",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop here")),
     )
     final = tmp_path / "x-final.srt"
     final.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
@@ -252,8 +253,8 @@ def test_refined_evidence_runs_inside_the_update_when_applied(tmp_path, monkeypa
             final_srt=final, refined_srt=refined, knowledge_root=tmp_path,
             execute=True, apply=True, client=object(), task_id="t1",
         )
-    rows = repo.store.conn.execute("SELECT verdict FROM evidence").fetchall()
-    assert [r["verdict"] for r in rows] == ["confirmed"]
+    rows = repo.store.conn.execute("SELECT field_path, verdict FROM evidence ORDER BY field_path").fetchall()
+    assert [(r["field_path"], r["verdict"]) for r in rows] == [("items/I1", "confirmed"), ("payload.zh", "confirmed")]
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,9 @@ from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 #: The field a cloud line carries its speaker in.
 LINE_SPEAKER = "line_speaker"
+#: `moss-diarization-aligner`: how sure local MOSS was of a line's speaker, its best label's log-probability minus the
+#: second's (absent: one candidate, or no part held the line). Recorded only (owner 2026-11-24).
+SPEAKER_MARGIN = "speaker_margin"
 #: The field marking a local line stretched over the next one, its value the moved row's id (`lane_id`), and the
 #: prefix of the key such a line has: no speaker a cloud transcription names starts with "~".
 LANE_FIELD = "overlap_lane"

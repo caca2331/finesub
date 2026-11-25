@@ -88,6 +88,11 @@ param(
         # them, stripped because their scripts hard-code local paths and
         # name real material. Public docs name the directory, not entries.
         "explore",
+        # Each game glossary build the maintainer kept, with its probe scores:
+        # tracked so a tag that went wrong can be traced back through the
+        # builds; stripped because the public side gets the lists as Release
+        # assets, and a copy in every snapshot would only weigh the tree down.
+        "tools/game_glossary/builds",
         # The maintainer's private supplement to AGENTS.md (test authorisation,
         # this publishing procedure, the plan index).
         "AGENTS.local.md"

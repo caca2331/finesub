@@ -348,13 +348,13 @@ finesub agent-ping
 输出直接引用 CLI 的原话，例如额度耗尽时 Codex 会提示「You've hit your usage limit... try
 again at ...」。FineSub 不解释该信息的含义，由用户自行判断。
 
-agy 的 Gemini、Claude（Sonnet、Opus 共用一份）与 Gemini 4 Argon 分开计量，FineSub 分三份记录（表格中会标注归属）。Argon 在 Pro 订阅上是单独一份、只按周计；在 Ultra 订阅上从 Gemini 那份里花、另有自己的上限，FineSub 照样单独记它：Gemini 那份用完时，Argon 最多再失败几次才被停用。
+agy 的 Gemini 与 Claude（Sonnet、Opus 共用一份）分开计量，FineSub 分两份记录（表格中会标注归属）。
 Claude 那份耗尽不影响带音视频的任务继续使用 agy 的 Gemini。CodeBuddy 的两份额度见 [4.2](#42-codebuddy模型清单跟着账号走)；
 `agent-ping` 探它的三个付费模型时各扣一点积分（一句话的量），探 `hy4flash-free` 不会转付费。
 
 ## 8. FineSub 创建的会话
 
-agy 与 dsh 每次调用都会在自己那边留下会话记录。Codex、Claude Code、CodeBuddy 按窗口跑时
+agy 与 dsh 每次调用都会在自己那边留下会话记录。Claude Code 跑文字任务时也留（每次调用一段对话）：模型没把答案交上来时，FineSub 接着这段对话再问它一次，事后也能对着记录查。Codex、CodeBuddy 按窗口跑时
 （出厂的 `per-window`）FineSub 让它们不留，只有实验性的 `resume`、`pseudo-conversational` 档位才留；
 `config.toml` 里写了 `[llm] local_agent_keep_episodes = true` 时 Codex 也留。例外是 Codex 给同一种会话的后续窗口留的那条共用开头（每个任务每种会话约一条），它留在 FineSub 自己的 Codex 目录里（用 ChatGPT 账号时是[单独登录](#codex-用-chatgpt-账号时给-finesub-单独登录一次)的那个目录），不进你自己的 Codex 历史。要识别 CLI 记录里哪些会话由 FineSub 产生，查看与 `config.toml` 同目录的
 `agent-sessions.jsonl`：每行一次调用，记录时间、工具、模型、用途，以及**这个工具自己的会话 id**。

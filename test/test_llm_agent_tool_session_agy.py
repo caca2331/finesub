@@ -507,6 +507,29 @@ def test_the_tool_guard_allows_read_file_only_under_the_listed_roots(tmp_path) -
     assert _guard_with_roots(tmp_path, {"name": "run_command", "args": {}}, [str(root)])["decision"] == "deny"
 
 
+def test_a_denied_read_names_the_file_whose_path_ends_the_same_way(tmp_path) -> None:
+    """A model copying a spill path dropped 16 of the 64 hex digits of the runtime
+    directory and retried the same path; the denial now hands it the right one."""
+
+    hexdir = "363b9" + "c38081e90cba94f9" + "c99199"
+    root = tmp_path / hexdir / "assignments" / "call-7"
+    spill = root / "control" / "spill"
+    for name in ("mcp-1", "mcp-2"):
+        (spill / name).mkdir(parents=True)
+        (spill / name / "part-01.md").write_text("x", encoding="utf-8")
+    view = lambda path: {"name": "read_file", "args": {"Path": str(path)}}  # noqa: E731
+    mangled = tmp_path / "363b9c99199" / "assignments" / "call-7" / "control" / "spill" / "mcp-2" / "part-01.md"
+
+    result = _guard_with_roots(tmp_path, view(mangled), [str(root)])
+    assert result["decision"] == "deny"
+    assert str((spill / "mcp-2" / "part-01.md").resolve()) in result["reason"]
+    # Only the file name in common (both spill files end that way): no file is named.
+    bare = tmp_path / "other" / "part-01.md"
+    assert "ends the same way" not in _guard_with_roots(tmp_path, view(bare), [str(root)])["reason"]
+    # Nothing under the roots ends that way: the plain denial.
+    assert "ends the same way" not in _guard_with_roots(tmp_path, view(tmp_path / "x" / "y.md"), [str(root)])["reason"]
+
+
 HEADLESS_DENIAL = (
     'no output produced — a tool required the "read_file" permission that '
     "headless mode cannot prompt for\n"

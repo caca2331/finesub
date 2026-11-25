@@ -23,7 +23,7 @@ out/reference/<id>/            # reference_ingest；管线直跑为 out/<stem>/
     session-checkpoints.jsonl  # 准备任务两条回复 / 每窗请求回合的已验证 session 输出
     correction-windows.jsonl   # 每窗口最终提交的输出（resume 缓存）；三个 pass 时 pass1: missing = 该窗回退单 pass
     correction-mode.json       # 这个任务走一个 pass 还是三个 pass、开不开 pass 3
-    proofread.json             # pass 3 逐窗的改动（序号、类别、改后文字、理由）与状态 done / failed
+    proofread.json             # pass 3 逐窗的改动（序号、类别、改后文字、理由）与状态 done / failed；存的是模型原样写的回答，没改的格可能是 `=`，写回时还原（还原后的改动看 artifact `proofread` 的 `changes`）
     exchanges/NNN-<session>.md # 每次 LLM 调用的完整 prompt+response（人类可读）；
                                # 纠错窗为 NNN-MM-<session>.md（NNN=按窗口序预领的
                                # block 号，MM=窗内调用序号，跨 run 确定）

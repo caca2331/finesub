@@ -172,7 +172,7 @@ python -m tools.session_replay correction-request --agentic --dry-run --label r1
 
 | pass | session | 输入 | 一次采样是什么 |
 | --- | --- | --- | --- |
-| pass 1 | `speaker-judge`，`--chunk` 是裁判单元的 id（`0001`，被对半拆过的是 `0001-a`） | 任务目录的 `speaker-judge-input.json`（裁判开跑时写：标题、概要、候选人物、模态、形状）+ stable 与它的裁判 sidecar（单元的行、前面单元带过来的新轨） | 生产的 `_judge_unit`：一个单元的调用连同它的重试与解析；`reply-NN.json` 是生产会记进 sidecar 的那条（`acts`、`results`…） |
+| pass 1 | `speaker-judge`，`--chunk` 是裁判单元的 id（`0001`，被对半拆过的是 `0001-a`） | 任务目录的 `speaker-judge-input.json`（裁判开跑时写：标题、概要、候选人物、模态、形状）+ stable 与它的裁判 sidecar（单元的行、前面单元带过来的新轨；云端任务串行时还有前面各单元留下的人物表、切开与挪动，与生产同一个 `run.relayed`） | 生产的 `_judge_unit`：一个单元的调用连同它的重试与解析；`reply-NN.json` 是生产会记进 sidecar 的那条（`acts`、`results`…） |
 | pass 2 | `correction`（照旧） | correction fixture；三个 pass 的任务多记 `three_pass.shape`，每次重建窗口时按 pass 1 的 sidecar 重新分组（`three_pass.pass2_plan`），窗口的原始行取窗口计划（`correction-window-plan.json`） | 同 [纠错交付轮](#纠错交付轮默认) |
 | pass 3 | `proofread`，`--chunk` 是纠错窗口的 id | 任务目录的 `proofread-input.json`（pass 3 开跑时写：每窗的行与只读前后行、标题、背景、风格、知识库的名词） | 生产的 `_ask`：一窗的调用连同解析不了时的重问（次数同纠错窗口的 `max_retries_per_window`）；agent 路径的校验器照带 |
 

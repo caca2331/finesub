@@ -14,7 +14,8 @@ Within a piece:
 2. any other gap of GAP s or more is re-requested once, only when Silero hears
    GATE_VOICED s of speech in it (owner 2026-10-30: repair detectable defects,
    spend no quota on real silence; Silero missing quiet speech only skips a
-   re-request);
+   re-request); an edge lying in a Silero pause goes out to its middle, within
+   the piece (`cuts.outward`);
 3. an answer in the wrong script (an English source transcribed as Japanese,
    seen once) is asked again once; still wrong, the run stops with an error.
 
@@ -25,7 +26,7 @@ re-requests, of the parts, and the ones a single call split a person into
 (owner 2026-11-09; `docs/joint-asr.md`).
 
 Keys: the `MOSS_PRO` pool. Each key has 1.25 h a day from Beijing midnight
-(refreshed only once the owner logs in to the console); the local account stops
+(credited automatically, no console login needed); the local account stops
 at DAILY_HOURS and counts the way the console does (SERVER_RATIO). With
 `[asr] moss_pro_paid` (default on) the pool's last key has no such stop: what
 the free hours cannot hold goes on it, billed to its prepaid balance.
@@ -47,7 +48,7 @@ from finesub.api_http import CONNECT_TIMEOUT_SECONDS, api_http_client
 from finesub.media.ffmpeg import extract_upload_mp3, probe_media_duration
 from finesub.reporting import current_reporter
 
-from . import MOSS_PRO, fill, moss_timing
+from . import MOSS_PRO, cuts, fill, moss_timing
 from .cache import CacheMiss, CallCache, audio_fingerprint
 from .model import Transcript, Unit, segment_turns
 from .quota import BEIJING, KeyLedger, QuotaExhausted
@@ -227,12 +228,12 @@ class Caller:
             said = [str(error)]
             if self.left_out:
                 said.append(f"key {self.left_out}, the paid last key of the pool, was refused (HTTP 402): its balance "
-                            "is empty or today's free hours have not refreshed; log in to the MOSI console (that "
-                            "refreshes the day), top up if the balance is 0, and rerun (or set [asr] moss_pro_paid = "
-                            "false to stop at the free hours)")
+                            "is empty; top up on the MOSI console and rerun (or set [asr] moss_pro_paid = false to stop "
+                            "at the free hours)")
             if self.refused:
                 said.append(f"key(s) {', '.join(self.refused)} were refused (HTTP 402) although the local account "
-                            "had room: the day has not refreshed (log in to the MOSI console) or the balance is empty")
+                            "had room: the server counts today's free hours as used up (the key was likely also used "
+                            "somewhere this account does not see); rerun after Beijing midnight")
             raise QuotaExhausted("; ".join(said)) from None
 
     def send(self, audio: Path, entry: api_keys.ApiKeyEntry, day: str, seconds: float) -> dict:
@@ -509,7 +510,7 @@ def transcribe(
             if voiced < GATE_VOICED:
                 log.append({"gap": [round(a, 1), round(b, 1)], "voiced": round(voiced, 1), "skipped": True})
                 continue
-            gap_body, got = checked(a, b, fresh=True)
+            gap_body, got = checked(*gap_call(a, b, lo, hi, end), fresh=True)
             extra = [s for s in got if not any(min(s["end"], t["end"]) - max(s["start"], t["start"]) > 0 for t in segs)]
             log.append({"gap": [round(a, 1), round(b, 1)], "voiced": round(voiced, 1), "recovered": len(extra),
                         "tokens": completion_tokens(gap_body), "speakers": apart(extra)})
@@ -519,10 +520,21 @@ def transcribe(
     cached = cache.names()
     pauses: list[tuple[float, float]] | None = None
 
+    def gap_call(a: float, b: float, lo: float, hi: float, end: float) -> tuple[float, float]:
+        """The span a gap [a, b] of the piece [lo, hi] (ending at `end`) is asked again for: each edge out to the
+        middle of a pause it lies in, inside [lo, end] (past `end` a resume could take it for the next piece's main
+        call), or a call cached inside [lo, end] between those and the gap's own edges (named so before 2026-11-22)
+        -- never the piece's own main call, which an empty answer's gap spans (`checked` asks that again as
+        `-again`). `cuts.widened`: a cached edge named as the gap's own is the gap's own, unrounded (0.04 s early,
+        what it recovered would overlap the segment before and be dropped)."""
+        known = [s for s in cuts.spans_named(cached, "s")
+                 if (round(s[0], 1), round(s[1], 1)) != (lo, hi) and s[0] >= lo and s[1] <= end]
+        return cuts.widened(a, b, silences(), lo, end, known)
+
     def silences() -> list[tuple[float, float]]:
         nonlocal pauses
         if pauses is None:
-            pauses = fill.pauses_of(gate.spans())
+            pauses = cuts.pauses_of(gate.spans())
         return pauses
 
     parts: list[tuple[float, float, list[dict]]] = []
@@ -537,7 +549,8 @@ def transcribe(
             continue
         if offline:
             raise CacheMiss(f"{cache.dir}: no cached call covers {reach:.0f} s on and calls are off")
-        starts = [(reach, 0.0)] if capped else fill.next_starts(reach, silences()) if parts else [(0.0, 0.0)]
+        starts = ([(reach, 0.0)] if capped else fill.next_starts(reach, silences(), cuts.segment_breaks(parts[-1][2]))
+                  if parts else [(0.0, 0.0)])
         while True:
             reserved = call.reserve_piece(total, starts, silences())
             lo, hi = round(reserved.piece.start, 1), round(reserved.piece.end, 1)
@@ -552,7 +565,9 @@ def transcribe(
     if len(parts) > 1:
         log.append({"parts": [[round(lo, 1), round(hi, 1)] for lo, hi, _ in parts]})
     log.append({"keys": keys})
-    merges = merge_by_voice(segs, gate.pcm, voiceprints or VOICEPRINTS, "MOSS Pro", unmerged=REUSE_UNMERGED)
+    merges, unknown = merge_by_voice(segs, gate.pcm, voiceprints or VOICEPRINTS, "MOSS Pro", unmerged=REUSE_UNMERGED)
+    if unknown:
+        log.append({"unknown": [list(u) for u in unknown]})
     if merges:
         log.append({"merge": [list(m) for m in merges]})
     return Transcript(MOSS_PRO, MODEL, total, "segment", segment_turns([Unit.from_dict(s) for s in segs]), log)

@@ -7,7 +7,7 @@ Modules:
 - ``style``     — selecting (`--style`) and rendering a style entry.
 - ``feedback``  — ``task_update_feedback`` v2 parsing and aggregation.
 - ``entries``   — hint-driven knowledge-entry prefetch/rendering.
-- ``materials`` — per-window CSV evidence packs and 100k chunk planning.
+- ``materials`` — per-window evidence packs and chunk planning.
 - ``update``    — the unified knowledge-update runner and CLI
                   (``python -m finesub.llm.knowledge.update``).
 

@@ -286,11 +286,12 @@ def _preview_glossary(knowledge_root, extra_info: str, segments, source_language
     the run itself warns about a stale build or missing readers."""
 
     picks = glossary_store.selection(knowledge_root, extra_info, ())
-    if not picks:
+    glossaries = tuple(glossary_store.load_selection(knowledge_root, picks)) if picks else ()
+    if not glossaries:
         return None
     from .game_glossary import GlossaryPick
 
-    pick = GlossaryPick(tuple(glossary_store.load_selection(knowledge_root, picks)), source_language)
+    pick = GlossaryPick(glossaries, source_language)
     return pick.run([segment.text for segment in segments], counter.count_text, fixed=fixed, warn=False)
 
 

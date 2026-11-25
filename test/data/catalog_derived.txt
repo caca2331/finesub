@@ -32,8 +32,8 @@ fact  gemini-free-gemma-4-31b              envelope=16000    pool=GEMINI_FREE
 fact  gemini-paid-3_5-flash-lite           envelope=983040   pool=GEMINI_PAID
 fact  gemini-paid-3_8-flash                envelope=983040   pool=GEMINI_PAID
 fact  local-agy-gemini-3_8-flash           envelope=983040   pool=AGY_GEMINI
-fact  local-agy-gemini-4-argon             envelope=983040   pool=AGY_ARGON
 fact  local-agy-gemini-4-hydrogen          envelope=983040   pool=AGY_GEMINI
+fact  local-agy-gemini-4-neon              envelope=983040   pool=AGY_GEMINI
 fact  local-agy-opus-5_5                   envelope=194000   pool=AGY_ANTHROPIC
 fact  local-agy-sonnet-5_5                 envelope=194000   pool=AGY_ANTHROPIC
 fact  local-claude-haiku                   envelope=872000   pool=LOCAL_CLAUDE

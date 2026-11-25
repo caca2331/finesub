@@ -3,8 +3,8 @@
 `POST https://api.mosi.cn/v1/audio/transcriptions`, model `moss-transcribe-diarize-pro`, multipart upload,
 up to 60 min per request; async mode + `GET /v1/audio/tasks/{id}` polling so long files do not hold a socket.
 
-Quota: keys in the main checkout `.env` as `MOSS_PRO={label:key,...}`, 1.25 audio hours per key per day; the day
-starts at Beijing midnight, but a key refreshes only once the owner logs in to the console (owner 2026-10-30). Price
+Quota: keys in the main checkout `.env` as `MOSS_PRO={label:key,...}`, 1.25 audio hours per key per day, credited
+automatically at Beijing midnight (no console login needed; owner 2026-11-25). Price
 2 RMB per audio hour (owner 2026-09-24). One key is used until its day is spent, then the next -- never alternating.
 Every call is a ledger row (`model=mosspro`).
 
@@ -84,7 +84,8 @@ def call(audio: Path, *, fmt: str, keyterms: list[str]) -> tuple[dict, str, floa
         status = r.status_code
         if r.status_code == 402:
             raise SystemExit(f"key {label} refused (HTTP 402) although the local ledger has room: the quota day began "
-                             f"at {quota_day_start('mosspro')}; ask the owner to log in to the MOSI console")
+                             f"at {quota_day_start('mosspro')}; the server counts the key's free hours as used up "
+                             "(likely spent somewhere this ledger does not see) -- report to the owner")
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:2000]}")
         body = r.json()

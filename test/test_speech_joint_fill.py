@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from finesub.speech.joint import cuts as C
 from finesub.speech.joint import fill as F
 from finesub.speech.joint.mosspro import main_call
 
@@ -25,9 +26,27 @@ def test_one_that_fits_none_is_cut_once_least_room_first_with_the_minimum_overla
 
 
 def test_cut_and_start_go_on_pauses_when_that_costs_nothing():
-    pauses = [(1450.0, 3.0), (1380.0, 2.0), (1499.0, 0.4)]
+    pauses = [(1490.0, 2.0), (1420.0, 2.0), (1499.0, 0.4), (1460.0, 3.0)]  # 1460: past REACH; 1499: too short so near
     plan = F.plan(2000, [(0, 0)], [K(1500), K(1500)], pauses)
-    assert spans(*plan) == [(0, 1450.0, 0), (1380.0, 2000, 1)]
+    assert spans(*plan) == [(0, 1490.0, 0), (1420.0, 2000, 1)]
+
+
+def test_a_seam_off_a_pause_ranks_after_every_pause_however_short():
+    plan = F.plan(2000, [(0, 0)], [K(1500), K(1500)], [(1470.5, 0.05)])  # qualifies only 780 s deep
+    assert spans(*plan)[0] == (0, 1470.5, 0)
+
+
+def test_seams_compare_how_many_are_off_a_pause_then_the_summed_depth_then_the_later_cut():
+    # A: the cut at the limit (off), the start on the pause at 1430 (depth 10); B: the cut on the pause at 1475
+    # (depth 25), its start range 1385-1415 without a pause (off). One off each: A's 10 < B's 25.
+    plan = F.plan(2000, [(0, 0)], [K(1500), K(1500)], [(1430.0, 2.0), (1475.0, 2.0)])
+    assert spans(*plan) == [(0, 1500.0, 0), (1430.0, 2000, 1)]
+    # a pause at 1400 puts B's start on one too (depth 15): no seam off a pause wins over one
+    plan = F.plan(2000, [(0, 0)], [K(1500), K(1500)], [(1430.0, 2.0), (1475.0, 2.0), (1400.0, 2.0)])
+    assert spans(*plan) == [(0, 1475.0, 0), (1400.0, 2000, 1)]
+    # equal sums: the later cut
+    plan = F.plan(2000, [(0, 0)], [K(1500), K(1500)], [(1480.0, 2.0), (1405.0, 2.0), (1490.0, 2.0), (1415.0, 2.0)])
+    assert spans(*plan) == [(0, 1490.0, 0), (1415.0, 2000, 1)]
 
 
 def test_a_pause_that_would_leave_the_next_piece_without_room_is_not_taken():
@@ -85,8 +104,8 @@ def test_where_one_cut_lands_does_not_hide_a_later_keys_ten_minute_cut(keys, exp
 
 def test_a_key_used_twice_still_lets_the_cut_go_on_a_pause():
     # keys compare by their room as planning began: the cut moving key a's later room does not outrank the seam
-    plan = F.plan(7200, [(0, 0)], [K(4235), K(4235)], [(3550.0, 2.0), (3490.0, 1.5)])
-    assert spans(*plan) == [(0, 3550.0, 0), (3490.0, 7090.0, 1), (7030.0, 7200, 0)]
+    plan = F.plan(7200, [(0, 0)], [K(4235), K(4235)], [(3580.0, 2.0), (3510.0, 1.5)])
+    assert spans(*plan) == [(0, 3580.0, 0), (3510.0, 7110.0, 1), (7050.0, 7200, 0)]
 
 
 @pytest.mark.parametrize("total, pauses", [
@@ -115,19 +134,20 @@ def test_the_paid_keys_small_free_room_takes_no_free_cut_piece():
     assert spans(*F.plan(700, [(0, 0)], [K(200), K(590, paid=True)], [(580.0, 1.0)])) == [(0, 700, 1)]
 
 
-@pytest.mark.parametrize("total, paid_room, pauses, cheapest", [
+@pytest.mark.parametrize("total, paid_room, pauses, cheapest, billed", [
     # the rest fits key a from 560: before, at, after the paid key's room; cheapest by every pause (brute.py)
-    (700, 550, [(591.0, 1.0), (610.0, 4.0), (620.0, 3.0), (630.0, 2.0)], 10),
-    (700, 560, [(591.0, 1.0), (610.0, 4.0), (620.0, 3.0), (630.0, 2.0)], 31),
-    (700, 590, [(591.0, 1.0), (610.0, 4.0), (620.0, 3.0), (630.0, 2.0)], 1),
-    (711, 590, [(591.0, 1.0), (710.6, 4.0), (710.7, 3.0), (710.8, 2.0)], 1),  # the miss reaches REACH (codex)
+    (700, 550, [(591.0, 1.0), (610.0, 4.0), (620.0, 3.0), (630.0, 2.0)], 10, 10),
+    (700, 560, [(591.0, 1.0), (610.0, 4.0), (620.0, 3.0), (630.0, 2.0)], 31, 140),  # the pauses: past REACH
+    (700, 590, [(591.0, 1.0), (610.0, 4.0), (620.0, 3.0), (630.0, 2.0)], 1, 110),
+    (700, 560, [(591.0, 1.0), (680.0, 2.0)], 31, 120),  # one within REACH of the end
+    (711, 590, [(591.0, 1.0), (710.6, 4.0), (710.7, 3.0), (710.8, 2.0)], 1, 121),
 ])
-def test_a_billed_piece_on_a_paid_key_with_little_free_room_stays_within_the_reach_of_the_cheapest(
-        total, paid_room, pauses, cheapest):
-    # A known, bounded miss (codex): the cheapest end can be a pause just past the paid key's small free room, not
-    # among the pauses tried; what is lost stays within REACH of billed seconds.
+def test_a_billed_piece_on_a_paid_key_with_little_free_room_can_miss_the_cheapest(
+        total, paid_room, pauses, cheapest, billed):
+    # A known miss (codex): the cheapest end can be a pause just past the paid key's small free room, not among the
+    # pauses tried when it lies more than REACH s before the limit; the plan bills up to a pause nearer, or the rest.
     plan = F.plan(total, [(0, 0)], [K(200), K(paid_room, paid=True)], pauses)
-    assert sum(p.billed for p in plan) <= cheapest + F.REACH + 0.5
+    assert sum(p.billed for p in plan) == billed >= cheapest
     assert all(p.billed or p.end == total or [K(200), K(paid_room)][p.key].room >= F.MIN_ROOM for p in plan)
 
 
@@ -175,17 +195,18 @@ def test_without_a_paid_key_the_free_hours_fill_and_the_plan_stops_short():
 
 
 def test_a_long_source_is_cut_on_a_pause_within_the_hour():
-    plan = F.plan(5000, [(0, 0)], [K(0, paid=True)], [(3550.0, 2.0)])
-    assert spans(*plan) == [(0, 3550.0, 0), (3490.0, 5000, 0)]
+    plan = F.plan(5000, [(0, 0)], [K(0, paid=True)], [(3580.0, 2.0), (3550.0, 2.0)])  # 3550: past REACH
+    assert spans(*plan) == [(0, 3580.0, 0), (3520.0, 5000, 0)]
 
 
 def test_next_starts_are_the_minimum_overlap_and_pauses_up_to_ninety_seconds_back():
     pauses = [(905.0, 9.0), (912.0, 1.0), (925.0, 2.0), (930.0, 3.0), (945.0, 9.0)]  # 905 and 945: out of range
-    assert F.next_starts(1000, pauses) == [(940.0, 0.0), (930.0, 3.0), (925.0, 2.0)]  # the longest TRIED_STARTS
-
-
-def test_pauses_are_the_silences_between_speech_spans():
-    assert F.pauses_of([(0, 10), (12, 20), (15, 25), (30, 40)]) == [(11.0, 2), (27.5, 5)]
+    # the best TRIED_STARTS by depth: 925 at 15 s; 930's 3 s counts as 1 s, so 20 s; 912 at 28 s
+    assert F.next_starts(1000, pauses) == [(940.0, None), (925.0, 15.0), (930.0, 20.0)]
+    # the previous piece's segments break at 930: a quarter of the length qualifies there at once
+    segs = [{"start": 900.0, "end": 929.0}, {"start": 931.0, "end": 990.0}]
+    breaks = C.segment_breaks(segs)
+    assert F.next_starts(1000, pauses, breaks) == [(940.0, None), (930.0, 10.0), (925.0, 15.0)]
 
 
 # --- which cached call is a piece's main call ---------------------------------------------------------------

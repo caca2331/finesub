@@ -58,7 +58,7 @@ uv tool install finesub
 
 ⚠ 用 `uv tool install` 装的安装版**只支持 Windows x64**；Linux / macOS 请走[源码安装](docs/manual/repo-install.md)。
 
-安装的是一个轻量外壳：首次运行时自动装好隔离的 Python 运行环境（无需预装 Python）与 FFmpeg，模型按需下载，都放在 `%LOCALAPPDATA%\FineSub` 下；设置（`config.toml`）、API Key（`.env`）与知识库在其中的 `user-data` 里。C 盘放不下、要搬盘见[资源与大文件](docs/manual/resources.md)，其余子命令与卸载见 [cli/README.md](cli/README.md)。以后升级跑 `uv tool upgrade finesub`。
+安装的是一个轻量外壳：首次运行时自动装好隔离的 Python 运行环境（无需预装 Python）与 FFmpeg，模型按需下载，都放在 `%LOCALAPPDATA%\FineSub` 下；设置（`config.toml`）、API Key（`.env`）与知识库在其中的 `user-data` 里。C 盘放不下、要搬盘见[资源与大文件](docs/manual/resources.md)，其余子命令与卸载见 [cli/README.md](cli/README.md)。以后升级跑 `uv tool upgrade finesub`；升级前看一眼 [CHANGELOG](CHANGELOG.md) 里新版本开头的「升级前要看的」（要改的配置、会不会重建运行环境、要重新下载的东西）。
 
 ### 源码安装
 
@@ -91,7 +91,7 @@ finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月
 - 纠错默认只给模型听音频；要它也看画面（名牌、对话框），加 `--llm-media video`（更费额度）。听音频、看画面都只有出厂的 Gemini API 与 agy 的 Gemini 做得到，别的模型只读文字，见[模型选择](docs/manual/models.md#各后端的使用体验)；
 - `--extra-info` 提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。写进去的要求（某种写法、要放进字幕的歌词等）会被照做。只对这一次的翻译风格要求写进 `--extra-style`，如 `--extra-style "人名保留日文原文"`（例子与它和风格条目的关系见[知识库](docs/manual/knowledge.md#风格条目style记住一套翻译习惯)）。
 - 不传 `--stage` 则默认停在 raw SRT（ASR 结果；不用云端转写时不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译。`--stage` 依次是 `vocal` → `aligned` → `stable` → `raw-srt` → `translated-srt` → `final-srt`，各停在哪见 [运行产物](docs/manual/outputs.md#--stage指定停止的阶段)。这一步需要配置 API 或 agent，二选一或组合：
-  - API：需要配好 Gemini API key（写进上面 `user-data` 下的 `.env`）；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)。免费额度一天大约够纠 2–3 小时素材（默认档，不含 `--knowledge update` 的知识更新，它也占同样的次数；估算的依据与别的档见[同一页](docs/manual/env.md#geminigoogle-ai-studio)），用完就停、第二天续跑。连不上 Google 的网络（如中国大陆）要先设代理，见[走代理](docs/manual/model-routing.md#走代理api-proxy)。
+  - API：需要配好 Gemini API key（写进上面 `user-data` 下的 `.env`）；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)。免费额度一天大约够纠 3–4 小时素材（默认档，不含 `--knowledge update` 的知识更新，它也占同样的次数；估算的依据与别的档见[同一页](docs/manual/env.md#geminigoogle-ai-studio)），用完就停、第二天续跑。连不上 Google 的网络（如中国大陆）要先设代理，见[走代理](docs/manual/model-routing.md#走代理api-proxy)。
   - agent：使用 **Antigravity（下称 agy，用它的命令行工具）/ Codex CLI / Claude Code** 已有的订阅额度运行。其中 agy 提供了现成预设，且是本机 agent 里唯一能听音频的（Gemini API 也能听）。配置与细节见 [本机 Agent 后端](docs/manual/agent.md)。
 - LLM 阶段默认是 `--llm-difficulty intermediate`：强模型一步纠错翻译，适合多数素材。多人对谈、要分清谁在说时加 `--llm-difficulty quality`（更贵，成品字幕不标人名，它多做的几步见 [说话人分离](docs/manual/diarization.md)）；免费额度用完或要大量便宜跑时用 `efficiency`。见 [模型路由](docs/manual/model-routing.md#difficulty-是定位)。
 - 知识库（主播术语、角色名等）**默认读取但不写入**（`--knowledge read`）：已有内容会自动注入，本次任务不改动它。传 `--knowledge update` 才在纠错后把本次的发现写回；传 `--knowledge none` 则完全不读也不写。

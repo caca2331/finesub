@@ -75,8 +75,8 @@ _BOOL_KEYS = frozenset(
     }
 )
 #: Per-model quality caps (owner 2026-11-08): the prepare task's chunk, a correction window's subtitles, a
-#: knowledge-update chunk's CSV, in tokens. Unstated is the built-in default (`routing.config.QUALITY_CAPS`).
-QUALITY_CAP_KEYS = ("prepare_chunk_tokens", "window_subtitle_tokens", "knowledge_csv_tokens")
+#: knowledge-update chunk's window material, in tokens. Unstated is the built-in default (`routing.config.QUALITY_CAPS`).
+QUALITY_CAP_KEYS = ("prepare_chunk_tokens", "window_subtitle_tokens", "knowledge_chunk_tokens")
 #: Every key a model table may carry. ``thinking``, ``capability`` and
 #: ``avoid`` take more than one shape and are parsed on their own.
 CATALOG_KEYS = (
@@ -88,8 +88,9 @@ CATALOG_KEYS = (
 #: Keys that only tell a person something: patching just these does not make
 #: a packaged model's numbers "user-typed" (``self_reported``).
 ANNOTATION_KEYS = frozenset({"note", "avoid"})
-# The score column's old name. Rejected with the new one rather than ignored.
-RETIRED_KEYS = {"quality_score": "capability"}
+# Old key names, rejected with the new one rather than ignored: the score column, and the knowledge-update chunk
+# cap (it counted the CSVs only; now everything that travels with the windows, owner 2026-11-20).
+RETIRED_KEYS = {"quality_score": "capability", "knowledge_csv_tokens": "knowledge_chunk_tokens"}
 #: `quota_pool` sentinel: this row draws on an allowance of its own.
 #: Deliberately lower case, so it cannot be mistaken for a pool identifier --
 #: every real one is written in caps. Same idea as `-1` for an unlimited rate.
@@ -471,7 +472,7 @@ class ModelCatalogEntry:
     #: ``QUALITY_CAP_KEYS``, ``None`` where the model states none. They shape planning, never a call.
     prepare_chunk_tokens: int | None = None
     window_subtitle_tokens: int | None = None
-    knowledge_csv_tokens: int | None = None
+    knowledge_chunk_tokens: int | None = None
 
     @property
     def effective_quota_pool(self) -> str:

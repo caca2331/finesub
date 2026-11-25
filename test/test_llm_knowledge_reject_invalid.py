@@ -349,9 +349,10 @@ def test_every_whole_batch_problem_text_reads_as_a_rejection_the_model_can_fix()
 
 
 def test_only_the_knowledge_update_rejects_every_other_caller_rolls_back() -> None:
-    """`knowledge edit`, the maintenance session, the base-style migration, `knowledge verify` and the shared-
-    conflict repair keep the whole-batch rollback: only `update.py` passes ``invalid_ops="reject"`` -- in the main
-    round and in the repair round."""
+    """`knowledge edit`, the maintenance session, the base-style migration, `knowledge verify`'s whole-line claims
+    and the shared-conflict repair keep the whole-batch rollback: `update.py` passes ``invalid_ops="reject"`` -- in
+    the main round and in the repair round -- and so does the name check, whose envelope holds one op (nothing of it
+    is written either way; ``reject`` only tells a refused value, final, from a race, tried again)."""
 
     passing: dict[str, list[str]] = {}
     for path in SRC.rglob("*.py"):
@@ -360,6 +361,7 @@ def test_only_the_knowledge_update_rejects_every_other_caller_rolls_back() -> No
                 if keyword.arg == "invalid_ops":
                     passing.setdefault(path.relative_to(SRC).as_posix(), []).append(ast.unparse(keyword.value))
     assert passing.pop("llm/knowledge/update.py") == ["'reject'", "'reject'"]
+    assert passing.pop("llm/knowledge/name_check.py") == ["'reject'"]
     assert passing == {"llm/knowledge/node/proposals.py": ["invalid_ops", "invalid_ops"]}  # passed through
 
 

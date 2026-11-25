@@ -49,7 +49,11 @@ _READINGS: dict[str, str] = {}
 
 
 def enabled() -> bool:
-    return os.environ.get(ENV, "").strip().lower() == "on"
+    """The switch, and never for a correct-only task: the hints stand on Japanese readings, which say
+    nothing about how a Chinese source mishears a name."""
+    from .knowledge.base import reads_correct_only
+
+    return os.environ.get(ENV, "").strip().lower() == "on" and not reads_correct_only()
 
 
 # --- readings ---------------------------------------------------------------

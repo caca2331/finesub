@@ -25,11 +25,12 @@ from .node.store import KnowledgeStore
 VERIFY_ALGO_VERSION = "kb-verify-1"
 _URL_RE = re.compile(r"https?://\S+")
 
-#: Which lines may be sent to an external search is a DATA decision, not a
+#: Term lines are the name check's (`name_check.py`, which checks and corrects the whole line); this session keeps
+#: the profile facts. Which lines may be sent to an external search is a DATA decision, not a
 #: kind decision (review 2026-08-29 P1-2): `[中之人]` is an unregistered label
 #: and 人际关系 holds real people, so both stay home. `verify` resolves
 #: label -> section -> `unknown_label_verify`, fail-closed at "none".
-_VERIFIABLE_KINDS = ("term", "note")
+_VERIFIABLE_KINDS = ("note",)
 
 
 def _placements(store: KnowledgeStore, rev: int) -> dict[str, set[tuple[str, str]]]:

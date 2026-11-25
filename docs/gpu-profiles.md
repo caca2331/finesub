@@ -507,5 +507,7 @@ batch 模式下第一个任务冲高后，后面每个任务都继承那个数�
 - 并发 sweep 覆盖正常 efficient 路径；beam rescue / naive fallback 不会增加
   模型权重份数，但极端输入的临时 activation 仍由 `heavy_resource` 守卫测试持续观察。
 - GPU model-family gate 允许多个 separator 或多个 WT 同类任务并行，但不允许
-  两个模型族跨任务同时驻留；切换前由最后一个活跃任务释放上一模型族。
+  两个模型族跨任务同时驻留；切换前由最后一个活跃任务释放上一模型族。另两族是
+  MOSS 长段的 Whisper 重定（`joint-whisper`，`speech/joint/aligner.py`，网络道上也会跑）与说话人分离
+  （`diarization`，`speech/diarization/stage.py`）。
 - 数值是这套硬件与依赖版本上的实测标定，不应外推为所有 GPU 的同等吞吐比例。

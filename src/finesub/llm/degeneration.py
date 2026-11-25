@@ -1,29 +1,37 @@
 """Signs that a model's answer degenerated, read from the answer and the window it answered -- no further call.
 
 An answer can pass validation and still be a bad draw: the same pass 2 input, answered three times, merged 3, 0
-and 32 of the window's lines read 可并 (`docs/llm_design_notes.md`「模型回答退化的判据与重试的决策记录」). Today these signals are only
-recorded in the window's record, and a window left unmerged is named in the stage summary as a note, so their
-false alarm rate can be measured on real runs before any of them starts a retry.
+and 32 of the window's lines read 可并 (`docs/llm_design_notes.md`「模型回答退化的判据与重试的决策记录」).
 
-- `unmerged` (pass 2): the window offers at least `UNMERGED_MIN_SEAMS` lines read 可并 (the 7 second filter is
-  already in the seam: `grouping.group_lines`) and the answer merged at most `UNMERGED_MAX_SHARE` of them. The two
-  degenerate draws were 0 / 64 and 3 / 64, the normal one about 31 / 64.
+- `zero_thinking` (a correction window, the speaker judge, pass 3's proofread): a call asked to think reported
+  no thinking at all (`thinking_of`).
+- `unmerged` (pass 2): the window's lines read 可并 were left apart (`Pass2Signals.unmerged`).
 
-One sign does start a retry: a call asked to think that reported no thinking at all (`thinking_of`), on the
-steps that write an answer -- a correction window, the speaker judge, pass 3's proofread. The caller asks once
-more in a fresh session and keeps one of the two answers (`pick_after_retry`; owner 2026-10-17).
+A passing answer with either sign is held and the window asked once more in a fresh session; the two signs share
+that one retry, and the window keeps one of the two answers (`pick_after_retry`; owner 2026-10-17, 2026-11-21).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 from .chunking import Seam, SubtitleWindow
 from .output_protocol import TranslatedCsvSegment
 
-UNMERGED_MIN_SEAMS = 30
-UNMERGED_MAX_SHARE = 0.05
+#: `unmerged` needs this many seams read 可并 and at most this percent of them merged ...
+UNMERGED_MIN_SEAMS = 20
+UNMERGED_MAX_PERCENT = 10
+#: ... and then, with this many tight seams, at most this percent of those merged; with fewer, none merged at all.
+#: A tight seam is one a normal answer merges most: at most `TIGHT_MAX_GAP` s of pause and the two lines together
+#: at most `TIGHT_MAX_SPAN` s. A model that merges little when fine (Gemini 4 Hydrogen: 4%-15% of all seams)
+#: still merges 17%-19% of the tight ones; a degenerate draw merges almost none. Readings and the plateau the
+#: numbers sit on: `docs/llm_design_notes.md`「模型回答退化的判据与重试的决策记录」.
+UNMERGED_MIN_TIGHT = 8
+UNMERGED_MAX_TIGHT_PERCENT = 10
+TIGHT_MAX_GAP = 0.3
+TIGHT_MAX_SPAN = 5.0
+_EPS = 1e-6  # a gap of exactly 0.3 s is tight however the floats round
 
 
 @dataclass(frozen=True)
@@ -31,16 +39,34 @@ class Pass2Signals:
     #: the window's own lines read 可并, and how many of them the answer merged with the line before
     may_seams: int
     may_merged: int
+    #: the same for the tight ones among them
+    tight_seams: int = 0
+    tight_merged: int = 0
+
+    @property
+    def unmerged(self) -> bool:
+        if self.may_seams < UNMERGED_MIN_SEAMS or 100 * self.may_merged > UNMERGED_MAX_PERCENT * self.may_seams:
+            return False
+        if self.tight_seams >= UNMERGED_MIN_TIGHT:
+            return 100 * self.tight_merged <= UNMERGED_MAX_TIGHT_PERCENT * self.tight_seams
+        # Mostly loose seams: leaving them apart may be right, so only an answer that merged none of them counts.
+        return self.may_merged == 0
 
     @property
     def signals(self) -> list[str]:
-        out = []
-        if self.may_seams >= UNMERGED_MIN_SEAMS and self.may_merged <= UNMERGED_MAX_SHARE * self.may_seams:
-            out.append("unmerged")
-        return out
+        return ["unmerged"] if self.unmerged else []
 
     def to_metadata(self) -> Dict[str, Any]:
-        return {"may_seams": self.may_seams, "may_merged": self.may_merged, "signals": self.signals}
+        return {"may_seams": self.may_seams, "may_merged": self.may_merged, "tight_seams": self.tight_seams,
+                "tight_merged": self.tight_merged, "signals": self.signals}
+
+
+def tight(line: Any, before: Any) -> bool:
+    """Whether the seam between ``before`` and ``line`` is tight: a short pause (an overlap reads as none) and
+    the two lines short together. Times are the grouped lines' own, the ones the window's CSV shows."""
+
+    gap = max(0.0, line.start - before.end)
+    return gap <= TIGHT_MAX_GAP + _EPS and line.end - before.start <= TIGHT_MAX_SPAN + _EPS
 
 
 def pass2_signals(window: SubtitleWindow, rows: Sequence[TranslatedCsvSegment]) -> Pass2Signals:
@@ -49,14 +75,18 @@ def pass2_signals(window: SubtitleWindow, rows: Sequence[TranslatedCsvSegment]) 
     row_of = {source: index for index, row in enumerate(rows) for source in row.source_ids}
     lines = window.segments
     start = len(window.overlap_segments)
-    may = merged = 0
+    may = merged = tight_may = tight_merged = 0
     for index in range(max(start, 1), len(lines)):
         line, before = lines[index], lines[index - 1]
         if line.seam != Seam.MAY:
             continue
+        joined = line.id in row_of and row_of.get(before.id) == row_of[line.id]
         may += 1
-        merged += line.id in row_of and row_of.get(before.id) == row_of[line.id]
-    return Pass2Signals(may, merged)
+        merged += joined
+        if tight(line, before):
+            tight_may += 1
+            tight_merged += joined
+    return Pass2Signals(may, merged, tight_may, tight_merged)
 
 
 #: Provider thinking values a call may answer at without thinking at all. A call sent no thinking value (the
@@ -150,22 +180,49 @@ def thinking_of(result: Any) -> Thinking:
     return Thinking(int(tokens["thinking_tokens"]), level, budget)
 
 
-def pick_after_retry(original_errors: int, retry: Thinking, retry_errors: int) -> str:
-    """Which answer a window keeps after asking again because the first did not think: ``retry`` or
-    ``original``. Errors count what validation refused in each (0: it passed).
+@dataclass(frozen=True)
+class Draw:
+    """One answer's degeneration state: how much its call thought, its pass 2 signals (pass 2 only), and
+    whether a repair round's patch put it together (a patch is a few rows, so not thinking is no sign there)."""
 
-    The retry is kept when it thought (or was not asked to) and passed; when it thought and failed, the original.
-    When it did not think either, or it is not known, the one with fewer errors, the original on a tie: the task
-    really may be that simple."""
+    thinking: Thinking
+    pass2: Pass2Signals | None = None
+    patched: bool = False
 
-    if retry.fine:
-        return "retry" if retry_errors == 0 else "original"
-    return "retry" if retry_errors < original_errors else "original"
+    def held_for(self) -> List[str]:
+        """Why a passing answer is held for the one retry: none, or its signs."""
+
+        return [*(["zero_thinking"] if self.thinking.skipped and not self.patched else []),
+                *(["unmerged"] if self.pass2 is not None and self.pass2.unmerged else [])]
+
+    def to_metadata(self) -> Dict[str, Any]:
+        return {"thinking": self.thinking.to_metadata(),
+                **({"degeneration": self.pass2.to_metadata()} if self.pass2 is not None else {}),
+                **({"patched": True} if self.patched else {})}
 
 
-def zero_thinking_record(original: Thinking, retry: Thinking | None, chosen: str, *, error: str = "") -> Dict[str, Any]:
-    """What a window's record keeps about a retry for missing thinking."""
+def pick_after_retry(original: Draw, retry: Draw, retry_passed: bool) -> str:
+    """Which answer a window keeps after asking again because the first was held (`Draw.held_for`): ``retry``
+    or ``original``.
 
-    return {"signal": "zero_thinking", "original": original.to_metadata(),
+    A retry that failed validation (or was cut off) loses. Otherwise the one with fewer signs wins, the original
+    on a tie. The retry's signs are its own, except that against an original held for not thinking, a retry not
+    known to have thought counts as not thinking either: keeping the original when the retry cannot be judged.
+    Elsewhere a missing count is a gap in the books, not a call that skipped thinking."""
+
+    if not retry_passed:
+        return "original"
+    held = original.held_for()
+    signs = retry.held_for()
+    if "zero_thinking" in held and "zero_thinking" not in signs and not retry.thinking.fine and not retry.patched:
+        signs.append("zero_thinking")
+    return "retry" if len(signs) < len(held) else "original"
+
+
+def redo_record(original: Draw, retry: Draw | None, chosen: str, *, error: str = "") -> Dict[str, Any]:
+    """What a record keeps about the one retry of a held answer: why it was held, both draws, which was kept,
+    and the error when the retry could not answer."""
+
+    return {"signals": original.held_for(), "original": original.to_metadata(),
             **({"retry": retry.to_metadata()} if retry is not None else {}),
             **({"retry_error": error} if error else {}), "chosen": chosen}

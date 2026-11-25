@@ -1512,21 +1512,21 @@ def apply_model_proposals(
     handles: HandleMap | None = None,
     assignment_id: str = "",
     context_epoch: int = 0,
-    proposal_text_hash: str = "",
+    write_id: str = "",
     line_gate: LineGate | None = None,
     invalid_ops: str = "rollback",
 ) -> ProposalReport:
     """REST front end: parse the model block, translate, apply, refresh the cache.
 
-    ``proposal_text_hash`` (sha256 of the raw model output) is recorded on the
-    revision so the chunk ledger can recover a commit that landed before the
-    ledger row was written. ``invalid_ops``: as `apply_envelope`'s.
+    ``write_id`` (the chunk ledger intent's id for this write) is recorded on the
+    revision so the ledger can recover a commit that landed before its row was
+    written. ``invalid_ops``: as `apply_envelope`'s.
     """
 
     return apply_proposals(
         parse_model_proposals(text), repo=repo, allow_categories=allow_categories, task_id=task_id,
         knowledge_read_rev=knowledge_read_rev, handles=handles, assignment_id=assignment_id,
-        context_epoch=context_epoch, proposal_text_hash=proposal_text_hash, line_gate=line_gate,
+        context_epoch=context_epoch, write_id=write_id, line_gate=line_gate,
         invalid_ops=invalid_ops,
     )
 
@@ -1541,7 +1541,7 @@ def apply_proposals(
     handles: HandleMap | None = None,
     assignment_id: str = "",
     context_epoch: int = 0,
-    proposal_text_hash: str = "",
+    write_id: str = "",
     line_gate: LineGate | None = None,
     invalid_ops: str = "rollback",
 ) -> ProposalReport:
@@ -1570,7 +1570,7 @@ def apply_proposals(
         draft_bindings=sorted({op["handle"] for op in engine_ops if op.get("op") == "create" and op.get("handle")}),
     )
     result: ApplyResult = apply_envelope(
-        repo.store, envelope, note=f"proposal_text:{proposal_text_hash}" if proposal_text_hash else "",
+        repo.store, envelope, note=f"write:{write_id}" if write_id else "",
         invalid_ops=invalid_ops,
         # the `updated_date` stamps: with every real change rejected, they alone write no revision
         bookkeeping_ops=[index for index, op in enumerate(ops) if _is_date_stamp(op)],

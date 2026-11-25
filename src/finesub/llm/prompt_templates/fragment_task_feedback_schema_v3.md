@@ -1,5 +1,5 @@
 `<task_update_feedback>` 内容必须是一个紧凑 JSON 对象（不要 Markdown 代码块），schema 如下：
-{"knowledge_hints":[{"category":"streamer|common","entry":"主词条key（源语言本名）","sub":"子词条行首字段（可选）","direction":"new_entry|replace_section|append_lines","focus":"一句话：想更新/新增什么","reason":"证据来源","source_ids":["12","13"],"confidence":7}],"asr_corrections":["可复用的 ASR 误听修正模式"],"uncertainties":["仍不确定、需人工或后续核实的点"]}
+{"knowledge_hints":[{"category":"streamer|common","entry":"主词条key（源语言本名）","sub":"子词条行首字段（可选）","direction":"new_entry|replace_section|append_lines","focus":"一句话：想更新/新增什么","reason":"证据来源","source_ids":["12","13"],"confidence":7}],"asr_corrections":["可复用的 ASR 误听修正模式"],"uncertainties":["仍不确定、需人工或后续核实的点"]$name_checks_schema}
 字段规则：
 1. `knowledge_hints` 是核心输出：你在本次输入中发现的、值得写入本地知识库的条目线索及更新方向。`entry` **永远填主词条**：优先用知识库索引中的既有 key 或别名；索引中没有合适主词条时写你建议的新主词条名（源语言本名），`direction` 填 `new_entry`。
 2. `sub`（可选）：当线索针对主词条内的某个子词条（某一行）时，填该行的行首字段（源语言词项），如《原神》词条内的 `ブレンニ`。带 `sub` 的 hint 表示母词条的行级更新，**不要为 sub 建独立词条**；单个角色、单个梗、单场事件一律作为母词条的行、用 `sub` 表达。
@@ -8,4 +8,4 @@
 5. $source_ids_rule
 6. `confidence`：任务反馈专用的 1-9 整数（9 最高），表示“该线索值得写入且内容属实”的把握。
 7. 只记录可复用、可核实、来自本次输入证据的内容；拿不准的写进本块的 `uncertainties`，不要编造 hint。没有内容的数组字段输出 `[]`，不要省略字段。
-8. 纯粹的误听/读音修正只写 `asr_corrections`；仅当该词条本身需要新增或更新知识库内容（人物、事件、设定等长期知识）时才另开 `knowledge_hints`，不要为同一个修正两边重复填写。
+8. 纯粹的误听/读音修正只写 `asr_corrections`；仅当该词条本身需要新增或更新知识库内容（人物、事件、设定等长期知识）时才另开 `knowledge_hints`，不要为同一个修正两边重复填写。$name_checks_rule

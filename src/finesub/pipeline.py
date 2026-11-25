@@ -71,7 +71,6 @@ from .scheduler import (
     run_batch,
 )
 from .speech import joint as joint_asr
-from .speech.joint import relink as joint_relink
 from .speech.joint import repair as cloud_repair
 from .speech.joint import stage as joint_stage
 from .speech.postprocessing import stabilization as asr_stabilize
@@ -116,6 +115,74 @@ def _add_recall_repair_options(parser: argparse.ArgumentParser) -> None:
         help="In the stable step, have the Qwen referee and Whisper hear lines again over their own span, and put "
              "words both hear and the line lacks into it (default: off; auto hears only the likeliest lines, "
              "about half the time for about three quarters of what on adds, and follows --qwen-verify off).",
+    )
+
+
+def _add_joint_asr_arguments(parser: argparse.ArgumentParser) -> None:
+    """`--asr` and the options of the joint-ASR backends (`speech/joint/`)."""
+    parser.add_argument(
+        "--asr",
+        choices=joint_asr.CHOICES,
+        default=None,
+        help=(
+            "Who transcribes: local (default: separation, VAD, Whisper here), a cloud service fed "
+            "the mix (the audio leaves this machine) -- mai2, scribe (ElevenLabs; both paid per hour), "
+            "gemini / gemini-35t (GEMINI_FREE keys), moss / moss-pro (MOSS_PRO keys) -- or moss-local (open MOSS on an "
+            "NVIDIA GPU of compute capability 8.0+, 1.7 GB download on first use), or moss-diarization-aligner "
+            "(the lines of --asr-rows, each line's speaker chosen by open MOSS on that GPU). A task keeps the "
+            "backend its -aligned.json / -stable.json came from; see docs/manual/asr-backend-choice.md."
+        ),
+    )
+    parser.add_argument(
+        "--asr-aligner",
+        choices=("auto", "on", "off"),
+        default=None,
+        help=(
+            "forced-aligner timing (1.8 GB model; GPU, else CPU) for moss-pro / moss-local long segments and gemini-35t "
+            "repairs (also as moss-diarization-aligner's --asr-rows); on a GPU, Whisper re-times MOSS's unsure "
+            "boundaries. auto (default): the aligner's languages, Whisper not in English; on: any language, English "
+            "too; off: Silero."
+        ),
+    )
+    parser.add_argument(
+        "--asr-repair",
+        choices=cloud_repair.MODES,
+        default=None,
+        help=(
+            "gemini-35t, mai2 and scribe (also as moss-diarization-aligner's --asr-rows): repair what the cloud "
+            "transcript missed or garbled. on (default) fills "
+            "gaps the local VAD hears speech in -- mai2 by asking it again (a few %% more billed audio), "
+            "gemini-35t through Gemini Live (no daily requests) -- and trims runaway repeats; quota also "
+            "lets gemini-35t re-ask on its daily requests; scribe re-asks collapsed timestamps (on = quota); off: none."
+        ),
+    )
+    parser.add_argument(
+        "--asr-rows",
+        choices=(*joint_asr.ROWS_BACKENDS, *(a for a, b in joint_asr.ALIASES.items() if b in joint_asr.ROWS_BACKENDS)),
+        default=None,
+        help=(
+            "moss-diarization-aligner: the backend its lines come from -- mai2, scribe or gemini-35t (config "
+            "[asr] rows) -- read from --asr-transcript, else this task's cache, else that backend's API (billed "
+            "as --asr <it>)."
+        ),
+    )
+    parser.add_argument(
+        "--asr-transcript",
+        default=None,
+        help=(
+            "moss-diarization-aligner: the --asr-rows backend's transcript of this source instead of its API -- one "
+            "answer in that backend's shape as a JSON file, or an earlier task's <stem>-cloud directory (read in "
+            "place). One per source."
+        ),
+    )
+    parser.add_argument(
+        "--asr-overlap-cue",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "moss-diarization-aligner: join one person's line pieces around a short interjection into one cue "
+            "shown over it (default: on; config [asr] overlap_cue)."
+        ),
     )
 
 
@@ -174,47 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=gpu_tier_help(),
     )
-    parser.add_argument(
-        "--asr",
-        choices=joint_asr.CHOICES,
-        default=None,
-        help=(
-            "Who transcribes: local (default: separation, VAD, Whisper here), a cloud service fed "
-            "the mix (the audio leaves this machine) -- mai2, scribe (ElevenLabs; both paid per hour), "
-            "gemini / gemini-35t (GEMINI_FREE keys), moss / moss-pro (MOSS_PRO keys) -- or moss-local (open MOSS on an "
-            "NVIDIA GPU of compute capability 8.0+, 1.7 GB download on first use). A task keeps the "
-            "backend its -aligned.json / -stable.json came from; see docs/manual/asr-backend-choice.md."
-        ),
-    )
-    parser.add_argument(
-        "--asr-aligner",
-        choices=("auto", "on", "off"),
-        default=None,
-        help=(
-            "forced-aligner timing (a 1.8 GB model, GPU) for moss-pro / moss-local long segments and gemini-35t "
-            "repairs. auto (default): moss-local, and the other two when this run has a GPU; on: all three; off: Silero."
-        ),
-    )
-    parser.add_argument(
-        "--asr-repair",
-        choices=cloud_repair.MODES,
-        default=None,
-        help=(
-            "gemini-35t, mai2 and scribe: repair what the cloud transcript missed or garbled. on (default) fills "
-            "gaps the local VAD hears speech in -- mai2 by asking it again (a few %% more billed audio), "
-            "gemini-35t through Gemini Live (no daily requests) -- and trims runaway repeats; quota also "
-            "lets gemini-35t re-ask on its daily requests; scribe re-asks collapsed timestamps (on = quota); off: none."
-        ),
-    )
-    parser.add_argument(
-        "--asr-speaker-merge",
-        choices=joint_relink.SPEAKER_MERGE_MODES,
-        default=None,
-        help=(
-            "mai2: merge the speaker labels of one person by voice (a voiceprint per label, merged at cosine 0.95). "
-            "Off under auto (default): it fires on few sources. The MOSS backends always merge."
-        ),
-    )
+    _add_joint_asr_arguments(parser)
     parser.add_argument(
         "--separate",
         action=argparse.BooleanOptionalAction,
@@ -518,10 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
             "unified knowledge update after correction."
         ),
     )
-    parser.add_argument(
-        "--refined-srt",
-        help="User-refined SRT for the knowledge update (with --knowledge update).",
-    )
+    parser.add_argument("--refined-srt", help="User-refined SRT for the knowledge update (with --knowledge update).")
     parser.add_argument("--knowledge-root", help="Override local knowledge base root for LLM stages.")
     parser.add_argument("--task-artifact-dir", help="Override LLM task artifact directory.")
     parser.add_argument("--task-id", default=None, help="Stable task id for LLM artifacts.")
@@ -856,6 +880,8 @@ _PER_SOURCE_KEYS = frozenset({
     # of this set and inherited as before).
     "llm_video",
     "refined_srt",
+    # One source's transcript: another source's would be read as this one's words.
+    "asr_transcript",
 })
 
 
@@ -1241,10 +1267,11 @@ def build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None)
         return _build_item(opts, claims=claims)
 
 
-def _refuse_moss_local_without_its_card(
+def _refuse_local_moss_that_cannot_run(
     source: str, output: Any, shared: Mapping[str, Any], asr_stage: str
 ) -> None:
-    """Stop a task that would decode with local MOSS on a run that cannot (`moss_local_unusable_reason`) when it
+    """Stop a task that would decode with local MOSS (`moss-local`, `moss-diarization-aligner`) on a run that cannot
+    (`moss_local.unusable_reason`: the card or transformers) when it
     is built -- before a download, a model fetch or a place in the asr queue. A startup row stops the run; a row
     appended later is skipped. Only a task that will decode: at or past `aligned`, its `-aligned.json` not there
     (nor its `-stable.json`, unless it stops at aligned). A URL's products are not known before it downloads, so
@@ -1264,11 +1291,11 @@ def _refuse_moss_local_without_its_card(
         if paths.aligned_json.exists() or (asr_stage != "aligned" and paths.stable_json.exists()):
             return
         backend = joint_stage.task_backend(paths.stable_json, paths.aligned_json, requested)
-    if backend != joint_asr.MOSS_LOCAL:
+    if backend not in joint_asr.LOCAL_MOSS_BACKENDS:
         return
-    from .speech.runtime.device import moss_local_unusable_reason
+    from .speech.joint import moss_local
 
-    reason = moss_local_unusable_reason(shared.get("gpu_tier"), shared.get("device"))
+    reason = moss_local.unusable_reason(backend, shared.get("gpu_tier"), shared.get("device"))
     if reason is not None:
         raise ValueError(f"{source}: {reason}")
 
@@ -1300,7 +1327,7 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
     )
     diarize_default = default_diarize(target_stage, profile)
     warn_if_the_judge_cannot_run(diarize or diarize_default, target_stage)
-    _refuse_moss_local_without_its_card(source, opts.get("output"), shared, asr_stage)
+    _refuse_local_moss_that_cannot_run(source, opts.get("output"), shared, asr_stage)
 
     def _run(payload: dict[str, Any], stage: str) -> None:
         # The reporter is bound by `run_batch` around every stage, so that
@@ -1447,7 +1474,7 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
         payload = item_payload or {}
         paths = default_pipeline_paths(payload["audio"], output_path=payload.get("output"))
         backend = joint_stage.task_backend(paths.stable_json, paths.aligned_json, shared.get("asr"))
-        return GPU_LANE if backend in (joint_asr.LOCAL, joint_asr.MOSS_LOCAL) else NETWORK_LANE
+        return GPU_LANE if backend in joint_asr.GPU_BACKENDS else NETWORK_LANE
 
     return BatchItem(
         label=(

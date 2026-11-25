@@ -12,25 +12,27 @@ and the inserts deferred for want of room).
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Sequence
 
 from ....speech.diarization import judgments as sidecar
+from ....speech.joint import voices
+from ....subtitles.stable_rows import read_rows
 from ...chunking import SubtitleWindow, load_product_segments
 from ...knowledge.base import append_task_artifact
 from ...token_budget import TokenCounter
-from .prompt import audio_layout, candidates, judge_prompt, profiles, rows_of
+from .prompt import candidates, label_source, rows_of
 from .roster import roster_entries
 from .run import (
     JudgeInputs,
     JudgeReport,
     entities_of,
     judge_group,
-    marks_shown,
     run_speaker_judge,
     speakers_of,
     summary_of,
+    unit_prompt,
     vocal_audio_for,
 )
 from .windows import split_windows
@@ -112,10 +114,12 @@ def judge_task(request: Any, correction_windows: Sequence[SubtitleWindow], conte
         context_pack = context_pack.with_source_order(
             [segment.id for segment in load_product_segments(request.stable_json)[0]])
     media = judge_media(request, warn)
+    inputs = judge_inputs(request, context_pack, knowledge_root=knowledge_root, fallback_title=fallback_title)
+    if label_source(rows_of(read_rows(request.stable_json))) == "cloud":
+        inputs = replace(inputs, voices=voices.ensure(request.stable_json, request.audio_path, warn=warn))
     report = run_speaker_judge(
         stable_json=request.stable_json, correction_windows=correction_windows, profile=request.profile,
-        client=client, inputs=judge_inputs(request, context_pack, knowledge_root=knowledge_root,
-                                           fallback_title=fallback_title),
+        client=client, inputs=inputs,
         media=media, audio=judge_audio(request, media, warn), task_artifact_dir=artifact_dir, task_id=task_id,
         parallel=request.parallel_windows, warn=warn, limits=_limits(media, request.profile.difficulty),
         counter=counter, shape=shape)
@@ -125,6 +129,9 @@ def judge_task(request: Any, correction_windows: Sequence[SubtitleWindow], conte
         **asdict(report),
         "moved": len(judged.moved) if judged else 0,
         "new_tracks": new_tracks_of(judged),
+        **({"merged": [asdict(merge) for merge in judged.merges]} if judged and judged.merges else {}),
+        **({"merge_refused": [{"a": a, "b": b, "why": why} for a, b, why in judged.refused]}
+           if judged and judged.refused else {}),
         **({"shape": shape, "acts": {act: sum(1 for value in shaped.acts.values() if value == act)
                                      for act in sidecar.ACTS},
             "dropped": [{"row": row, "why": why} for row, why in shaped.dropped.items()],
@@ -152,7 +159,6 @@ def preview_task(request: Any, correction_windows: Sequence[SubtitleWindow], *, 
                  fallback_title: str, counter: TokenCounter, shape: str | None = None) -> dict[str, Any]:
     """The first judge window's prompt, as the dry run shows it, and what the judge would cost in input.
     Calls no model; the candidates are the knowledge base's only (the preparation task has not run)."""
-    from finesub.subtitles.stable_rows import read_rows
 
     segments = read_rows(request.stable_json)
     rows = rows_of(segments)
@@ -160,14 +166,15 @@ def preview_task(request: Any, correction_windows: Sequence[SubtitleWindow], *, 
     if not windows or not sidecar.judgeable(segments):
         return {"speaker_judge": {"windows": 0, "skipped": "no usable speaker labels"}}
     inputs = judge_inputs(request, None, knowledge_root=knowledge_root, fallback_title=fallback_title)
+    if label_source(rows) == "cloud":
+        inputs = replace(inputs, voices=voices.read(request.stable_json, segments))
+    tracks = sidecar.profile_tracks([row.speaker for row in rows])
     messages, tokens = [], 0
     for index, window in enumerate(windows):
-        profile = profiles(rows, window)
-        layout = audio_layout(rows, window, profile.samples) if request.speaker_judge == "audio" else None
-        system, user, _ = judge_prompt(rows, window, title=inputs.title,
-                                       summary=inputs.summary([row.id for row in rows[window.low:window.high]]),
-                                       cast=inputs.pool, marks=marks_shown(), profile=profile, audio=layout,
-                                       shape=shape is not None, correct_only=request.profile.correct_only)
+        # each window with no earlier verdicts, the person table only the candidates, numbered where it stands
+        built = unit_prompt(rows, window, inputs, tracks=tracks, carried=(), heard=request.speaker_judge == "audio",
+                            shape=shape is not None, correct_only=request.profile.correct_only, segment=index + 1)
+        system, user, layout = built.system, built.user, built.layout
         tokens += counter.count_text(system) + counter.count_text(user)
         if layout is not None:
             tokens += counter.count_audio_seconds(layout.seconds)

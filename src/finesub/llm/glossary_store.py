@@ -28,7 +28,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-FORMAT = 1
+FORMAT = 2  # the one read: format 1 (the 2026-11-12 Genshin file) had no marks or tags; refetching replaces it
 DIRECTORY = "glossary"
 INSTALLED = "installed.json"
 KEEP_FILES = 3
@@ -51,8 +51,26 @@ class GlossaryTerm:
     label: str      # 角色 / 地区 / 组织 ...
     note: str
     group: str      # the entity: several spellings of one name share it
-    core: bool      # on the resident list
+    core: bool      # in the resident list's pool: a core name of the last two years, or one too short to match
     famous: bool    # a closed-book model knew it
+    skip: str = ""       # why the term is never listed or matched (not a name, an everyday address form...); "" = used
+    core_skip: str = ""  # why a core name stays off the resident list (an everyday word); still a window candidate
+    rare: bool = False   # a less common name (a minor NPC, a quest, an item): kept in the file, not listed or matched
+    exact: bool = False  # matched only as written, never by sound: a short name or one that is also an everyday word
+    fold: bool = False   # an exact katakana name that is no everyday word: also found in hiragana / half-width kana
+    tags: tuple[str, ...] = ()  # the build's evidence (kind:, important:, added:, famous:...): read by people, not here
+
+    @property
+    def matched(self) -> bool:
+        """Listed and matched at all: neither skipped nor rare."""
+
+        return not self.skip and not self.rare
+
+    @property
+    def resident(self) -> bool:
+        """On the resident list: in its pool, not famous, not marked off it, listed at all."""
+
+        return self.core and not self.famous and not self.core_skip and self.matched
 
     def name(self, language: str) -> str:
         return {"ja": self.ja, "zh": self.zh, "en": self.en}.get(language, "")
@@ -117,16 +135,22 @@ def parse(data: bytes) -> Glossary:
         where = f"terms[{i}]"
         if not isinstance(t, dict):
             raise GlossaryError(f"{where}: not an object")
-        if not isinstance(t.get("reading", False), bool) or not all(
-                isinstance(t.get(k, False), bool) for k in ("core", "famous")):
-            raise GlossaryError(f"{where}: reading / core / famous must be booleans")
+        flags = ("reading", "core", "famous", "rare", "exact", "fold")
+        if not all(isinstance(t.get(k, False), bool) for k in flags):
+            raise GlossaryError(f"{where}: {' / '.join(flags)} must be booleans")
+        tags = t.get("tags", [])
+        if not isinstance(tags, list) or not all(isinstance(x, str) for x in tags):
+            raise GlossaryError(f"{where}: tags must be a list of strings")
         terms.append(GlossaryTerm(
             ja=_text(t, "ja", where), zh=_text(t, "zh", where), en=_text(t, "en", where, False),
             kana=_text(t, "kana", where, False), reading=t.get("reading", False), label=_text(t, "label", where, False),
             note=_text(t, "note", where, False), group=_text(t, "group", where, False) or t["ja"].strip(),
             core=t.get("core", False), famous=t.get("famous", False),
+            skip=_text(t, "skip", where, False), core_skip=_text(t, "core_skip", where, False),
+            rare=t.get("rare", False), exact=t.get("exact", False), fold=t.get("fold", False),
+            tags=tuple(tags),
         ))
-    if not terms:
+    if not any(t.matched for t in terms):
         raise GlossaryError("no terms")
     noise: dict[tuple[str, str], float] = {}
     for key, rate in (raw.get("noise") or {}).items():
@@ -243,10 +267,21 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 
 def load(knowledge_root: str | Path | None, sha256: str) -> Glossary | None:
-    """The glossary stored under ``sha256``; None once it has been pruned."""
+    """The glossary stored under ``sha256``; None once it has been pruned, or when this FineSub cannot read it (an
+    older format: warned, the task goes on without it)."""
 
     path = directory(knowledge_root) / f"{sha256}.json"
-    return _load(str(path)) if path.is_file() else None
+    if not path.is_file():
+        return None
+    try:
+        return _load(str(path))
+    except GlossaryError as exc:
+        from finesub.reporting import current_reporter
+
+        current_reporter().warning(
+            "game-glossary-unreadable", f"an installed game glossary cannot be read: {exc}",
+            impact="the task runs without it; `finesub knowledge glossary fetch <game>` installs the current one")
+        return None
 
 
 @lru_cache(maxsize=4)
@@ -313,13 +348,15 @@ def selection(knowledge_root: str | Path | None, notes: str, requested: Sequence
 
 
 def load_selection(knowledge_root: str | Path | None, picks: Sequence[Mapping[str, str]]) -> list[Glossary]:
-    """The pinned glossaries; one pruned since is replaced by the game's current one, with a warning."""
+    """The pinned glossaries; one pruned since is replaced by the game's current one, with a warning. One still
+    there that this FineSub cannot read is left out (``load`` warns): the task runs without it."""
 
     out = []
     current = installed(knowledge_root)
     for pick in picks:
+        pruned = not (directory(knowledge_root) / f"{pick['sha256']}.json").is_file()
         glossary = load(knowledge_root, pick["sha256"])
-        if glossary is None and pick["game"] in current:
+        if pruned and pick["game"] in current and current[pick["game"]].sha256 != pick["sha256"]:
             from finesub.reporting import current_reporter
 
             current_reporter().warning(

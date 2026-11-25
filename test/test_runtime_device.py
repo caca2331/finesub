@@ -892,7 +892,7 @@ def test_the_forced_aligner_stays_off_an_intel_card(xpu, reported, monkeypatch) 
     )
     monkeypatch.setattr(aligner, "_LOADED", None)
 
-    aligner._model()
+    aligner._model("cuda")
 
     assert placed == {"device": "cpu", "dtype": torch.float32}
     assert reported.codes() == ["cpu-fallback"]

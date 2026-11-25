@@ -834,3 +834,20 @@ def test_dry_run_shows_the_none_window_the_run_sends(tmp_path, monkeypatch, stra
     assert "<keep_entries>" in window_system
     prepare_system = artifacts["research_messages"][0][0]["content"]
     assert "<keep_entries>" in prepare_system and "单独上限 8 条" in prepare_system
+
+
+@pytest.mark.parametrize("knowledge_enabled", [True, False])
+@pytest.mark.parametrize("retrieval", ["local", "none"])
+def test_name_source_rule_names_only_what_the_window_is_handed(knowledge_enabled: bool, retrieval: str) -> None:
+    """Goals item 3's sources for a source-language spelling, like `$verify_basis`: no term lines without a base,
+    no search results without retrieval (the background is there under every layer)."""
+
+    from finesub.llm.prompt_compose import compose_correction_system
+    from finesub.llm.routing.profiles import resolve_profile
+
+    system = compose_correction_system(
+        resolve_profile("text", retrieval, "quality"), knowledge_enabled=knowledge_enabled, length_scale=1.0)
+    rule = system[:system.index("写出了原文写法的")].rsplit("。", 1)[-1]
+    assert "背景调查" in rule
+    assert ("知识库术语行" in rule) is knowledge_enabled
+    assert ("搜索结果" in rule) is (retrieval != "none")

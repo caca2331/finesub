@@ -545,11 +545,13 @@ MOSS_LOCAL_GPU_HINT = ("an NVIDIA card of compute capability 8.0 or newer (RTX 3
 MOSS_LOCAL_MIN_USABLE_GIB = 6.5
 
 
-def moss_local_unusable_reason(gpu_tier: Optional[str], device: Optional[str]) -> Optional[str]:
+def moss_local_unusable_reason(gpu_tier: Optional[str], device: Optional[str],
+                               backend: str = "moss-local") -> Optional[str]:
     """Why this run cannot decode with local MOSS, as the sentence to stop on, or None if it can.
 
     Unlike every other stage there is no CPU fallback: someone who picked MOSS gets MOSS or this error, not
-    another model behind their back. `gpu_tier` and `device` are the run's `--gpu-tier` and `--device`.
+    another model behind their back. `gpu_tier` and `device` are the run's `--gpu-tier` and `--device`;
+    `backend` the `--asr` value the sentence names.
     """
 
     from .resources import AUTO_GPU_TIER, RESOURCE_PROFILES, get_resource_profile
@@ -577,7 +579,7 @@ def moss_local_unusable_reason(gpu_tier: Optional[str], device: Optional[str]) -
                 reason = f"the run's GPU tier ({profile.gpu_tier}) gives it {profile.usable_gib:g} GiB of VRAM"
     if reason is None:
         return None
-    return (f"--asr moss-local needs {MOSS_LOCAL_GPU_HINT}, but {reason}; use --asr local (Whisper) or a cloud "
+    return (f"--asr {backend} needs {MOSS_LOCAL_GPU_HINT}, but {reason}; use --asr local (Whisper) or a cloud "
             "backend (docs/manual/asr-backend-choice.md)")
 
 

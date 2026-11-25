@@ -538,3 +538,89 @@ def test_a_missing_block_rejection_is_neither_budgeted_nor_cached(tmp_path) -> N
     # answered with the stale "you owe blocks" verdict.
     accepted = _submit(runtime, task, "good", request_id="s2")
     assert accepted.get("accepted_task_id") == "call"
+
+
+def _session_text(runtime, task, text, *, request_id="t1"):
+    return runtime.accept_session_text(
+        assignment_id="assignment-1",
+        task_id=task["task_id"],
+        worker_id="worker-1",
+        lease_generation=task["lease_generation"],
+        request_id=request_id,
+        input_hash="sha256:in",
+        candidate=text,
+    )
+
+
+def _good_only(candidate, _manifest):
+    if candidate != "good":
+        return ValidationResult.repairable("say good")
+    return ValidationResult.accepted(candidate)
+
+
+def test_session_text_that_passes_is_accepted_and_says_how(tmp_path) -> None:
+    runtime = _runtime(tmp_path, validator=_good_only)
+    task = _claim(runtime)
+    _pull(runtime, task, [PROTOCOL, PAYLOAD], request_id="p1")
+
+    response = _session_text(runtime, task, "good")
+
+    assert response.get("accepted_task_id") == "call"
+    record = runtime.task_record(assignment_id="assignment-1", task_id="call")
+    assert record["status"] == "accepted"
+    assert record["accepted_via"] == "session_text"
+    assert json.loads(runtime.read_artifact(record["accepted_artifact_ref"]))["artifact"] == "good"
+
+
+def test_a_submitted_answer_says_it_came_by_submit(tmp_path) -> None:
+    runtime = _runtime(tmp_path, validator=_good_only)
+    task = _claim(runtime)
+    _pull(runtime, task, [PROTOCOL, PAYLOAD], request_id="p1")
+    _submit(runtime, task, "good", request_id="s1")
+    assert runtime.task_record(assignment_id="assignment-1", task_id="call")["accepted_via"] == "submit"
+
+
+@pytest.mark.parametrize("read", [True, False])
+def test_session_text_that_does_not_pass_changes_nothing(tmp_path, read) -> None:
+    runtime = _runtime(tmp_path, validator=_good_only)
+    task = _claim(runtime)
+    if read:
+        _pull(runtime, task, [PROTOCOL, PAYLOAD], request_id="p1")
+    before = runtime.task_record(assignment_id="assignment-1", task_id="call")
+
+    response = _session_text(runtime, task, "bad")
+
+    assert response["status"] == "repairable"
+    assert response["validation_errors"]
+    assert runtime.task_record(assignment_id="assignment-1", task_id="call") == before
+
+
+def test_session_text_is_not_judged_after_a_submit(tmp_path) -> None:
+    runtime = _runtime(tmp_path, validator=_good_only)
+    task = _claim(runtime)
+    _pull(runtime, task, [PROTOCOL, PAYLOAD], request_id="p1")
+    _submit(runtime, task, "bad", request_id="s1")
+
+    assert _session_text(runtime, task, "good")["status"] == "submitted"
+    assert runtime.task_record(assignment_id="assignment-1", task_id="call")["last_candidate"] == "bad"
+
+
+def test_session_text_that_passes_still_owes_its_proofread_turn(tmp_path) -> None:
+    class Proofreading:
+        def __call__(self, candidate, _manifest):
+            return ValidationResult.accepted(candidate)
+
+        @staticmethod
+        def proofread_opening(_artifact, _manifest):
+            return "proofread it"
+
+    runtime = _runtime(tmp_path, validator=Proofreading())
+    task = _claim(runtime)
+    _pull(runtime, task, [PROTOCOL, PAYLOAD], request_id="p1")
+
+    _session_text(runtime, task, "good")
+
+    record = runtime.task_record(assignment_id="assignment-1", task_id="call")
+    assert record["status"] == "repairing"
+    assert record["proofread"]["state"] == "owed"
+    assert record["last_candidate"] == "good"

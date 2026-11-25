@@ -26,13 +26,13 @@ from .routing.profiles import DEFAULT_PROFILE, TranslationProfile
 if TYPE_CHECKING:
     from .window_speakers import WindowSpeakers
 
-PROMPT_VERSION = "zh-subtitle-correction-csv-v115"
+PROMPT_VERSION = "zh-subtitle-correction-csv-v135"
 #: Three passes' pass 2 (the correction window over lines pass 1 grouped) versions its prompt on its own, so a
 #: change to it does not void the windows single-pass tasks already delivered, nor the other way round.
-GROUPED_PROMPT_VERSION = "zh-subtitle-correction-3pass-v21"
+GROUPED_PROMPT_VERSION = "zh-subtitle-correction-3pass-v37"
 #: capableC-tracked (a single-judged task's windows, `prompt_variants._CAPABLE_C_TRACKED`): they carry their speaker material
 #: (`SubtitleWindow.speakers`), and a window record names this version (`commit.window_prompt_version`).
-TRACKED_PROMPT_VERSION = "zh-subtitle-correction-tracked-v3"
+TRACKED_PROMPT_VERSION = "zh-subtitle-correction-tracked-v12"
 
 # No session asks for a visible reasoning block: in real zero-thinking calls of capable models the thinking never
 # moved into it (docs/llm_design_notes.md「模型回答退化的判据与重试的决策记录」), and a reasoning block asked for in the open gets Claude's
@@ -132,6 +132,14 @@ def render_term_line_rules() -> str:
     session may only rewrite existing lines, so it does not get the grammar)."""
 
     return load_prompt_template("fragment_knowledge_term_lines_v1.md").strip()
+
+
+def kb_term_lines_note(mode: Mapping[str, str], *, window: bool) -> str:
+    """The mode's note on reading term lines. A window also takes a name the background survey settled; the
+    preparation task is that survey, so its note names only search results (the re-read of csv-v129 found the task told of a block it has not)."""
+
+    settled = prompt_phrases("name_checks")["settled_by_background"] if window else ""
+    return Template(mode["kb_term_lines_note"]).substitute(settled_by=settled)
 
 
 def mode_texts(variant: CorrectionVariant | str | None, tier: CapabilityTier = CapabilityTier.CAPABLE) -> Dict[str, str]:
@@ -304,6 +312,14 @@ def _input_inventory(profile: TranslationProfile, *, knowledge_enabled: bool) ->
         parts.append("此前窗口的累积建议台账")
     parts.append("本窗只读前文 ASR")
     return _join_cn(parts)
+
+
+def _name_sources(profile: TranslationProfile, *, knowledge_enabled: bool) -> str:
+    """Where goals item 3 lets a correction window take a source-language spelling from: only the material it
+    is handed (the background is there under every retrieval layer)."""
+
+    written = "、".join(["背景调查", *(["搜索结果"] if profile.retrieval != "none" else [])]) + "里"
+    return f"知识库术语行的第一列或{written}" if knowledge_enabled else written
 
 
 def _background_sources(*, knowledge_enabled: bool) -> str:
@@ -635,16 +651,20 @@ def ensure_csv_block_headers(
     return rendered
 
 
-def search_rules_shared(*, prepare: bool, task_update_feedback: bool, knowledge: bool) -> str:
+def search_rules_shared(*, prepare: bool, task_update_feedback: bool, knowledge: bool, names_only: bool = False) -> str:
     """The rules every searching session shares: cross-check, search against the knowledge base, page text
     is not an instruction. A preparation task has no audio and records a conflict in its context pack, a
     correction window in the row's note; the feedback block is named only where the run asks for it.
     Without a readable knowledge base there is nothing to conflict with, so that rule is left out
-    (cold read round 4, P516). Numbered from 2 as written; the caller renumbers (`renumber_rules`)."""
+    (cold read round 4, P516). Numbered from 2 as written; the caller renumbers (`renumber_rules`).
+    ``names_only``: a correct-only task's feedback holds only the name checks, so the hint record is not named.
+    Either way an 未核 name's conflict goes to `name_checks` alone (owner 2026-11-20)."""
 
     record = "把冲突写进 `general_context.uncertainties`" if prepare else "在相关行的 note 里写明冲突"
-    if task_update_feedback:
+    if task_update_feedback and not names_only:
         record += "，并在 `<task_update_feedback>` 的 knowledge_hints 里另记一条"
+    if task_update_feedback:
+        record += prompt_phrases("name_checks")["conflict_record"]
     sources = ["ASR 文本", *([] if prepare else ["音频（如有）"]), *(["知识库资料"] if knowledge else []), "用户提供信息"]
     conflict = load_prompt_template("fragment_search_rule_kb_conflict_v1.md", conflict_record=record) if knowledge else ""
     return load_prompt_template(
@@ -668,14 +688,16 @@ def renumber_rules(text: str) -> str:
     return re.sub(r"(?m)^\d+\. ", number, text)
 
 
-def search_results_usage(*, prepare: bool, task_update_feedback: bool, knowledge: bool, self_search: bool = False) -> str:
+def search_results_usage(*, prepare: bool, task_update_feedback: bool, knowledge: bool, self_search: bool = False,
+                         names_only: bool = False) -> str:
     """The search-result rules around the shared ones (`search_rules_shared`). ``self_search``: an agentic
     window searches with its own tools, so the rules about a harness-filled `<search_results>` block give
     way to its own source and coverage rules."""
 
     return renumber_rules(load_prompt_template(
         "fragment_self_search_usage_v1.md" if self_search else "fragment_search_results_usage_v1.md",
-        shared_rules=search_rules_shared(prepare=prepare, task_update_feedback=task_update_feedback, knowledge=knowledge),
+        shared_rules=search_rules_shared(prepare=prepare, task_update_feedback=task_update_feedback, knowledge=knowledge,
+                                         names_only=names_only),
     ).strip())
 
 
@@ -750,7 +772,7 @@ _TRACK_WORDS = ("tracks_intro", "tracks_errors", "profile_examples", "tracks_cel
 _TRACK_WORD_OVERRIDES = {"tracks_cells": "fragment_track_cells_tracked_v1.md"}
 #: Its own pieces, each pass 1's wording made to answer in a `spk` column: the cells' confidence marks
 #: (`speaker_judge_marks_note_v1.md`, where `keep` accepts a filled track) and the answers a row may give
-#: (`speaker_judge_system_v3.md`'s list of answers, `keep` written out as the track itself).
+#: (`speaker_judge_system_v4.md`'s list of answers, `keep` written out as the track itself).
 TRACK_MARKS_FRAGMENT = "fragment_marks_note_tracked_v1.md"
 SPK_ANSWERS_FRAGMENT = "fragment_spk_answers_v1.md"
 #: The input's track column (item 5 of the input format), the output's `spk` column, and the user message's block
@@ -960,7 +982,8 @@ def compose_correction_system(
             ),
             **mode,
         ),
-        **mode,
+        **{**mode, "name_source_rule": Template(mode["name_source_rule"]).substitute(
+            name_sources=_name_sources(profile, knowledge_enabled=knowledge_enabled))},
     )
     retrieval_block = render_slot(
         "retrieval",
@@ -968,7 +991,7 @@ def compose_correction_system(
         **mode,
         search_results_usage=search_results_usage(
             prepare=False, task_update_feedback=task_update_feedback, knowledge=knowledge_enabled,
-            self_search=self_search,
+            self_search=self_search, names_only=v.correct_only,
         ),
     )
     effort_block = render_slot("effort", context, **mode)
@@ -1152,6 +1175,7 @@ def compose_correction_user(
     user_requests: bool = False,
     extra_style: str = "",
     speakers: "WindowSpeakers | None" = None,
+    self_search: bool = False,
 ) -> str:
     """``turns``, ``grouped``, ``keyed``, ``agentic`` and ``length_scale`` as in :func:`compose_correction_system`. ``style_pick_reminder`` leads the first reminder item and the closing
     reminder when the window carries a style pick: the reminders otherwise
@@ -1223,6 +1247,13 @@ def compose_correction_user(
             load_prompt_template(
                 "fragment_entry_details_input_v1.md",
                 entry_details_label=entry_details_label or render_entry_details_label(agentic=agentic),
+                kb_term_lines_note=kb_term_lines_note(mode, window=True),
+                # a window searching on its own (tools or the provider's) searches the 未核 names it is about to
+                # write first (owner 2026-11-20); a request round is told so in its query rules
+                unchecked_search_clause=(
+                    "\n" + load_prompt_template("fragment_unchecked_search_self_v1.md").strip()
+                    if self_search or profile.native_search else ""
+                ),
                 entry_details=entry_details,
             ).strip() + "\n\n"
             if knowledge_enabled

@@ -69,10 +69,12 @@ flash_gap_seconds = 0.3
 
 | 选项 | 默认 | 什么时候动它 |
 | --- | --- | --- |
-| `--asr` | `local` | 谁来转写：本机的 Whisper 那一串，云端的 `mai2` / `scribe` / `moss-pro`（`moss`）/ `gemini-35t`（`gemini`），或本机显卡上的开源 MOSS `moss-local`（8 GB 以上的 RTX 30 系列以上 N 卡）。后三类都不跑人声分离与 Whisper；云端的音频会发给提供方。费用、额度、显卡要求与续跑规则见[一体转写](asr-backend-choice.md)。也可写进 `config.toml` 的 `[asr] backend` |
-| `--asr-aligner` | `auto` | 超长段在段内切行的时间由本机的强制对齐模型对：`auto` 给 `moss-local`，`moss-pro` 的超长段与 `gemini-35t` 修补补回的文字在这次运行能用 GPU 时也对；`on` 三处都对（没有 GPU 时在 CPU 上慢跑）；`off` 都用 Silero。见[一体转写](asr-backend-choice.md)「重的本地计算」。也可写进 `config.toml` 的 `[asr] aligner` |
+| `--asr` | `local` | 谁来转写：本机的 Whisper 那一串，云端的 `mai2` / `scribe` / `moss-pro`（`moss`）/ `gemini-35t`（`gemini`），或本机显卡上的开源 MOSS `moss-local`（8 GB 以上的 RTX 30 系列以上 N 卡），以及两者的组合 `moss-diarization-aligner`（文字用云端一家、说话人由本机的 MOSS 定，配下面的 `--asr-rows`）。除了 `local`，都不跑人声分离，也不用 Whisper 转写（MOSS 两家有 GPU 时只借 Whisper 重定一部分切点的时间，见下一行）；云端的音频会发给提供方。费用、额度、显卡要求与续跑规则见[一体转写](asr-backend-choice.md)。也可写进 `config.toml` 的 `[asr] backend` |
+| `--asr-rows` | 无 | 只给 `--asr moss-diarization-aligner`（文字用云端一家、说话人由本机的开源 MOSS 定）：文字从哪家来，`mai2` / `scribe` / `gemini-35t`；这个后端新转写时必须有（读 `--asr-transcript` 时也要：按它认文件的格式），续跑已有的结果不用。别的后端在命令行或 manifest 里给了它会报错，`config.toml` 里的不算。见[一体转写](asr-backend-choice.md#别家的文字本地-moss-的说话人--asr-moss-diarization-aligner)。也可写进 `config.toml` 的 `[asr] rows` |
+| `--asr-transcript` | 无 | 只给 `--asr moss-diarization-aligner`：已经转好的文字，不再调 API——之前任务的 `<名字>-cloud/` 目录，或一份 `--asr-rows` 那家形状的 JSON（自己转写的按 Scribe 的形状写）。每个源一份，批处理写在 manifest 那一行的 `asr_transcript`；别的后端给了它会报错。见[一体转写](asr-backend-choice.md#别家的文字本地-moss-的说话人--asr-moss-diarization-aligner)「自己转好的文字怎么接进来」 |
+| `--asr-overlap-cue` / `--no-asr-overlap-cue` | 开 | 只给 `--asr moss-diarization-aligner`：同一个人被别人插话切开的几行合成一条字幕、插话与它同时显示；关掉就不合，被切开的几行各成一条（不同的人同时说话的行照样重叠显示）。见[一体转写](asr-backend-choice.md#别家的文字本地-moss-的说话人--asr-moss-diarization-aligner)。也可写进 `config.toml` 的 `[asr] overlap_cue` |
+| `--asr-aligner` | `auto` | 超长段在段内切行的时间由本机的强制对齐模型对：`auto` 给 `moss-local`、`moss-pro` 的超长段与 `gemini-35t` 修补补回的文字，有 GPU 时在卡上并由 Whisper 再修一遍 MOSS 两家没把握的切点（英语不修），没有时在 CPU 上慢跑；`on` 不看语言、英语也修；`off` 都用 Silero。见[一体转写](asr-backend-choice.md)「重的本地计算」。也可写进 `config.toml` 的 `[asr] aligner` |
 | `--asr-repair` | `on` | `mai2` 与 `gemini-35t`：补云端漏转的话、裁掉失控的复读；`scribe`：时间被挤坏的那一段再转一次。`on` 不花 `gemini-35t` 每天的请求数（`mai2` 的补问约多 6% 费用），`quota` 让 `gemini-35t` 也花请求数再问它自己（也给不带说话人的一窗配人），`off` 不补。见[一体转写](asr-backend-choice.md)「补漏转与复读」。也可写进 `config.toml` 的 `[asr] repair` |
-| `--asr-speaker-merge` | `auto`（不合并） | `mai2`：把同一个人被拆开的说话人标签按声纹合并，`on` 开。MOSS 两家总是合并，不看它。见[一体转写](asr-backend-choice.md)「说话人」。也可写进 `config.toml` 的 `[asr] speaker_merge` |
 | `finesub quota`（命令） | — | 某把 key 因额度用完或被拒被搁置（Gemini 某个模型当天用完、本机 agent 停用 2 小时、搜索 key 停用 24 小时、ElevenLabs 冻结到刷新时间、35t 与 MOSS Pro 当天记成用完），而你知道它已经能用了（充了值、换了档、额度恢复了）：`finesub quota` 看是哪几把，`finesub quota thaw <名字>` 或 `--all` 提前放回。见[密钥](env.md)「额度与解冻」 |
 | `--model` | `large-v3-turbo` | 换 Whisper。三个可选模型的实测对比见 [`models.md`](models.md) |
 | `--asr-decode-batch` | `auto`(= 1，关) | 运行 `large-v3` 级大模型时填 `8`，实测提速 **1.4–1.6 倍**；在默认模型上收益仅约 6%，不值得开启 |

@@ -77,7 +77,7 @@ prompt 变体是给模型的说明的不同写法，如给强模型的一套与�
 
 所有远程 API 请求共用一条代理设置：LLM 层的（Gemini REST、OpenAI 兼容 / Anthropic 端点、媒体上传、
 Exa / Gemma4 / Tavily 检索、免费的 `countTokens`），以及云端转写的（MAI2 经 Vercel、OpenRouter 或 Azure、
-Gemini 3.5 Transcribe、MOSS Pro，见 [`asr-backend-choice.md`](asr-backend-choice.md)）：
+ElevenLabs Scribe、Gemini 3.5 Transcribe、MOSS Pro，见 [`asr-backend-choice.md`](asr-backend-choice.md)）：
 
 ```toml
 [api]
@@ -173,7 +173,7 @@ token 计数改用本地估算（窗口略小，不影响正确性），联网�
 | 给什么模型（出厂绑定） | capable 组 | capable 组 | 两个 lite，思考 low |
 | 纠错的 prompt | 强模型那套 | 强模型那套 | lite 那套（一行对一个输入行，只接回被切断的词） |
 | 不写 `--diarize` 时开说话人裁判 | 开（跑到 LLM 阶段时） | 不开 | 不开；显式开报错 |
-| 纠错走三个 pass | 跟着说话人裁判：开了就走 | 不走：开了裁判是一步纠错兼认人（一体转写的任务除外；中文只纠错的任务也走，开跑时提示一行） | 不走，一律一步纠错 |
+| 纠错走三个 pass | 跟着说话人裁判：开了就走 | 不走：开了裁判是一步纠错兼认人（中文只纠错的任务也是，开跑时提示一行）；一体转写的任务例外，照样走三个 pass | 不走，一律一步纠错 |
 | `--llm-proofread auto` 时校对（`on` 时三档都校对） | 校对 | 不校对 | 不校对 |
 | `--llm-proofread-inline auto` 时窗内校对 | 不校对 | 校对（一步纠错的窗口；中文只纠错的任务与换了 prompt 的格子不做，见[调参](tuning.md#llm-这一侧)） | 不校对 |
 | 风格 | 照常 | 照常 | 只用出厂默认风格，见[`knowledge.md`「风格条目」](knowledge.md#风格条目style记住一套翻译习惯) |
@@ -185,7 +185,7 @@ token 计数改用本地估算（窗口略小，不影响正确性），联网�
 
 - 免费档 capable 的日额度（每个模型每天 20 次请求）耗尽、又没配付费 key 时，运行会**停下**而不是偷偷换成 lite（配了付费 key 就轮到组尾的付费成员）；
 - 两条出路：等额度恢复后续跑，或显式 `--llm-difficulty efficiency` 继续（`intermediate` 绑的也是 capable 组，
-  换过去额度一样不够）。开着说话人裁判的任务这样续跑也不报错：续跑照任务记下的裁判走。
+  换过去额度一样不够）。`efficiency` 只把纠错换成 lite：准备任务与知识更新在三档都用各自 quality 那一格的组（同一批免费强模型），额度在准备任务里就用完、或带着 `--knowledge update` 时，换过去也接不住，只能等额度或配付费 key。开着说话人裁判的任务这样续跑也不报错：续跑照任务记下的裁判走。
   例外：额度在准备任务里就用完的任务，纠错怎么走还没记下来，这时命令里仍写着 `--diarize judge-text` / `judge-audio` 会按新任务报错；去掉它再续跑。
 - 切档**不会丢失已完成窗口**。产物中会出现前后不同变体的混合，这是显式发起的，逐窗都有记录。
 
@@ -308,7 +308,7 @@ Code / CodeBuddy 的办法：出厂预设只是没绑。能写的名字见下面
 | `gemini-paid-3_8-flash`、`gemini-paid-3_5-flash-lite` | 同名模型的付费档，出厂排在各组末尾 | 中 / 低 | 能 | `.env` 里的 `GEMINI_PAID` key |
 | `local-codex-gpt-6-luna`、`local-codex-gpt-6_1-terra`、`local-codex-gpt-6_2-sol` | 经 Codex CLI 调 GPT-6 Luna / GPT-6.1 Terra / GPT-6.2 Sol | 中 / 中 / 高 | 否 | 装好并登录 Codex CLI（[本机 agent](agent.md)） |
 | `local-claude-opus`、`local-claude-sonnet`、`local-claude-haiku` | 经 Claude Code 调 Opus / Sonnet / Haiku 的当前最新版 | 高 / 高 / 中 | 否 | 装好并登录 Claude Code |
-| `local-agy-gemini-3_8-flash`、`local-agy-gemini-4-argon`、`local-agy-gemini-4-hydrogen` | 经 agy 调 Gemini 3.8 Flash / Gemini 4 Argon / Gemini 4 Hydrogen；出厂 agy 组用 Hydrogen 与 Argon，3.8 Flash 不在出厂组里 | 中 / 高 / 中 | 能 | 装好并登录 agy（[agent.md「需要装什么」](agent.md#3-需要装什么)） |
+| `local-agy-gemini-3_8-flash`、`local-agy-gemini-4-hydrogen`、`local-agy-gemini-4-neon` | 经 agy 调 Gemini 3.8 Flash / Gemini 4 Hydrogen / Gemini 4 Neon；出厂 agy 组用 Hydrogen，Neon 紧跟它当故障替补，3.8 Flash 不在出厂组里 | 中 / 中 / 高 | 能 | 装好并登录 agy（[agent.md「需要装什么」](agent.md#3-需要装什么)） |
 | `local-agy-sonnet-5_5`、`local-agy-opus-5_5` | 经 agy 调 Claude Sonnet 5.5 / Opus 5.5；Opus 不在任何出厂模型组里 | 高 | 否 | 同上 |
 | `local-dsh-deepseek-v4_1-flash`、`local-dsh-deepseek-v4-pro` | 经 dsh 调 DeepSeek V4.1 Flash / V4 Pro，只能绑按窗口跑的格子 | 中 | 否 | 装好 dsh、配好 DeepSeek key（[agent.md 4.1](agent.md#41-dshdeepseek-harness只能按窗口跑)） |
 | `local-codebuddy-hy4flash-free`、`local-codebuddy-hy4flash`、`local-codebuddy-deepseek-v4_1-flash` | 经 CodeBuddy 调混元 4 Flash（免费线 / 付费）/ DeepSeek V4.1 Flash；只有 `hy4flash-free` 免费（活动到 2026-12-01），它的当日免费额度用完默认转付费的 `hy4flash`（关法见 [agent.md 4.2](agent.md#42-codebuddy模型清单跟着账号走)） | 低 / 低 / 中 | 否 | 装好并登录 CodeBuddy Code CLI（[agent.md 4.2](agent.md#42-codebuddy模型清单跟着账号走)） |
@@ -378,8 +378,8 @@ config.toml 不动；优先级按 `命令行[任务组] > 命令行[default] > �
 
 | 模型组 | 成员（有序） | 绑定的格子 |
 | --- | --- | --- |
-| `agy-capable` | 免费 Gemini 4 Hydrogen → 免费 3.8 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Argon | 纠错的 quality + intermediate、knowledge/quality |
-| `agy-basic` | 免费 3.6 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Argon | research 的 quality |
+| `agy-capable` | 免费 Gemini 4 Hydrogen → 免费 3.8 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Neon | 纠错的 quality + intermediate、knowledge/quality |
+| `agy-basic` | 免费 3.6 Flash → agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Neon | research 的 quality |
 
 免费 API 在前是有意的，两边的额度都不浪费。Sonnet 5.5 是**纯文本**，排在媒体成员之前同样有意：
 文字任务优先给它，带剪辑的任务在能力过滤时自动跳过它、落到 agy 前置的那个 Gemini。
@@ -393,17 +393,17 @@ config.toml 不动；优先级按 `命令行[任务组] > 命令行[default] > �
 
 | 模型组 | 成员（有序） | 绑定的格子 |
 | --- | --- | --- |
-| `agy-only-capable` | agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Argon | 纠错的 quality + intermediate、knowledge/quality |
-| `agy-only-basic` | agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Argon | research 的 quality |
+| `agy-only-capable` | agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Neon | 纠错的 quality + intermediate、knowledge/quality |
+| `agy-only-basic` | agy Sonnet 5.5 → agy Gemini 4 Hydrogen → agy Gemini 4 Neon | research 的 quality |
 
 > **与 `execution_policy = "agent-only"` 有何区别？** 两条路径可能产生相同的调用，但语义不同：
 > policy 是一道**对所有预设都起作用的开关**，只能把某一类后端整个关掉、不能新增成员，且对**任何**激活的预设生效；预设
 > 描述的是「这份名单中有哪些成员」。需要临时将某次运行限制为纯 agent 时使用 policy；需要长期按
 > 订阅运行时使用 `agy` 预设。两者叠加使用也没有问题。
 
-> agy 的 Sonnet 5.5、Opus 5.5 按 high/medium/low 原样接收思考档位（`thinking` 为默认映射）；Gemini 4 Argon、Gemini 4 Hydrogen 与 3.8 Flash 一样封在 `medium,medium,low`。
+> agy 的 Sonnet 5.5、Opus 5.5 按 high/medium/low 原样接收思考档位（`thinking` 为默认映射）；Gemini 4 Hydrogen、Gemini 4 Neon 与 3.8 Flash 一样封在 `medium,medium,low`。
 > `[llm].local_agent_reasoning_effort = "xhigh"` 对 agy 的各行按 `high` 发。
-> Gemini 4 Argon 在每个出厂 agy 组里紧跟 Gemini 4 Hydrogen，当它的替补（额度另算，Gemini 那份用完时还能接）。
+> Gemini 4 Neon 在每个出厂 agy 组里紧跟 Gemini 4 Hydrogen，接 Hydrogen 的超时、不可用、限速与其他临时失败。两者同一份额度：额度用完时 agy 的报错不明说，FineSub 要等 Hydrogen 与 Neon 通常各失败一次、再探一次才停用这份额度。
 > Opus 5.5 不在任何出厂模型组里，要用就 `--llm-model local-agy-opus-5_5` 点名，或列进自己的模型组。
 
 ### 快速粗纠：`agy-fast` 与 `fast`
@@ -418,7 +418,7 @@ config.toml 不动；优先级按 `命令行[任务组] > 命令行[default] > �
 
 | 预设 | 给谁 | efficiency 格 | 其余格 |
 | --- | --- | --- | --- |
-| `agy-fast` | 有 agy 订阅的人 | 纠错与准备任务都只用 agy Gemini 4 Hydrogen，它的额度用完时接 agy Gemini 4 Argon（`agy-only-fast`）；两份都用完就停下报错，**不会转到 API** | 与 `agy` 相同 |
+| `agy-fast` | 有 agy 订阅的人 | 纠错与准备任务都只用 agy Gemini 4 Hydrogen，它出故障时接 agy Gemini 4 Neon（`agy-only-fast`）；Gemini 那份额度用完就停下报错，**不会转到 API** | 与 `agy` 相同 |
 | `fast` | 只用 API 的人 | 纠错落到两个 3.5 Flash Lite（免费在前、付费在后）；准备任务与 `default` 相同（免费 3.6 / 3.8 Flash 与 Gemini 4 Hydrogen，再接付费） | 与 `default` 相同 |
 
 4 个窗口是上限，实际并发还受 `[llm].local_agent_max_parallel`（agent，默认 4）或 API 的每分钟请求限速约束。
@@ -464,7 +464,6 @@ config.toml 不动；优先级按 `命令行[任务组] > 命令行[default] > �
 | `模型组 X 的成员 … 不一致，按其中最小的 N 切分（由 Y 决定…）` | 组里成员写的三个质量上限不同（没写的按默认计），这个组按最小的切分 | 想用大的，给组里每个成员都写上 |
 | `规划包络由 X 决定 (…tokens…)，窗口数约 ×N` | 告警里的「规划包络」指一个窗口最多能放进多少输入；组里有成员能放进的量或输出上限比免费 Gemini 小 | 窗口按**组内最低**规划（谁应答还没定，必须保守），×N 是窗口数放大倍数。组里有小上下文模型时窗口会变多；想要大窗口，组里别放小模型 |
 | `组内没有成员支持音频` | `-mm` 格里一个能听的都没有 | 带媒体的调用会在能力过滤后无候选可用；换模型，或把该任务改成 `text` |
-| `N 个成员里只有 1 个支持音频` | 该格能服务媒体调用，但只有一个候选 | 不是错误：纯文本成员排在前面是刻意的（文字任务优先给它）。但媒体调用的链长为 1，那一个失败就整轮失败，想要冗余就再加一个能听的成员 |
 | `target X 不支持视频，按 video->audio 降一级` | 运行中途的兜底检查触发 | 正常配置不该看到它。说明该格里混进了看不了视频的模型 |
 
 ## 7. 什么会作废已完成的进度

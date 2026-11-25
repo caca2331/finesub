@@ -120,6 +120,10 @@ def owner_of_tracks(probs, grid, people, *, frame_seconds: float | None = None) 
 
     `frame_seconds` is the grid of `probs` (default: the lab's 80 ms); segments come back in
     seconds and index the 80 ms truth grid either way.
+
+    Keys are `probs` column numbers, not raw track ids: see `backend_cost.timeline_probs`. Looking up raw ids silently
+    reads the neighbouring track's owner; before a new script reports numbers, check it on a file whose track ids
+    do not start at 0.
     """
     from finesub.speech.diarization.segments import segments_from_activity
 

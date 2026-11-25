@@ -4,10 +4,16 @@ A task gets a glossary when the preparation task selects an installed one (`glos
 name the game, or the task names ``glossary/<game>`` in ``<requested_entries>``. Unselected, nothing here runs and
 the correction prompt is unchanged.
 
+A glossary keeps every name it extracted; the ones it should not offer carry a mark instead of being left out
+(``skip``: not a name, never listed or matched; ``rare``: a less common name, kept for later but not listed or
+matched either; ``core_skip``: off the resident list only; ``exact``: a window candidate only as written, never by
+sound; ``fold``: an exact katakana name also found in hiragana), so a later build can move a name back by changing its
+mark. The build derives the marks from each term's ``tags``, which this module does not read.
+
 ``GlossaryView`` is built once per run from the whole transcript and renders each window's block, three parts:
 
-- **resident list**: the glossary's core terms that a closed-book model did not know (``core and not famous``),
-  the same for every window;
+- **resident list**: the glossary's core terms that a closed-book model did not know and that are not marked off it
+  (``GlossaryTerm.resident``), the same for every window;
 - **frequency list**: names written verbatim on ``FREQUENT_ROWS`` or more rows of this recording;
 - **window candidates**: names written verbatim on a row of the window (a famous name written verbatim is left out:
   a model writes it right without help) and, for a Japanese source with the ``kb-phonetic`` extra, names a row
@@ -54,27 +60,34 @@ class GlossaryView:
 
         self.games = tuple(g.game for g in glossaries)
         self.source = source if source in COLUMN else "ja"
-        seen: set[tuple[str, str]] = set()
+        # a name -> its entity: each file keys its own groups, so two games' 杰克 are two entities. A name is its
+        # form in this source with its zh (``_key``): in English, 氷=冰 is Cryo in one game and Ice in another
+        entity: dict[tuple[str, str], tuple[str, str]] = {}
         self.terms: list[GlossaryTerm] = []
         for g in glossaries:
             for t in g.terms:
-                if (t.ja, t.zh) not in seen and self._usable(t):
-                    seen.add((t.ja, t.zh))
+                if self._key(t) not in entity and self._usable(t):
+                    entity[self._key(t)] = (g.game, t.group)
                     self.terms.append(t)
         self.by_form: dict[str, list[GlossaryTerm]] = defaultdict(list)
         for t in self.terms:
             self.by_form[self._form(t)].append(t)
         self.forms = gm.by_length(self.by_form)
-        self.verbatim = {text: gm.verbatim(text, self.forms) for text in set(texts)}
-        rows_per_group: dict[str, int] = defaultdict(int)
+        # an exact katakana name that is no everyday word is also found in the other kana (``fold``)
+        folded = gm.by_length({self._form(t) for t in self.terms if t.fold}) if self.source == "ja" else ()
+        self.verbatim = {text: gm.verbatim(gm.widen_kana(text), self.forms)
+                         | (gm.kana_verbatim(text, folded, self.forms) if folded else set())
+                         for text in set(texts)}
+        rows_per_group: dict[tuple[str, str], int] = defaultdict(int)
         for text in texts:
-            for group in {t.group for f in self.verbatim[text] for t in self.by_form[f]}:
+            for group in {entity[self._key(t)] for f in self.verbatim[text] for t in self.by_form[f]}:
                 rows_per_group[group] += 1
         frequent_groups = {g for g, n in rows_per_group.items() if n >= FREQUENT_ROWS}
-        self.core = [t for t in self.terms if t.core and not t.famous]
-        core_keys = {(t.ja, t.zh) for t in self.core}
-        self.frequent = [t for t in self.terms if t.group in frequent_groups and (t.ja, t.zh) not in core_keys]
-        self.listed = core_keys | {(t.ja, t.zh) for t in self.frequent}
+        self.core = [t for t in self.terms if t.resident]
+        core_keys = {self._key(t) for t in self.core}
+        recurring = [t for t in self.terms if entity[self._key(t)] in frequent_groups]
+        self.frequent = [t for t in recurring if self._key(t) not in core_keys]
+        self.listed = core_keys | {self._key(t) for t in self.frequent}
         self.sound: dict[str, list[gm.SoundHit]] = {}
         self.by_ja: dict[str, list[GlossaryTerm]] = defaultdict(list)  # one ja may carry two names (ナッツ: 松果, 小松果)
         for t in self.terms:
@@ -83,18 +96,23 @@ class GlossaryView:
             noise: dict[tuple[str, str], float] = {}
             for g in glossaries:
                 noise.update(g.noise)
-            matcher = gm.SoundMatcher((gm.Term(t.ja, t.kana, t.reading) for t in self.terms if t.kana), noise)
-            self.sound = matcher.match(texts, frozenset(t.ja for t in self.terms if t.group in frequent_groups))
+            # an ``exact`` term (short, or also an everyday word) is found only as written
+            matcher = gm.SoundMatcher((gm.Term(t.ja, t.kana, t.reading) for t in self.terms if t.kana and not t.exact),
+                                      noise)
+            self.sound = matcher.match(texts, frozenset(t.ja for t in recurring))
 
     def _form(self, t: GlossaryTerm) -> str:
         return t.name(self.source)
 
+    def _key(self, t: GlossaryTerm) -> tuple[str, str]:
+        return self._form(t), t.zh
+
     def _usable(self, t: GlossaryTerm) -> bool:
-        """Whether ``t`` can be matched in this source: it has a form there, and in English that form is a name, not
-        an ordinary word the upstream lists in lower case (contract, element)."""
+        """Whether ``t`` can be matched in this source: it is not marked ``skip`` or ``rare``, it has a form there, and in English
+        that form is a name, not an ordinary word the upstream lists in lower case (contract, element)."""
 
         form = self._form(t)
-        return bool(form) and not (self.source == "en" and form[:1].islower())
+        return t.matched and bool(form) and not (self.source == "en" and form[:1].islower())
 
     def _pair(self, t: GlossaryTerm) -> str:
         if self.source == "zh":
@@ -115,11 +133,13 @@ class GlossaryView:
             for f in self.verbatim.get(text, ()):
                 for t in self.by_form[f]:
                     if not t.famous:
-                        found.setdefault((t.ja, t.zh), {"t": t, "rows": [], "basis": "原样", "rank": (0, 0.0, 0.0)})
-                        found[(t.ja, t.zh)]["rows"].append(i)
+                        found.setdefault(self._key(t), {"t": t, "rows": [], "basis": "原样", "rank": (0, 0.0, 0.0)})
+                        found[self._key(t)]["rows"].append(i)
             for hit in self.sound.get(text, ()):
                 for t in self.by_ja[hit.ja]:
-                    c = found.setdefault((t.ja, t.zh), {"t": t, "rows": [], "basis": "音近",
+                    if t.exact:  # another row of the same ja is matched by sound; this one only as written
+                        continue
+                    c = found.setdefault(self._key(t), {"t": t, "rows": [], "basis": "音近",
                                                         "rank": (1, hit.noise, hit.cost)})
                     if c["basis"] == "音近":
                         c["rank"] = min(c["rank"], (1, hit.noise, hit.cost))

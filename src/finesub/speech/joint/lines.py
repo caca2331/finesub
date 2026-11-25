@@ -10,7 +10,7 @@ Scribe round's (E1st, MAI2's route); readouts and reasons in `docs/joint-asr.md`
   every pause over SEAM_PAUSE (35t, MAI2), or every MOSS Pro line after merging its short segments;
 * 35t only: abutting words pulled GRID_GAP apart (its 100 ms grid makes them abut, and the DP reads a zero
   pause as connected speech); 35t and Scribe: the sentence-boundary model's evidence taken off each cut (`sbd.py`);
-* in Chinese (the word backends): sentence-end evidence after every clause mark (`clause_bonus`).
+* in Chinese (every backend): sentence-end evidence after every clause mark (`clause_bonus`).
 
 Turns: 35t and MOSS Pro each run the DP once per turn -- a 35t turn is one
 speaker's run in output order, a MOSS Pro turn is a line after the merge -- with a VAD derived from that turn's
@@ -22,6 +22,7 @@ its words' time; lines are in order by start, same start by `line_speaker`.
 
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
 from typing import Any, Iterable, Sequence
@@ -71,10 +72,22 @@ def dp_words(units: Iterable[dict], *, duration: float, keep_order: bool = False
     word before it, `space_before` between Latin words. Sorted by start unless `keep_order`."""
     raw = list(units) if keep_order else sorted(units, key=lambda w: w["start"])
     words: list[dict] = []
+    kept: dict | None = None  # the unit before this one, if it was kept
     for w in raw:
         text = (w.get("text") or "").strip()
-        if not text or w["start"] >= duration:
+        if not text:
             continue
+        if w["start"] >= duration:
+            # past the cut, only a mark or symbol with no time of its own, at the end of the kept unit before it,
+            # stays (a unit the aligner gives no time takes that unit's end, which may be the audio's very end):
+            # folded into it
+            if (kept is not None and w["start"] == w["end"] == kept["end"]
+                    and all(unicodedata.category(ch)[0] in "PSZ" for ch in text)):
+                words[-1]["word"] += text
+            else:
+                kept = None
+            continue
+        kept = w
         if all(unicodedata.category(ch)[0] in "PZ" for ch in text) and words:
             words[-1]["word"] += text
             continue
@@ -185,9 +198,75 @@ def _is_punct(ch: str) -> bool:
     return unicodedata.category(ch)[0] in "PSZ"
 
 
+#: Hiragana and katakana, without the middle dot and the long-vowel mark (Chinese text uses them in names).
+_KANA = re.compile(r"[\u3041-\u3096\u30a1-\u30fa]")
+#: nagisa's parts of speech that belong with the word before them in a line (`_glued`).
+_GLUE_POS = frozenset({"助詞", "助動詞", "接尾辞"})
+#: What a te-form's て / で follows (読ん+で, 寒く+て, させ+て); after a noun で is the case particle.
+_TE_FORM = frozenset({"動詞", "形容詞", "助動詞"})
+
+
+def japanese(text: str) -> bool:
+    """A segment with any kana is Japanese (judged per segment, so a task without `--language` is judged too)."""
+    return bool(_KANA.search(text))
+
+
+def _glued(word: str, pos: str, prev: tuple[str, str], before: str) -> bool:
+    """Whether a Japanese word stays in one line with the word before it (`prev`: its surface and part of speech;
+    `before`: the part of speech of the word before that): a particle, an auxiliary or a suffix; a word after a
+    prefix; a noun after a noun (a compound: ファースト+コンタクト, 血統+代理+人); a verb after a verb (a compound
+    verb: 走り+出す; also a repeat: わかる+わかる) or after a verb's te-form (待っ+て+ください -- not a case particle's で: ゲームで / 遊ぶ); a
+    suru-verb's する after its noun (作用+する)."""
+    prev_word, prev_pos = prev
+    if pos in _GLUE_POS or prev_pos == "接頭辞" or (pos == "名詞" and prev_pos == "名詞"):
+        return True
+    if pos == "動詞":
+        return prev_pos == "動詞" or (prev_pos == "助詞" and prev_word in ("て", "で") and before in _TE_FORM) or (
+            prev_pos == "名詞" and word.startswith(("し", "す", "さ", "せ", "でき")))
+    return False
+
+
+def _japanese_words(token: str) -> list[tuple[str, str]]:
+    """(surface, part of speech) for a space-free token, by nagisa (the dictionary segmenter transformers' Qwen3
+    processors use for Japanese; light, with wheels on every platform). nagisa normalises some characters (？ -> ?) but not their count, so the
+    surfaces are cut from `token` by its words' lengths; a token it would change in length is cut by character."""
+    import nagisa  # noqa: PLC0415 -- dictionary model, loaded on the first Japanese segment
+
+    tagged = nagisa.tagging(token)
+    if sum(map(len, tagged.words)) != len(token):
+        return [(piece, "") for piece in _PIECE.findall(token)]
+    out: list[tuple[str, str]] = []
+    at = 0
+    for word, pos in zip(tagged.words, tagged.postags):
+        surface = token[at:at + len(word)]
+        at += len(word)
+        if out and _LATIN.match(out[-1][0][-1]) and _LATIN.match(surface[0]):
+            out[-1] = (out[-1][0] + surface, out[-1][1])  # 4|5 -> 45: no `space_before` inside one run
+        else:
+            out.append((surface, pos))
+    return out
+
+
+@functools.lru_cache(maxsize=8192)
+def _words(text: str) -> tuple[tuple[str, bool], ...]:
+    """(word, glued to the word before it) for a Japanese segment; punctuation joins the word before it."""
+    out: list[list] = []  # [word, glued, part of speech]
+    for tok in _TOKEN.findall(text):
+        for piece, pos in [(tok, "")] if tok.isascii() else _japanese_words(tok):
+            if all(_is_punct(ch) for ch in piece) and out:
+                out[-1][0] += piece
+                out[-1][2] = "punct"
+                continue
+            glued = bool(out) and out[-1][2] != "punct" and _glued(
+                piece, pos, (out[-1][0], out[-1][2]), out[-2][2] if len(out) > 1 else "")
+            out.append([piece, glued, pos])
+    return tuple((w, g) for w, g, _ in out)
+
+
 def units_of(text: str) -> list[str]:
-    """CJK by character, Latin by word (a run of ASCII letters and digits inside CJK text is one word too, or
-    lines would spell `bug` as `b u g`); punctuation joins the unit before it."""
+    """A MOSS segment's units, which Silero times (`moss_timing.warp`): CJK by character, Latin by word (a run of
+    ASCII letters and digits inside CJK text is one word too, or lines would spell `bug` as `b u g`); punctuation
+    joins the unit before it."""
     out: list[str] = []
     for tok in _TOKEN.findall(text):
         if tok.isascii():
@@ -198,6 +277,35 @@ def units_of(text: str) -> list[str]:
                 out[-1] += piece
             else:
                 out.append(piece)
+    return out
+
+
+def japanese_segment(text: str, language: str | None) -> bool:
+    """Whether MOSS text is handled as Japanese: the task's `language` is Japanese or not given, and the text has
+    kana (a Chinese task's stray の is not)."""
+    return not (language and not language.lower().startswith("ja")) and japanese(text)
+
+
+def groups(units: Sequence[dict], text: str, *, language: str | None) -> list[dict]:
+    """A segment's timed `units` (spelling `text` without its spaces, as `units_of` does) merged into groups the
+    line DP does not cut inside: in Japanese a dictionary word (nagisa) with what stays with it (`_glued`: 出て,
+    ギミクが, 作用する) for a `japanese_segment`; elsewhere every unit is its own group. A unit is merged when its
+    first character does not start a group."""
+    if not japanese_segment(text, language):
+        return [dict(u) for u in units]
+    starts, at = set(), 0
+    for word, glued in _words(text):
+        if not glued:
+            starts.add(at)
+        at += len(word)
+    out: list[dict] = []
+    at = 0
+    for u in units:
+        if out and at not in starts:
+            out[-1].update(text=out[-1]["text"] + u["text"], end=max(out[-1]["end"], u["end"]))
+        else:
+            out.append(dict(u))
+        at += len(u["text"])
     return out
 
 
@@ -303,15 +411,119 @@ def widened(lines: Sequence[dict], *, pad: float, duration: float, end_pad: floa
 
 
 def segment_lines(timed: Sequence[dict], *, duration: float, params: seg.SplitParams,
-                  language: str | None) -> tuple[list[dict], list[dict]]:
-    """MOSS Pro: segments with their timed `units` (`moss_timing.timed`) -> (lines, derived VAD). Short
-    segments merge on MOSS Pro's own edges; each merged line is a turn, one input segment of its own DP."""
+                  language: str | None, sentence_ends=None,
+                  clauses: float | None = None) -> tuple[list[dict], list[dict]]:
+    """MOSS Pro and local MOSS: segments with their timed `units` (`moss_timing.timed`) -> (lines, derived VAD).
+    Japanese units merge into `groups` first; short segments merge on MOSS's own edges; each merged line is a
+    turn, one input segment of its own DP. `sentence_ends(words)` and `clauses` as in `word_lines`, over every turn's
+    words."""
     vad = derived_vad(sorted((u for s in timed for u in s["units"]), key=lambda u: u["start"]))
+    grouped = [dict(s, units=groups(s["units"], s["text"], language=language)) for s in timed]
     turns = [[{**w, "seam": k == 0} for k, w in enumerate(ungrid(dp_words(m["units"], duration=duration,
                                                                           keep_order=True)))]
-             for m in merge_short(timed, params=params, duration=duration)]
-    return split([words for words in turns if words], params=params, duration=duration, language=language), vad
+             for m in merge_short(grouped, params=params, duration=duration)]
+    turns = [words for words in turns if words]
+    if sentence_ends is not None and turns:
+        sentence_ends([w for words in turns for w in words])
+    if clauses:
+        clause_ends((w for words in turns for w in words), clauses)
+    return split(turns, params=params, duration=duration, language=language), vad
 
 
 def summary(lines: Sequence[dict]) -> dict[str, Any]:
     return {"lines": len(lines), "speakers": len({line[LINE_SPEAKER] for line in lines})}
+
+
+# --- moss-diarization-aligner: the lines' new speakers, and overlap cues -----------------------------------------
+
+#: The line's speaker as its ASR gave it, kept beside the new `line_speaker`.
+ASR_SPEAKER = "asr_speaker"
+SPEAKER_MARGIN = line_groups.SPEAKER_MARGIN
+#: Overlap cues (`overlap_cues`; the exploration's readers, `docs/joint-asr.md`): one person's pieces join across
+#: other people's lines between them when every gap along the chain is at most CUE_GAP s, those lines last CUE_INTER s
+#: at most in all, and the next piece starts at most CUE_HOLE s after the cue so far ends.
+CUE_GAP = 0.1
+CUE_INTER = 0.6
+CUE_HOLE = 1.5
+#: A cue whose text so far ends a sentence takes no further piece (the speaker had finished). A single `.` counts;
+#: `...` does not: an unfinished line cut off by someone is what an overlap cue is for.
+SENTENCE_STOPS = "。？！?!"
+
+
+def relabelled(lines: Sequence[dict], speakers: Sequence[str], margins: Sequence[float | None], *,
+               duration: float) -> list[dict]:
+    """`lines` with `line_speaker` replaced (the old one in `asr_speaker`, the margin in `speaker_margin`), then the
+    timeline contract redone per speaker: two lines the ASR gave two people may now be one person's and overlap."""
+    out = []
+    for line, who, margin in zip(lines, speakers, margins, strict=True):
+        new = {**line, ASR_SPEAKER: line[LINE_SPEAKER], LINE_SPEAKER: who}
+        if margin is not None:
+            new[SPEAKER_MARGIN] = margin
+        out.append(new)
+    out = line_groups.grouped(line_groups.in_order(out), segment_ops.clamp_segment_overlaps)
+    out, _ = segment_ops.normalize_segment_timeline(out, audio_end=duration)
+    return out
+
+
+def sentence_closed(text: str) -> bool:
+    """Whether `text` ends a sentence (`SENTENCE_STOPS`, or one `.` that is not the end of `...`)."""
+    text = text.rstrip()
+    return bool(text) and (text[-1] in SENTENCE_STOPS or (text[-1] == "." and not text.endswith("..")))
+
+
+def overlap_cues(lines: Sequence[dict], *, params: seg.SplitParams) -> tuple[list[dict], list[list[int]]]:
+    """(lines, the merges as lists of positions in `lines`): a line joins the open cue of its speaker when other
+    people's lines lie between them (CUE_GAP, CUE_INTER, CUE_HOLE), the cue does not end a sentence, and the joined cue
+    stays within the split's limits (`dur_ok_hi`, weighted `chars_ok_hi`: `--split-length-scale` scales both). The
+    lines between are kept as they are, overlapping the cue. A joined cue: the pieces' words in order, the seam's
+    `space_before` recomputed, its text from its words; `asr_speaker` the first piece's, the margin the smallest.
+    `UNKNOWN_SPEAKER`'s lines join nothing. `lines` by start."""
+    from ...text import words_to_text
+
+    cues: list[dict] = []
+    open_: dict[str, dict] = {}
+    for k, line in enumerate(lines):
+        who = line[LINE_SPEAKER]
+        cue = open_.get(who) if who != UNKNOWN_SPEAKER else None
+        if cue is not None and _joins(cue, line, lines, k, params):
+            cue["ids"].append(k)
+            cue["end"] = line["end"]
+            cue["text"] += line["text"]
+            continue
+        cue = {"ids": [k], "end": line["end"], "text": line["text"]}
+        cues.append(cue)
+        open_[who] = cue
+    out = []
+    for cue in cues:
+        pieces = [lines[k] for k in cue["ids"]]
+        if len(pieces) == 1:
+            out.append(pieces[0])
+            continue
+        words = [dict(w) for w in pieces[0].get("words") or []]
+        for piece in pieces[1:]:
+            more = [dict(w) for w in piece.get("words") or []]
+            if words and more:
+                more[0]["space_before"] = spaced(str(words[-1].get("word", "")), str(more[0].get("word", "")))
+            words += more
+        joined = {**pieces[0], "end": pieces[-1]["end"], "words": words, "text": words_to_text(words)}
+        sure = [p[SPEAKER_MARGIN] for p in pieces if p.get(SPEAKER_MARGIN) is not None]
+        joined.pop(SPEAKER_MARGIN, None)
+        if sure:
+            joined[SPEAKER_MARGIN] = min(sure)
+        out.append(joined)
+    return line_groups.in_order(out), [c["ids"] for c in cues if len(c["ids"]) > 1]
+
+
+def _joins(cue: dict, line: dict, lines: Sequence[dict], k: int, params: seg.SplitParams) -> bool:
+    who = line[LINE_SPEAKER]
+    between = [x for j, x in enumerate(lines[:k])
+               if j not in cue["ids"] and cue["end"] <= x["start"] < line["start"]]
+    if not between or any(x[LINE_SPEAKER] == who for x in between) or sentence_closed(cue["text"]):
+        return False
+    chain = [cue["end"]] + [t for x in between for t in (x["start"], x["end"])] + [line["start"]]
+    first = lines[cue["ids"][0]]
+    return (all(b - a <= CUE_GAP for a, b in zip(chain[::2], chain[1::2]))
+            and sum(x["end"] - x["start"] for x in between) <= CUE_INTER
+            and line["start"] - cue["end"] <= CUE_HOLE
+            and line["end"] - first["start"] <= params.dur_ok_hi
+            and weighted_char_count(cue["text"] + line["text"]) <= params.chars_ok_hi)

@@ -6,15 +6,20 @@ Units are dicts with `start`, `end`, `text`, `speaker` (absolute seconds).
   point with window k+1 -- a gap no unit of either window spans, near the
   middle of their overlap (or near where window k stopped, if it stopped
   early).
-* Speakers: labels are only consistent within one window. In each overlap the
-  two windows' labels are linked one-to-one, greedily by co-speaking seconds;
-  an unlinked label is a new person.
+* Speakers: labels are only consistent within one window, so each window's
+  labels are kept apart (`w<k>:`); who is who across windows is left to the
+  voice merge (the MOSS backends) and the speaker judge. Linking them by
+  co-speaking seconds in the overlap was dropped (owner 2026-11-21): after the
+  judge it cost more than it saved (`docs/joint-asr.md`「设计取舍」).
 * Word units keep the providers' output order: window k's kept units, then
   window k+1's, never sorted (a turn is a speaker's run in output order, and a
   global sort by start would interleave two overlapping speakers' words).
   Segment units (MOSS Pro) are cut into differently shaped segments by each
   window, so each seam is reconciled by text and the result sorted by start --
   a segment is a turn of its own, so the sort interleaves nothing.
+* Same units in every window (`orphans`, the forced decode: one set of lines, each labelled in every part it lies
+  wholly inside): the hand-over still picks each line's copy; a line no window keeps (its midpoint outside the
+  keep range of the only window holding it) comes from the first window holding it, with that window's label.
 
 Ported from the experiment's `tools/ts_diar_explore/episode.py`; the seam
 reconciliation was smoke-tested there, not run in the readouts (their sources
@@ -24,8 +29,9 @@ were all <= 60 min, one MOSS Pro call).
 from __future__ import annotations
 
 import unicodedata
-from collections import defaultdict
 from typing import Sequence
+
+from .relink import TWIN
 
 HANDOVER_SLACK = 15.0
 #: share of a segment's characters that must appear (in order) on the other side for it to count as already kept
@@ -39,18 +45,6 @@ EVENT_EDGE = 5.0
 Part = tuple[float, float, list[dict]]  # (window start, window end, its units in output order)
 
 
-def windows(lo: float, hi: float, size: float | None, overlap: float) -> list[tuple[float, float]]:
-    if size is None or hi - lo <= size:
-        return [(lo, hi)]
-    out, start = [], lo
-    while True:
-        end = min(hi, start + size)
-        out.append((start, end))
-        if end >= hi:
-            return out
-        start = end - overlap
-
-
 def norm(text: str) -> str:
     """Letters and digits only, NFKC: what two transcriptions of one utterance share."""
     text = unicodedata.normalize("NFKC", text)
@@ -61,34 +55,9 @@ def overlap(x: dict, y: dict) -> float:
     return max(0.0, min(x["end"], y["end"]) - max(x["start"], y["start"]))
 
 
-def by_label(units: Sequence[dict], lo: float, hi: float) -> dict[str, list[tuple[float, float]]]:
-    out: dict[str, list[tuple[float, float]]] = defaultdict(list)
-    for u in units:
-        a, b = max(u["start"], lo), min(u["end"], hi)
-        if u.get("speaker") is not None and b > a:
-            out[u["speaker"]].append((a, b))
-    return out
-
-
-def _co_seconds(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> float:
-    return sum(max(0.0, min(x1, y1) - max(x0, y0)) for x0, x1 in a for y0, y1 in b)
-
-
-def link(prev: dict[str, list], cur: dict[str, list]) -> list[tuple[str, str]]:
-    """(prev label, cur label) pairs, one-to-one, greedy by co-speaking seconds, largest first."""
-    pairs = sorted(((_co_seconds(prev[p], cur[c]), i, j, p, c)
-                    for i, p in enumerate(prev) for j, c in enumerate(cur)), key=lambda x: (-x[0], x[1], x[2]))
-    out, used_p, used_c = [], set(), set()
-    for seconds, _, _, p, c in pairs:
-        if seconds > 0 and p not in used_p and c not in used_c:
-            out.append((p, c))
-            used_p.add(p)
-            used_c.add(c)
-    return out
-
-
-def stitch(parts: Sequence[Part], *, segments: bool) -> list[dict]:
-    """The windows' units as one list: output order for words, start order for segments."""
+def stitch(parts: Sequence[Part], *, segments: bool, orphans: str | None = None) -> list[dict]:
+    """The windows' units as one list: output order for words, start order for segments. `orphans`: the field
+    naming one unit across windows; a unit no window keeps is kept from the first window holding it."""
 
     if not parts:
         return []
@@ -103,20 +72,29 @@ def stitch(parts: Sequence[Part], *, segments: bool) -> list[dict]:
         # A window that stopped early hands over where it stopped (at the latest).
         cuts.append(handover(list(units) + list(nxt), parts[k + 1][0], max(parts[k + 1][0], min(parts[k][1], last)),
                              max(parts[k + 1][0], min(mid, last))))
-    wins, prev = [], []
-    for k, (start, _, units) in enumerate(parts):
+    wins = []
+    for k, (_, _, units) in enumerate(parts):
         own = [dict(u) for u in units]
+        # a segment's TWIN is a label too (`relink.unknown_rescues`), renamed with the rest
         for u in own:
-            u["speaker"] = f"w{k}:{u['speaker']}" if u.get("speaker") is not None else None
-        if k:
-            lo, hi = start, parts[k - 1][1]
-            mapping = {c: p for p, c in link(by_label(prev, lo, hi), by_label(own, lo, hi))}
-            for u in own:  # an unlinked label is a new person and keeps its window-local name
-                u["speaker"] = mapping.get(u["speaker"], u["speaker"])
+            for key in ("speaker", TWIN):
+                if u.get(key) is not None:
+                    u[key] = f"w{k}:{u[key]}"
         wins.append(own)
-        prev = own
-    kept = [[u for u in own if (cuts[k - 1] if k else float("-inf")) <= (u["start"] + u["end"]) / 2
-             < (cuts[k] if k + 1 < len(parts) else float("inf"))] for k, own in enumerate(wins)]
+
+    def keeps(k: int, u: dict) -> bool:
+        return (cuts[k - 1] if k else float("-inf")) <= (u["start"] + u["end"]) / 2 \
+            < (cuts[k] if k + 1 < len(parts) else float("inf"))
+
+    kept = [[u for u in own if keeps(k, u)] for k, own in enumerate(wins)]
+    if orphans is not None:
+        held = {u[orphans] for side in kept for u in side}
+        first: dict = {}
+        for k, own in enumerate(wins):
+            for u in own:
+                first.setdefault(u[orphans], k)
+        kept = [[u for u in own if keeps(k, u) or (u[orphans] not in held and first[u[orphans]] == k)]
+                for k, own in enumerate(wins)]
     if not segments:
         return [u for side in kept for u in side]
     for k in range(len(parts) - 1):

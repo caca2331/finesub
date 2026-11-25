@@ -62,9 +62,11 @@ WHISPER_JA_CACHE_DIR = f"models--{WHISPER_JA_REPO_ID.replace('/', '--')}"
 #: Open MOSS-Transcribe-Diarize for `--asr moss-local`: like the Japanese model, fetched only by a run that picks it
 #: (absent from `PIPELINE_MODEL_IDS`). Apache-2.0.
 MOSS_LOCAL_CACHE_DIR = "models--OpenMOSS-Team--MOSS-Transcribe-Diarize"
-#: Qwen3-ForcedAligner for `--asr-aligner` (on by default for local MOSS): fetched only by a run that uses it.
+#: Qwen3-ForcedAligner for `--asr-aligner` (on by default for the MOSS backends and 35t's repairs): fetched only by a
+#: run that uses it.
 QWEN_ALIGNER_CACHE_DIR = "models--Qwen--Qwen3-ForcedAligner-0.6B-hf"
-#: The sentence-boundary model the word backends (`--asr mai2`, `gemini-35t`, `scribe`) build lines with.
+#: The sentence-boundary model every joint backend (`--asr mai2`, `gemini-35t`, `scribe`, `moss-local`, `moss-pro`) builds
+#: lines with.
 SBD_CACHE_DIR = "models--1-800-BAD-CODE--xlm-roberta_punctuation_fullstop_truecase"
 
 #: Repositories the pipeline pulls from Hugging Face, as cache directory names.

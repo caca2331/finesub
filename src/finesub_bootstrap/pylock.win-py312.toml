@@ -103,7 +103,7 @@ archive = { url = "https://github.com/caca2331/finesub/releases/download/ct2-4.8
 [[packages]]
 name = "cython"
 version = "3.2.9"
-marker = "sys_platform == 'win32'"
+marker = "python_full_version < '3.15' or sys_platform == 'win32'"
 sdist = { url = "https://files.pythonhosted.org/packages/f6/de/db48b8870e766cfea809986cc50c1e986c663a9ab7bafd0ac1a2512c4a26/cython-3.2.9.tar.gz", upload-time = 2026-07-24T06:21:21Z, size = 3293493, hashes = { sha256 = "d249c9022ab13286b17bd66f30609e800c5f95efeecb06168990c7a66cecde6c" } }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/b5/4ce33235a25b19fcd51dc639f0f403b783a3b7f9b1934eade0d993fbe029/cython-3.2.9-cp312-cp312-win_amd64.whl", upload-time = 2026-07-24T06:21:58Z, size = 2778077, hashes = { sha256 = "4b1fd5a9c03f72a18618668a8e90d569442ed742f910e3ad003dcc9348e9598b" } },
@@ -128,6 +128,12 @@ version = "0.2.4"
 marker = "sys_platform == 'win32'"
 sdist = { url = "https://files.pythonhosted.org/packages/be/96/8ca5acf5ecfd4108aa6f345cef171f2fda0c081cf0e7430671712586f172/diffq_fixed-0.2.4.tar.gz", upload-time = 2024-11-07T21:33:26Z, size = 189695, hashes = { sha256 = "cbc906b76fa23d1cf3c0ae517fbab744d9624980a068fe7fbb00dede1d83208d" } }
 wheels = [{ url = "https://files.pythonhosted.org/packages/33/14/94327d99f551136ac95bdc9697a1738f78ab3bb63afe8ce58b2b9854cd3a/diffq_fixed-0.2.4-cp312-cp312-win_amd64.whl", upload-time = 2024-11-07T21:33:24Z, size = 106205, hashes = { sha256 = "81087279979db570723ca0911265635d7c3132cc8b74bc52bdea94881440ce96" } }]
+
+[[packages]]
+name = "dynet38"
+version = "2.2"
+marker = "python_full_version < '3.15'"
+wheels = [{ url = "https://files.pythonhosted.org/packages/ff/4f/a5b22e11549f0a5dc6feccdb50414aaf3c05decf0d8ca29288984a21fc5a/dynet38-2.2-cp312-cp312-win_amd64.whl", upload-time = 2025-12-29T12:14:44Z, size = 1299414, hashes = { sha256 = "fd9967ed3ec071cc4c0c084d758ab44dac34cb37beb625ea9fcf2221c2085975" } }]
 
 [[packages]]
 name = "einops"
@@ -277,6 +283,12 @@ name = "msgpack"
 version = "1.2.1"
 sdist = { url = "https://files.pythonhosted.org/packages/31/f9/c0a1c127f9049db9155afc316952ea571720dd01833ff5e4d7e8e6352dbb/msgpack-1.2.1.tar.gz", upload-time = 2026-06-18T16:13:52Z, size = 183960, hashes = { sha256 = "04c721c2c7448767e9e3f2520a475663d8ee0f09c31890f6d2bd70fd636a9647" } }
 wheels = [{ url = "https://files.pythonhosted.org/packages/57/7f/ce1e377df7e62461fefd9eb23bfb93a4a523f40a517b377b8f844d836828/msgpack-1.2.1-cp312-cp312-win_amd64.whl", upload-time = 2026-06-18T16:13:09Z, size = 71421, hashes = { sha256 = "5c24aa15d5963051e1a5c62b12c50cd705992502b5ec1f3bece6046f33c9fc24" } }]
+
+[[packages]]
+name = "nagisa"
+version = "0.3.2"
+sdist = { url = "https://files.pythonhosted.org/packages/8c/56/6927d15fb658e45ed8ce34c09d7b6cc7b1395fb083825cfa486538c7ebc0/nagisa-0.3.2.tar.gz", upload-time = 2026-11-14T17:06:37Z, size = 21097549, hashes = { sha256 = "82485a04f292c322664ea438068d10f6eb0eb65ef17a5830ec2ccffd3976377f" } }
+wheels = [{ url = "https://files.pythonhosted.org/packages/12/e9/e111d108172a3e3f32bbc4761b965ed3369b81201b302c56c2cda85b9bb4/nagisa-0.3.2-cp312-cp312-win_amd64.whl", upload-time = 2026-11-14T17:05:04Z, size = 21588758, hashes = { sha256 = "69e903c3f465e5356a94d17ef8732196a259964b950e4b07b2e5f1b48e275247" } }]
 
 [[packages]]
 name = "narwhals"

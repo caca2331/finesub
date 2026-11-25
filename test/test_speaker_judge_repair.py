@@ -173,6 +173,17 @@ def test_the_judge_validator_accepts_what_the_harness_reads_and_asks_a_patch_of_
     assert blind.status == "repairable" and blind.metadata == {}, "nothing usable: the whole answer again"
 
 
+def test_a_person_table_s_validator_asks_the_patch_that_keeps_tracks_and_people_and_shows_pn_as_written():
+    for people in ([2], []):  # no candidate left to pick is still a person-table task
+        meta = {"metadata": {"validator": {"ids": IDS, "tracks": [0, 1], "people": people}}}
+        refused = build_validator("speaker-judge", meta)(whole(row(1), BROKEN, row(3), row(4)), {})
+        assert "原样保留" in refused.metadata["repair_instruction"], people
+    wrong = '{"id":"q2","track":"p2" "why":"w"}'  # a candidate on a row that is not JSON
+    meta = {"metadata": {"validator": {"ids": IDS, "tracks": [0, 1], "people": [2]}}}
+    refused = build_validator("speaker-judge", meta)(whole(row(1), wrong, row(3), row(4)), {})
+    assert refused.status == "repairable" and refused.metadata["rows_to_fix"] == wrong
+
+
 def test_the_judge_merge_lays_a_patch_over_the_draft():
     merge = agent_validators.VALIDATOR_MERGES["speaker-judge"]
     laid = merge(patch(row(4)), whole(row(1), row(2), row(3)), manifest())
@@ -299,7 +310,7 @@ def test_a_patched_answer_is_not_asked_again_for_not_thinking(tmp_path):
 
     client = Script([reply(whole(row(1), row(2), row(3)), 500), reply(patch(row(4)), None)])
     report = run(stable, client, tmp_path, cut=((1, 4),))
-    assert report.judged == 1 and len(client.calls) == 2 and "thinking" not in entry_of(stable)
+    assert report.judged == 1 and len(client.calls) == 2 and "redo" not in entry_of(stable)
 
 
 # --- the transports, through the real client --------------------------------------------------------------
@@ -503,3 +514,17 @@ def test_a_patch_that_leaked_its_reasoning_is_read_by_the_patch_it_ends_with(tmp
     report = run(stable, Script([whole(row(1), row(2), row(3)), leaked]), tmp_path, cut=((1, 4),))
     assert report.judged == 1
     assert entry_of(stable)["thought_stripped"] == len(leaked) - len(patch(row(4))), "what was cut from the reply"
+
+
+def test_the_person_table_s_repair_asks_for_new_tracks_lines_only_and_a_whole_answer_with_people():
+    """v21: a patch round keeps the first answer's `<tracks>` and `<people>` and adds only new evidence; a whole
+    answer again writes all three blocks."""
+    from finesub.llm.stages.speaker_judge.patch import patch_instruction, repair_base, whole_instruction
+
+    base = repair_base('<judge>\n{"id":"q1","track":"keep","why":"w"}\n{"id":"q2","track":"s9","why":"w"}\n</judge>',
+                       ["q1", "q2"], [0, 1])
+    people = patch_instruction(base, ["q2: s9 is not a track"], people=True)
+    assert "没有就不写" in people and "原样保留" in people and "只写这些" not in people
+    assert "只写这些" in patch_instruction(base, ["q2: s9 is not a track"])
+    assert "`<tracks>`、`<people>` 块" in whole_instruction(["x"], people=True)
+    assert "`<people>`" not in whole_instruction(["x"])

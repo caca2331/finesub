@@ -33,7 +33,7 @@ from ...content_filter import (
     run_injection_ladder,
     split_rendered_search_block,
 )
-from ...degeneration import Thinking, pick_after_retry, thinking_of, zero_thinking_record
+from ...degeneration import Draw, Pass2Signals, pick_after_retry, redo_record, thinking_of
 from ...exchange_log import ExchangeBlock
 from ...exchange_metadata import (
     correction_input_components,
@@ -84,10 +84,14 @@ class _Answer:
     style_choice: Any
     next_advice: str
     next_transfer: List[str]
-    thinking: Thinking
+    #: what the degeneration signs read off it (`degeneration.Draw`)
+    draw: Draw
     #: the base prompt the answering candidate was sent and the clip it heard: the proofread turn goes on from them
     messages: List[Dict[str, Any]] = dataclass_field(default_factory=list)
     file_ref: Any = None
+    #: its `<task_update_feedback>` body ("" when it gave none) and the attempt it came on: `_accept` writes them
+    update_feedback: str = ""
+    attempt: int = 0
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,9 @@ class _Repair:
     errors: tuple[str, ...] = ()
     base: RepairBase | None = None
     patch_errors: tuple[str, ...] = ()
+    #: the split guidance (`CsvValidationResult.split_guidance`): in the patch instruction when there is one,
+    #: else last in the errors, so the model reads it once whichever the transport shows
+    guidance: str = ""
 
     @property
     def sent(self) -> bool:
@@ -108,10 +115,13 @@ class _Repair:
 
     @property
     def all_errors(self) -> List[str]:
-        return [*self.patch_errors, *self.errors]
+        tail = [self.guidance] if self.guidance and self.base is None else []
+        return [*self.patch_errors, *self.errors, *tail]
 
     def instruction(self) -> str:
-        return patch_instruction(self.base, self.all_errors) if self.base is not None and self.sent else ""
+        if self.base is None or not self.sent:
+            return ""
+        return patch_instruction(self.base, [*self.patch_errors, *self.errors, *filter(None, [self.guidance])])
 
 
 @dataclass(frozen=True)
@@ -180,7 +190,8 @@ def _next_repair(run: CorrectionRun, previous: _Repair, merge: PatchMerge | None
     base = repair_base(answer, validation, window, variant) if _patch_allowed(run) else None
     # A merge across a turn never sends a window back on its own; one going back anyway fixes it in the same
     # answer (owner 2026-10-16).
-    return _Repair(answer, (*validation.errors, *validation.turn_notes), base)
+    return _Repair(answer, validation.repair_messages(guidance=False), base,
+                   guidance=validation.split_guidance)
 
 
 def _repair_record(sent: bool, repair: _Repair, merge: PatchMerge | None) -> Dict[str, Any]:
@@ -195,21 +206,32 @@ def _repair_record(sent: bool, repair: _Repair, merge: PatchMerge | None) -> Dic
             "replaced_units": merge.replaced_units}
 
 
+def _pass2(run: CorrectionRun, window: SubtitleWindow, validation: Any) -> Pass2Signals | None:
+    """Pass 2's degeneration signs of a passing answer (`degeneration.pass2_signals`): None off a grouped
+    window (a single pass, or three passes' window that got the single pass prompt for want of pass 1)."""
+
+    if run.grouping is None or not window.grouped:
+        return None
+    from ...degeneration import pass2_signals
+
+    return pass2_signals(window, validation.segments)
+
+
 def _pass_fields(run: CorrectionRun, window: SubtitleWindow, validation: Any) -> Dict[str, Any]:
     """Three passes' fields of a window's record: `pass1: missing` when it got the single pass prompt for want
     of pass 1, its rows that merge more original lines than the soft cap (the validator counted grouped
-    lines), and the signs of a degenerate answer (`degeneration.pass2_signals`, recorded only)."""
+    lines), and the signs of a degenerate answer in the one committed (`_pass2`)."""
 
     if run.grouping is None:
         return {}
-    from ...degeneration import pass2_signals
     from ...grouping import over_cap
 
     if not window.grouped:
         return {"pass1": "missing"}
     rows = over_cap(validation.segments, run.grouping)
-    return {**({"over_cap_rows": rows} if rows else {}),
-            "degeneration": pass2_signals(window, validation.segments).to_metadata()}
+    signals = _pass2(run, window, validation)
+    assert signals is not None
+    return {**({"over_cap_rows": rows} if rows else {}), "degeneration": signals.to_metadata()}
 
 
 def correction_role_for_profile(profile: TranslationProfile) -> LLMRole:
@@ -271,11 +293,11 @@ def _log_window_exposures(
     if not (run.knowledge_enabled and injected_keys):
         return
     try:
-        from ...knowledge.base import knowledge_root_path, knowledge_signals_enabled, version_rev
+        from ...knowledge.base import entry_signals_enabled, knowledge_root_path, version_rev
         from ...knowledge.node.repo import KnowledgeRepo
         from ...knowledge.node.signals import log_exposed_entries
 
-        if not knowledge_signals_enabled(run.knowledge_root):
+        if not entry_signals_enabled(run.knowledge_root):
             return
         rev = version_rev(run.knowledge_version)
         log_exposed_entries(
@@ -414,6 +436,7 @@ def _complete_window(
     repair: _Repair,
     replacement_round: bool,
     validator_spec: Mapping[str, Any],
+    redo: bool = False,
     predelivered: Any = None,
     style_grant: Any = None,
 ):
@@ -473,7 +496,8 @@ def _complete_window(
         fresh_session=replacement_round,
         validator_spec=validator_spec,
         correct_only=run.profile.correct_only,
-        max_repair_attempts=max(0, run.max_retries_per_window),
+        # A held answer's retry is asked once: a task runtime runs no repair round inside it either.
+        max_repair_attempts=0 if redo else max(0, run.max_retries_per_window),
         agent_task_extras=agent_task_extras,
         # The proofread turn re-sends this opening: an API transport whose cache is opt-in writes it now.
         followup_expected=_proofread_follows(run, window),
@@ -604,11 +628,38 @@ def _proofread_round(run: CorrectionRun, current: SubtitleWindow, result: Any, r
             "response_content": result.content}
 
 
+def _write_window_feedback(run: CorrectionRun, current: SubtitleWindow, answer: _Answer) -> None:
+    """The committed answer's task feedback, as the knowledge update reads it (last record per window wins,
+    `knowledge.feedback.aggregate_task_update_feedback`). Written on commit, not per reply: a window held for a
+    retry may keep the first answer (`degeneration.pick_after_retry`), and a refused reply's feedback is no part
+    of the output. Written even when empty, so a window asked again over a run's earlier record replaces it."""
+
+    if not run.task_update_feedback:
+        return
+    from ...knowledge.feedback import WINDOW_FEEDBACK_ARTIFACT_KIND, retrieval_urls_from_response
+
+    append_task_artifact(
+        run.task_artifact_dir,
+        kind=WINDOW_FEEDBACK_ARTIFACT_KIND,
+        task_id=run.task_id,
+        payload={
+            "chunk_id": current.chunk_id,
+            "attempt": answer.attempt,
+            "window": window_to_metadata(current),
+            "feedback": answer.update_feedback,
+            # Harness-side call evidence (docs/knowledge.md 任务反馈采集): what this call's retrieval ledger
+            # actually returned, attached here because the model's self-reported sources are exactly what went
+            # missing.
+            "retrieval_urls": list(retrieval_urls_from_response(answer.result.raw_response)),
+        },
+    )
+
+
 def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, injected_keys: List[str],
-            entries: WindowEntries, thinking: Mapping[str, Any] | None = None,
+            entries: WindowEntries, redo: Mapping[str, Any] | None = None,
             spk_unchecked: bool = False, proofread: Mapping[str, Any] | None = None) -> _WindowRunOutcome:
-    """Commit ``answer`` as the window's: its ledger record (``thinking``: a retry for missing thinking, as
-    `degeneration.zero_thinking_record` says it went; ``spk_unchecked``: accepted with its `spk` column unfixed,
+    """Commit ``answer`` as the window's: its ledger record (``redo``: the one retry of a held answer, as
+    `degeneration.redo_record` says it went; ``spk_unchecked``: accepted with its `spk` column unfixed,
     `_accept_unfixed_speakers`; ``proofread``: the proofread turn's record, `_proofread`) and the tallies the
     closing summary reads."""
 
@@ -621,10 +672,11 @@ def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, inj
     pass_fields = _pass_fields(run, current, validation)
     if "unmerged" in pass_fields.get("degeneration", {}).get("signals", ()):
         run.note_unmerged(current.chunk_id)
-    if thinking is not None:
-        run.note_rethought(current.chunk_id)
+    if redo is not None:
+        run.note_redone(current.chunk_id, list(redo.get("signals") or ()))
     if proofread is not None:
         run.note_proofread(current.chunk_id, str(proofread.get("status") or ""))
+    _write_window_feedback(run, current, answer)
     run.ledger.commit(
         {
             "chunk_id": current.chunk_id,
@@ -665,7 +717,7 @@ def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, inj
             "turn_violations": [list(ids) for ids in validation.turn_violation_rows],
             # Translations that slid off their rows, accepted with a warning (`translation_shift`).
             "translation_shift": asdict(validation.translation_shift) if validation.translation_shift else None,
-            **({"thinking": dict(thinking)} if thinking is not None else {}),
+            **({"redo": dict(redo)} if redo is not None else {}),
             **({"spk_unchecked": True} if spk_unchecked else {}),
             **({"inline_proofread": str(proofread.get("status") or "")} if proofread is not None else {}),
             **pass_fields,
@@ -808,12 +860,12 @@ def run_window_attempts(
     premise ("the model can fix it at a glance") no longer holds. Total
     calls are the product of the two knobs' (n+1) forms.
 
-    An answer that passes but reported no thinking although it was asked to
-    (`degeneration.thinking_of`) is held, and the window is asked once more
-    in a fresh session -- outside that budget, so a pass on the last attempt
-    still gets it; under `resume` the fresh session is where the chain goes
-    on. The window keeps one of the two (`degeneration.pick_after_retry`),
-    the held one whenever the retry cannot answer (owner 2026-10-17).
+    A passing answer with a sign of degeneration (`degeneration.Draw.held_for`)
+    is held and the window asked once more in a fresh session, one retry for
+    both signs and no repair round, outside that budget (a pass on the last
+    attempt gets it too; under `resume` the chain goes on there). The window
+    keeps one of the two (`degeneration.pick_after_retry`), the held one when
+    the retry cannot answer (owner 2026-10-17, 2026-11-21).
     """
 
     base_chunk_id = current.chunk_id.split("-", 1)[0]
@@ -832,15 +884,15 @@ def run_window_attempts(
     # A backend that runs tier 1 itself (an agent on the task runtime) spends
     # a whole chain in one call; the attempts it would have been are skipped.
     skip_until = 0
-    # A passing answer that did not think, waiting on the one fresh retry it gets.
+    # A passing answer held for a sign of degeneration, waiting on the one fresh retry it gets.
     held: _Answer | None = None
 
     def keep_held(error: str) -> _WindowRunOutcome:
         assert held is not None
         kept, proofread = _proofread(run, current, held, exchange_block=exchange_block,
-                                     skip="the answer kept after its thinking retry failed")
+                                     skip="the answer kept after its retry failed")
         return _accept(run, current, kept, injected_keys=injected_keys, entries=entries, proofread=proofread,
-                       thinking=zero_thinking_record(held.thinking, None, "original", error=error))
+                       redo=redo_record(held.draw, None, "original", error=error))
 
     for attempt in range(total_calls + 1):
         if attempt < skip_until:
@@ -922,7 +974,7 @@ def run_window_attempts(
 
             call_result = _complete_window(
                 run, current, compose_for_variant, attempt=attempt, file_ref=window_file_ref,
-                repair=repair,
+                repair=repair, redo=held is not None,
                 replacement_round=replacement_round, validator_spec=window_validator_spec,
                 style_grant=attempt_catalog if style_pick is not None else None,
                 # The request turn's own delivery stands in for attempt 0 of
@@ -1274,42 +1326,21 @@ def run_window_attempts(
                 task_id=run.task_id,
                 payload=response_payload,
             )
-            if update_feedback:
-                from ...knowledge.feedback import retrieval_urls_from_response
-
-                append_task_artifact(
-                    run.task_artifact_dir,
-                    kind="correction_window_task_feedback",
-                    task_id=run.task_id,
-                    payload={
-                        "chunk_id": current.chunk_id,
-                        "attempt": attempt,
-                        "window": window_to_metadata(current),
-                        "feedback": update_feedback,
-                        # Harness-side call evidence (docs/knowledge.md 任务反馈采集):
-                        # what this call's retrieval ledger actually returned,
-                        # attached here because the model's self-reported
-                        # sources are exactly what went missing.
-                        "retrieval_urls": list(
-                            retrieval_urls_from_response(result.raw_response)
-                        ),
-                    },
-                )
-        answer = _Answer(result, validation, response_variant, style_choice, next_advice, next_transfer,
-                         thinking_of(result), messages, window_file_ref)
         passed = validation.ok and not output_limited
+        draw = Draw(thinking_of(result), _pass2(run, current, validation) if passed else None, read.patched)
+        answer = _Answer(result, validation, response_variant, style_choice, next_advice, next_transfer,
+                         draw, messages, window_file_ref, update_feedback=update_feedback, attempt=attempt)
         if held is not None:
-            refused = 0 if passed else max(1, len(validation.errors))
-            chosen = pick_after_retry(0, answer.thinking, refused)
+            chosen = pick_after_retry(held.draw, draw, passed)
             kept, proofread = _proofread(run, current, answer if chosen == "retry" else held,
                                          exchange_block=exchange_block)
             return _accept(run, current, kept, injected_keys=injected_keys, entries=entries, proofread=proofread,
-                           thinking=zero_thinking_record(held.thinking, answer.thinking, chosen))
-        if passed and answer.thinking.skipped and not read.patched:
+                           redo=redo_record(held.draw, draw, chosen))
+        if passed and draw.held_for():
             held = answer
             repair = _Repair()
-            current_reporter().debug("correction window answered without thinking",
-                                     {"chunk": current.chunk_id, "attempt": attempt})
+            current_reporter().debug("correction window held for one retry",
+                                     {"chunk": current.chunk_id, "attempt": attempt, "signs": draw.held_for()})
             continue
         if passed:
             answer, proofread = _proofread(run, current, answer, exchange_block=exchange_block)

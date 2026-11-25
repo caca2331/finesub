@@ -32,9 +32,11 @@ from .prompts import (
     _load_prompt_template,
     _r1_entry_blocks,
     _search_queries_rules,
+    unchecked_search_rule,
     build_correction_csv_messages,
     task_feedback_reminder,
     render_knowledge_indexes,
+    window_asks_feedback,
 )
 from .routing.profiles import DEFAULT_PROFILE
 from .routing.config import (
@@ -121,7 +123,8 @@ def render_window_request_channel(
             else ""
         ),
         search_queries_rules=(
-            _search_queries_rules(max_search_queries, knowledge_enabled=knowledge)
+            _search_queries_rules(max_search_queries, knowledge_enabled=knowledge,
+                                  unchecked_rule=unchecked_search_rule(prepare=False) if knowledge else "")
             if search
             else ""
         ),
@@ -183,6 +186,8 @@ def build_correction_fill_message(
                 else "fragment_entry_details_label_fill_v1.md"
             ).strip(),
             entry_details=entry_details.strip() or words["no_entries"],
+            # the first message of the same conversation says how a correct-only task reads term lines
+            kb_term_lines_note="",
         )
         if requested_entries
         else ""
@@ -357,7 +362,13 @@ def build_window_task_messages(
             style_block=style_fill_block,
             entry_channel=knowledge,
             entries_slimmed=bool(correction_kwargs.get("entries_slimmed")),
-            task_update_feedback=bool(correction_kwargs.get("task_update_feedback")),
+            # the same switch as the system's feedback block, so the reminder names only a block it asked for
+            task_update_feedback=window_asks_feedback(
+                profile,
+                knowledge_enabled=bool(correction_kwargs.get("knowledge_enabled", True)),
+                self_search=bool(correction_kwargs.get("self_search")),
+                task_update_feedback=bool(correction_kwargs.get("task_update_feedback")),
+            ),
             # the set the window is served (a window with speakers: the tracked one, whose reply opens with
             # `<tracks>`), not the cell's
             delivery=for_window(

@@ -25,6 +25,7 @@ read has happened.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Callable, Mapping
 
 from .agent_task_runtime import PROOFREAD_PARAM, PatchOutcome, ProofreadStep, ValidationResult, Validator
@@ -204,26 +205,25 @@ def _correction_window(manifest: Mapping[str, Any]) -> Validator:
         submitted = str(candidate)
         text = strip_leaked_thought(submitted, CORRECTION_ANSWER_TAGS) or submitted
         result = validate_correction_window_output(text, window, variant=variant)
-        errors = [str(item) for item in result.errors if str(item).strip()]
         read_missing = False
         if isinstance(style_pick, Mapping):
             _choice, style_errors, read_missing = judge_style_pick(
                 text, style_pick, observed_kb_reads(view)
             )
-            errors.extend(style_errors)
-        if errors:
+            if style_errors:
+                result = replace(result, ok=False, errors=[*result.errors, *style_errors])
+        if result.errors:
             # Merges across a turn never send an answer back on their own; one going back anyway fixes them too.
-            errors.extend(result.turn_notes)
             # A mostly right answer is repaired with a patch, as the harness's own repair round asks for one; a
-            # style error belongs to no row, so that answer goes back whole.
-            base = None if len(errors) != len(result.errors) + len(result.turn_notes) else repair_base(
-                text, result, window, variant)
+            # style error belongs to no row, so that answer goes back whole (`repair_base` finds it unattributed).
+            base = repair_base(text, result, window, variant)
             metadata = {
                 **({"observed_dependent": True} if read_missing else {}),
-                **({"repair_instruction": patch_instruction(base, errors), "rows_to_fix": rows_to_fix(base)}
-                   if base is not None else {}),
+                **({"repair_instruction": patch_instruction(base, result.repair_messages()),
+                    "rows_to_fix": rows_to_fix(base)} if base is not None else {}),
             }
-            return ValidationResult.repairable(*errors, metadata=metadata)
+            # The reply shows the errors beside the patch instruction, which already holds the split guidance.
+            return ValidationResult.repairable(*result.repair_messages(guidance=base is None), metadata=metadata)
         return ValidationResult.accepted(submitted)
 
     return validate
@@ -368,16 +368,25 @@ def _speaker_judge(manifest: Mapping[str, Any]) -> Validator:
     from ..stages.speaker_judge.patch import patch_instruction, repair_base, rows_to_fix
 
     ids, tracks = _judge_params(manifest)
+    # a cloud task's person table (the key is there even with no candidate left to pick): the candidates' numbers a
+    # row may answer, each a new track for that person (`people_io`); its repair keeps `<tracks>` and `<people>`
+    params = dict(dict(manifest.get("metadata") or {}).get("validator") or {})
+    with_table = "people" in params
+    people = {int(number) for number in params.get("people") or ()}
 
     def validate(candidate: Any, view: Mapping[str, Any]) -> ValidationResult:
+        from ..stages.speaker_judge.people_io import swap_people, unswap_people
+
         submitted = str(candidate)
         text = strip_leaked_thought(submitted, ("judge",)) or submitted
+        text, swapped = swap_people(text, people) if people else (text, [])
         errors = survey(text, ids, tracks).errors
         if not errors:
             return ValidationResult.accepted(submitted)
         base = repair_base(text, ids, tracks)
-        metadata = {"repair_instruction": patch_instruction(base, errors), "rows_to_fix": rows_to_fix(base)} \
-            if base is not None else {}
+        # the rows are shown as the model wrote them, pN as pN
+        metadata = {"repair_instruction": patch_instruction(base, errors, people=with_table),
+                    "rows_to_fix": unswap_people(rows_to_fix(base), set(swapped))} if base is not None else {}
         return ValidationResult.repairable(*errors, metadata=metadata)
 
     return validate
@@ -388,8 +397,13 @@ def _merge_judge_patch(candidate: str, draft: str, manifest: Mapping[str, Any]) 
 
     from ..stages.speaker_judge.patch import apply_patch, repair_base
 
+    from ..stages.speaker_judge.people_io import swap_people
+
     ids, tracks = _judge_params(manifest)
-    return _lay_patch(candidate, draft, answer_tags=("judge",), base_of=lambda text: repair_base(text, ids, tracks),
+    people = {int(number) for number in dict(dict(manifest.get("metadata") or {}).get("validator") or {})
+              .get("people") or ()}
+    return _lay_patch(candidate, draft, answer_tags=("judge",),
+                      base_of=lambda text: repair_base(swap_people(text, people)[0] if people else text, ids, tracks),
                       apply=apply_patch)
 
 

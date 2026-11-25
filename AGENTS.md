@@ -79,7 +79,7 @@ python -m compileall -q src test && ruff check && python -m pytest -q && git sta
 - **从 checkout 运行用 checkout 自己的数据**（`knowledge/`、`.env`、`.state`），不碰 `%LOCALAPPDATA%`；
   `FINESUB_CHECKOUT_DATA=0` 关掉。git worktree 解析回主 checkout，worktree 里的知识库自动写入默认跳过
   （`FINESUB_KNOWLEDGE_WRITE=1` 才写）——要从 worktree 更新主仓知识库，先问开发者。
-- **不背向后兼容**：接口直接改，旧产物重跑即可；但 prompt 升版不作废未完成任务已提交的窗口与阶段产物，续跑照用并告警，只重做渲染出的输入变了、或当前校验器不再放行的窗。
+- **不背向后兼容**（1.0.0 之前；之后改接口或产物格式先问）：接口直接改，旧产物重跑即可；但 prompt 升版不作废未完成任务已提交的窗口与阶段产物，续跑照用并告警，只重做渲染出的输入变了、或当前校验器不再放行的窗。
 - **改管线或 LLM 行为时，测试与 owner 文档同一次改**（owner 文档见 [`docs/architecture.md`](docs/architecture.md)）。
   改了用户看得见的行为，在 `CHANGELOG.md` 写一条；加了用户能给的选项，在 `docs/manual/tuning.md` 落一行；
   只给开发用的开关（环境变量）不进 manual，写进它所属的开发者文档。
@@ -97,7 +97,7 @@ python -m compileall -q src test && ruff check && python -m pytest -q && git sta
 - **私有笔记**：`docs/plans/`、`docs/archive/`、`docs/reports/` 在 `dev` 上跟踪，发布时剥离，公开文档不点名、不链接
   里面的文件。往里移文档前，把仍然成立的事实提回跟踪的公开文档（owner 文档或新建一份），同一次修好断链。
 - **分支**：日常在 `dev` 上开发；公开的 `main` 只由发布脚本写入，不手工提交，也绝不把 `dev` 推上公开远端。
-  worktree 放 `.worktrees/<槽位>/`；清掉槽位（`git worktree remove`）之前先 `git -C <槽位> clean -xdn` 看被忽略的文件：
+  worktree 放 `.worktrees/<槽位>/`；在槽里不经 pytest 跑 `python` 之前读 [`docs/test-runs.md`](docs/test-runs.md)「在 worktree 里跑」：它会静默 import 主 checkout 的代码。清掉槽位（`git worktree remove`）之前先 `git -C <槽位> clean -xdn` 看被忽略的文件：
   git 会挡住未提交、未合并的改动，却不声不响删掉被忽略的文件。其中以后还会被读的（文档引用它，
   或复核结论、开着的线要用它）挪进主 checkout 的 `data/` 并在 `data/index.md` 登记一行，还会重跑的脚本提交进 `explore/<名字>/`
   （分支已合并就在主 checkout 提交）；其余随 `git worktree remove` 一起删，花过额度也一样。每次提交后报告当前分支与提交哈希。
@@ -109,8 +109,8 @@ python -m compileall -q src test && ruff check && python -m pytest -q && git sta
 | 改某个模块 | [`docs/architecture.md`](docs/architecture.md) 对应一行 | 那一行写着 owner 文档与改之前必须知道的；✱ 的约束有测试钉着 |
 | 改用户看得见的行为或选项 | `docs/manual/index.md` → 对应 manual | 用户向描述以 manual 为准；新增或改名一份 manual 要同步 `index.md`（覆盖面有测试，那句话说得对不对没有）；`troubleshooting.md` 只做路由，别把内容搬进去 |
 | 让 agent 替用户办事 | `agent-tasks/`：`run-audit/`（审一次 run 的产物与知识库，离线只读）、`knowledge-ingest/`（把资料收进知识库）、`feedback-pack/`（打反馈包）；约定在 `agent-tasks/README.md` | 一个子目录一件事，主文件 `SKILL.md`；**没有 harness 会把它们注入上下文**，任务对得上就自己整份读完再动手 |
-| 找数据、跑实验 | `docs/data-index.md`，逐条清单在本地 `data/index.md` | 动性能前先读 `docs/bench-discipline.md`（短）；`docs/bench-baselines.md` 的节号一律不重编号 |
-| 语音链路（VAD / ASR / 分句 / 分离器） | `docs/vad-energy.md` `docs/vad-asr.md` `docs/asr-align.md` `docs/asr-stabilize.md` `docs/segmentation-split.md` | 动分离器性能 / 并发前读 `docs/separator-optimization.md`；审分割质量前读 `docs/segmentation-gold.md`；单文件 WT 分片**已移除**（回溯点 `dev` 的 `1fcc4e1`），别按 `docs/wt-parallelism.md` 实现 |
+| 找数据、跑实验 | `docs/data-index.md`，逐条清单在本地 `data/index.md` | 动性能前先读 `docs/bench-discipline.md`（短）；`docs/bench-baselines.md` 的节号一律不重编号；重转、覆盖或删别的实验当输入用过的 ASR 产物（`data/` 里的，或 `out/`、`tmp/` 里常用测试窗口的任务目录）前，读 `docs/data-index.md`「使用前必读的三条」 |
+| 语音链路（VAD / ASR / 分句 / 分离器） | `docs/vad-energy.md` `docs/vad-asr.md` `docs/asr-align.md` `docs/asr-stabilize.md` `docs/segmentation-split.md` | 动分离器性能 / 并发前读 `docs/separator-optimization.md`；审分割质量前读 `docs/segmentation-gold.md`；单文件 WT 分片**已移除**（回溯点 `dev` 的 `1fcc4e1`），别按 `docs/wt-parallelism.md` 实现；设计长音频的救援启发式（幻觉、复读、对齐坍塌、VAD 兜底、块拼接去重）前先查 [CrispASR](https://github.com/CrispStrobe/CrispASR) 的 `docs/LEARNINGS-INDEX.md`，每条标题即结论 |
 | speech 侧还没做的事 | `docs/speech-followups.md` | 状态只写在这里、只改这里 |
 | 已经定了的事（不做的、取舍） | `docs/decisions.md`（speech、评测与跨层）；`docs/llm_design_notes.md`（LLM 层） | 重开或改之前先读那条的理由与重开条件；follow-up 里只留指过去的一行 |
 | 说话人分离 | `docs/diarization-findings.md` | 能力边界只认 findings；过程记录已归档，别从那里推断现状 |

@@ -27,6 +27,8 @@
 | `input-diar.json` | 说话人时间线（仅跑过说话人分离）。元数据 `hints` 里的 `samples` 给每条轨一段「这个人单独说话、而且最像他自己」的时间区间——**想知道 s1 是谁，照着听十秒最快**（没有连续单独说满 2 秒的轨、裁判新建的轨都没有样本）；`hints` 里其余几条只是参考数字，不改任何标签。同一份也写在 `-diar-rows.json` 顶层的 `speaker` 里 | ⚠ **别当中间数据删**：同一解码输入、同一执行路径的复跑可以相同，但重新编码、位深转换或硬件数值差异可能改变分轨，重跑也未必更准。它只读人声音轨，标签在下一行的文件里 |
 | `input-diar-rows.json` | 时间线对 `-stable.json` 每一行说了什么（仅跑过说话人分离）：每行挂哪条轨、[逐行置信标](diarization.md#逐行置信标)、[拆开的行](diarization.md#拆开两个人的行)切在哪、用不用拆过的版本；格式见[产出了什么](diarization.md#产出了什么) | ⚠ **别删**：`-raw.srt` 与 LLM 产物数的是它定下的行；删了会按当时的证据与开关重写。`-stable.json` 写成后不再改，说话人分离的结果只在这里 |
 | `input-diar-evidence.npz` | 说话人分离算出来的声学证据（`nemotron3` 与 `diarizen`；`sortformer` 不产生），每小时几 MB | **可以删**，没有它照样跑完：[逐行置信标](diarization.md#逐行置信标)与切点已经记在 `-diar-rows.json` 里，只有那份要重写时才再读它，那时没有它就没有置信标、也不拆。⚠ **只删它不会让它回来**：下次跑看到 `-diar.json` 还在就跳过这一步，要重算得**两份一起删**（而删 `-diar.json` 会换一个答案） |
+| `input-joint-voices.json` | 一体转写任务开了说话人裁判时，各轨的声纹与两两的声音相似度，裁判看的高、中两档由它算（见[一体转写的任务](diarization.md#一体转写的任务)） | ⚠ **别删**：裁判的合并按它挡；重算时门槛附近的一对可能落到另一边 |
+| `input-moss-diar.json` | 仅 `--asr moss-diarization-aligner`：它这一步的记录（交给它判说话人的原行、每段怎么选的标签、合成一条的插话），给人看、排查用 | 可以删：没有东西读它，结果在 `-aligned.json` 里 |
 | `input-speaker-judge.json` | [LLM 说话人裁判](diarization.md#llm-说话人裁判)的结果：每个窗口（LLM 分批处理的一段字幕）判了哪些行、挪到哪条轨、哪些判断不了、理由（仅 `--diarize judge-text` / `judge-audio`，且跑了 LLM 阶段；[一步纠错兼认人](diarization.md#一步纠错兼认人)的任务由纠错窗口写，没有理由） | ⚠ 同上，**别删**：同样的输入再问一次，答案可能不同。`-annotated.csv` 的 `spk` 列与分轨导出读它；删掉它就回到声学标签 |
 | `input-speakers/` | 按说话人拆开的 **ASR 原文**（仅 `--speaker-tracks`），不是纠错、翻译后的字幕；里面有哪些文件、哪行进哪份见[转成分轨](diarization.md#转成分轨) | 拿去打轴时用；自己的校对副本别放在这个目录里（重新导出会清掉，见同一链接） |
 | `input-metadata.json` | 各阶段耗时、并行数 | 排查「慢在哪一步」时查看 |
@@ -40,7 +42,7 @@
 
 ## `--stage`：指定停止的阶段
 
-共六个取值，按流水线顺序执行。默认值为 `raw-srt`——`--asr` 没选云端三家时，跑到这里**不调用任何 API、不消耗配额**。
+共六个取值，按流水线顺序执行。默认值为 `raw-srt`——`--asr` 是 `local` 或 `moss-local` 时，跑到这里**不调用任何 API、不消耗配额**（云端几家与 `moss-diarization-aligner` 在转写时就调用，已有缓存的回答或给了 `--asr-transcript` 时不调）。
 
 | `--stage` | 跑完得到 | 需要什么 |
 | --- | --- | --- |
@@ -140,6 +142,6 @@ sub|21|1.2|0.6|あのお目付役が|那个负责监视的人？|median|8.5|s0+s
 | --- | --- | --- |
 | 只要字幕 | 成品 `<名字>.srt`（想对照原文再留 `-raw.srt`） | 其余的 |
 | 回喂精修字幕（[`knowledge-update`](knowledge.md#4-把精修好的字幕回喂)） | 成品 `.srt`、`-stable.json`、`-annotated.csv` 与 `<名字>.llm-artifacts/`，留在原位置：它按成品的位置找另外几样 | `-vocal.ogg`、`-vad.json`、`-vad-energy.npz`、`-aligned.json`、四件 `-pass2-*` |
-| 续跑，或调参后重跑某一阶段 | 全部：阶段按文件在不在跳过，删掉的那一步及下游会重做（见[重跑某一阶段](#重跑某一阶段需删除的产物)） | 四件 `-pass2-*`、`-diar-evidence.npz`（见表里那一行） |
+| 续跑，或调参后重跑某一阶段 | 全部：阶段按文件在不在跳过，删掉的那一步及下游会重做（见[重跑某一阶段](#重跑某一阶段需删除的产物)） | 四件 `-pass2-*`、`-diar-evidence.npz`（见表里那一行）、`-moss-diar.json` |
 
 卸载 FineSub 时删什么、留什么，见[资源与大文件「清理」](resources.md#清理)。

@@ -39,8 +39,9 @@ DEFAULT_EXECUTION_STRATEGY = "batched"
 
 #: The three business tasks of §3. ``prepare`` is the global preparation
 #: (material understanding, sources, cross-window conventions); ``translate``
-#: is one correction/translation deliverable; ``knowledge_update`` proposes
-#: into the base after the product exists and is the only write channel.
+#: is one correction/translation deliverable; ``knowledge_update`` checks the
+#: names the task searched, then proposes into the base after the product
+#: exists, and is the only write channel.
 TASK_KINDS = ("prepare", "translate", "knowledge_update")
 
 #: ``global``: once per run. ``window``: once per planned correction window
@@ -166,6 +167,7 @@ def plan_task_graph(
     fast_enabled: bool,
     grant: CapabilityGrant,
     prepare_strategy: str | None = None,
+    correct_only: bool = False,
 ) -> TaskGraph:
     """The four-cell main matrix (§3) over the six-cell grant (§4).
 
@@ -174,7 +176,9 @@ def plan_task_graph(
     the whole input fits one deliverable, not because of any search backend.
     ``knowledge_update`` follows the product whenever the switch says
     ``update``, in both columns, and is never folded into the fused task
-    (§3: "fast 不把知识更新塞进翻译任务").
+    (§3: "fast 不把知识更新塞进翻译任务"). It opens with the name check
+    (docs/knowledge.md「中文定名的核查」), which searches; a correct-only
+    task's stage is that check alone, no proposals.
 
     Deliberately takes no knowledge root and no index: with the base enabled
     but empty, the read tool simply returns nothing.
@@ -206,9 +210,8 @@ def plan_task_graph(
             TaskSpec(kind="translate", scope="window", tools=read_tools, strategy=strategy)
         )
     if grant.updates_knowledge:
-        tasks.append(
-            TaskSpec(kind="knowledge_update", scope="global", tools=(TOOL_KB_PROPOSE,))
-        )
+        # the check's search is the stage's own (the route's native search, else local), not the run's grant
+        tasks.append(TaskSpec(kind="knowledge_update", scope="global", tools=() if correct_only else (TOOL_KB_PROPOSE,)))
     return TaskGraph(strategy=strategy, fast=fast_enabled, grant=grant, tasks=tuple(tasks))
 
 

@@ -163,6 +163,7 @@ def test_the_judge_reads_a_cloud_tasks_tracks_as_its_transcriptions_speakers():
     from dataclasses import replace
 
     from finesub.llm.stages.speaker_judge import prompt as judge
+    from finesub.llm.stages.speaker_judge.run import JudgeInputs, unit_prompt
     from finesub.llm.stages.speaker_judge.windows import JudgeWindow
 
     from .support.speaker_judge import segments_of, speaker
@@ -171,9 +172,8 @@ def test_the_judge_reads_a_cloud_tasks_tracks_as_its_transcriptions_speakers():
     window = JudgeWindow("0001", "0001", 0, 4)
 
     def system(rows):
-        profile = judge.profiles(rows, window)
-        return judge.judge_prompt(rows, window, title="t", summary="", cast=(), marks=False, profile=profile,
-                                  shape=True, audio=judge.audio_layout(rows, window, profile.samples))[0]
+        return unit_prompt(rows, window, JudgeInputs("t"), tracks=(), carried=(), heard=True, shape=True,
+                           correct_only=False, segment=1).system
 
     local = system(rows)
     cloud = system([replace(row, group_key=f"S{row.speaker.track}") for row in rows])

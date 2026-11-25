@@ -191,7 +191,7 @@ def test_a_merged_row_writes_one_spk_and_a_merge_over_a_turn_is_not_a_violation(
 
 def test_a_tracked_window_names_its_own_prompt_version(tmp_path):
     stable = _stable(tmp_path)
-    assert window_prompt_version(_window(stable)) == "zh-subtitle-correction-tracked-v3"
+    assert window_prompt_version(_window(stable)) == "zh-subtitle-correction-tracked-v12"
     assert window_prompt_version(_window(stable, tracked=False)).startswith("zh-subtitle-correction-csv-")
 
 
@@ -207,7 +207,7 @@ def test_a_tool_session_validator_gets_the_speaker_material(tmp_path):
 def test_the_request_turn_checkpoint_is_composed_under_the_windows_own_set(tmp_path):
     stable = _stable(tmp_path)
     tracked, plain = _window(stable), _window(stable, tracked=False)
-    assert checkpoint_set(tracked) == ("", "zh-subtitle-correction-tracked-v3")
+    assert checkpoint_set(tracked) == ("", "zh-subtitle-correction-tracked-v12")
     assert checkpoint_set(plain)[0] == "" and checkpoint_set(plain)[1].startswith("zh-subtitle-correction-csv-")
     assert _messages(tracked, checkpoint_set(tracked)[0]) == _messages(tracked)  # the default set, served tracked
 
@@ -514,7 +514,7 @@ def test_the_correct_only_set_shares_the_tracked_prompt_version(tmp_path):
     """The version is the window's (it carries speaker material), whichever mode: the translating render did not
     change, and no correct-only tracked window was committed before."""
     window = _window(_zh_stable(tmp_path))
-    assert window_prompt_version(window) == "zh-subtitle-correction-tracked-v3"
+    assert window_prompt_version(window) == "zh-subtitle-correction-tracked-v12"
 
 
 def test_the_correct_only_role_and_work_words_come_from_the_mode(tmp_path):

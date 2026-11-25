@@ -512,10 +512,10 @@ class CorrectionRun:
     #: and a bare `+=` is a read-modify-write that can drop counts.
     repair_rounds: int = 0
     content_filter_recoveries: int = 0
-    #: three passes: the windows whose answer left almost every line read 可并 apart (`degeneration`)
+    #: three passes: the windows whose committed answer left their lines read 可并 apart (`degeneration`)
     unmerged_windows: list[str] = field(default_factory=list)
-    #: the windows asked again because their answer reported no thinking (`degeneration.thinking_of`)
-    rethought_windows: list[str] = field(default_factory=list)
+    #: the windows asked again because their answer was held, with why (`degeneration.Draw.held_for`)
+    redone_windows: list[tuple[str, list[str]]] = field(default_factory=list)
     #: the inline proofread turn's outcome per window this run committed, by status (`inline_proofread`)
     proofread_windows: Dict[str, int] = field(default_factory=dict)
     #: windows replayed from the ledger that another prompt version answered: version -> count (`note_replay`)
@@ -540,9 +540,9 @@ class CorrectionRun:
         with self._tally_lock:
             self.unmerged_windows.append(chunk_id)
 
-    def note_rethought(self, chunk_id: str) -> None:
+    def note_redone(self, chunk_id: str, signals: list[str]) -> None:
         with self._tally_lock:
-            self.rethought_windows.append(chunk_id)
+            self.redone_windows.append((chunk_id, signals))
 
     def note_proofread(self, chunk_id: str, status: str) -> None:
         with self._tally_lock:

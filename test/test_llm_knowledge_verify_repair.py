@@ -41,26 +41,37 @@ def _seed(store: KnowledgeStore) -> None:
                          "desc": "Ver.3.0 起对听众的统称。"})
         for order, node_id in enumerate(("T1", "T2", "T3", "R1")):
             txn.create_membership(f"M{order}", "S", node_id, "角色", order)
+        # the profile facts `verify` checks (term lines are the name check's, `name_check.py`)
+        txn.create_node("P", "subject", {"surface": "星野灯", "intro": "主播", "category": "streamer",
+                                         "section_order": ["档案", "直播内容"]})
+        txn.create_node("F1", "note", {"label": "人设", "text": "个人势"})
+        txn.create_node("F2", "note", {"label": "外观", "text": "银发蓝瞳"})
+        txn.create_node("F3", "note", {"text": "事务所所属"}, maturity="tentative")
+        txn.create_node("F4", "note", {"text": "常玩原神"})
+        for order, node_id in enumerate(("F1", "F2", "F3")):
+            txn.create_membership(f"P{order}", "P", node_id, "档案", order)
+        txn.create_membership("P9", "P", "F4", "直播内容", 0)  # verify = none
 
 
 def test_unverified_claims_scope(tmp_path) -> None:
     with KnowledgeStore(tmp_path / "kb.sqlite") as store:
         _seed(store)
         record_evidence(
-            store, node_id="T1", field_path="payload:core",
-            value_hash=payload_group_hash("term", store.node("T1").payload),
+            store, node_id="F1", field_path="payload:core",
+            value_hash=payload_group_hash("note", store.node("F1").payload),
             verdict="confirmed", evidence_kind="external",
             source_ref="https://x", task_id="t",
         )
         claims = unverified_claims(store)
     nodes = {c["node_id"] for c in claims}
-    assert "T2" in nodes           # no evidence yet
-    assert "T1" not in nodes       # already confirmed for the current hash
-    assert "T3" not in nodes       # tentative earns its way via shadow, not quota
-    assert "R1" in nodes           # a common 分类节 term: external route open
-    row = next(c for c in claims if c["node_id"] == "T2")
-    assert row["subject"] == "原神" and "フリンズ|菲林斯||角色" in row["line"]
-    assert "フリンズ" in render_verify_prompt(claims)
+    assert "F2" in nodes           # no evidence yet
+    assert "F1" not in nodes       # already confirmed for the current hash
+    assert "F3" not in nodes       # tentative earns its way via shadow, not quota
+    assert "F4" not in nodes       # 直播内容: verify = none
+    assert not nodes & {"T1", "T2", "R1"}  # term lines are the name check's
+    row = next(c for c in claims if c["node_id"] == "F2")
+    assert row["subject"] == "星野灯" and "[外观] 银发蓝瞳" in row["line"]
+    assert "银发蓝瞳" in render_verify_prompt(claims)
 
 
 def test_parse_and_book_verify_results(tmp_path) -> None:
@@ -72,29 +83,29 @@ def test_parse_and_book_verify_results(tmp_path) -> None:
             "查了官方站。\n<verify_results>\n"
             + json.dumps(
                 [
-                    {"claim_id": by_node["T2"]["claim_id"], "verdict": "confirmed",
-                     "url": "https://official.example/x", "note": "官方译名"},
-                    {"claim_id": by_node["T1"]["claim_id"], "verdict": "confirmed",
+                    {"claim_id": by_node["F2"]["claim_id"], "verdict": "confirmed",
+                     "url": "https://official.example/x", "note": "官方资料"},
+                    {"claim_id": by_node["F1"]["claim_id"], "verdict": "confirmed",
                      "note": "我确信"},  # confirmed WITHOUT url: an opinion, dropped
                     {"claim_id": "c999", "verdict": "confirmed", "url": "https://x"},  # unknown id
                 ]
                 + [{"claim_id": c["claim_id"], "verdict": "unverifiable", "note": "查不到"}
-                   for c in claims if c["node_id"] not in ("T1", "T2")],
+                   for c in claims if c["node_id"] not in ("F1", "F2")],
                 ensure_ascii=False,
             )
             + "\n</verify_results>"
         )
         rows = parse_verify_results(text, claims)
         verdicts = {r["node_id"]: r["verdict"] for r in rows}
-        assert verdicts["T2"] == "confirmed"
-        assert "T1" not in verdicts  # url-less confirmation dropped
+        assert verdicts["F2"] == "confirmed"
+        assert "F1" not in verdicts  # url-less confirmation dropped
         booked = book_verify_results(store, rows, task_id="kb-verify")
         assert booked == len(rows)
         kinds = {
             (r["node_id"], r["verdict"], r["evidence_kind"])
             for r in store.conn.execute("SELECT node_id, verdict, evidence_kind FROM evidence")
         }
-        assert ("T2", "confirmed", "external") in kinds
+        assert ("F2", "confirmed", "external") in kinds
         # a second sweep no longer offers the settled claims
         assert all(c["node_id"] not in verdicts for c in unverified_claims(store))
 
@@ -179,6 +190,9 @@ class _CutOffLLM:
 
     def __init__(self, content: str) -> None:
         self.content, self.kwargs = content, {}
+
+    def ensure_eligible_target(self, role, **kwargs):  # type: ignore[no-untyped-def]
+        pass  # every route serves: the name check takes native search
 
     def complete(self, role, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.kwargs = kwargs
@@ -335,8 +349,10 @@ def test_a_restrictive_parent_keeps_a_shared_node_home(tmp_path) -> None:
                                               "category": "common", "section_order": ["角色"]})
             txn.create_node("SS", "subject", {"surface": "某主播", "intro": "x",
                                               "category": "streamer", "section_order": ["人际关系"]})
-            txn.create_node("T", "term", {"surface": "某人", "zh": "某人", "desc": "d"})
-            txn.create_membership("M1", "SC", "T", "角色", 0)        # verify = external
+            txn.create_node("SP", "subject", {"surface": "另一位", "intro": "x",
+                                              "category": "streamer", "section_order": ["档案"]})
+            txn.create_node("T", "note", {"label": "人设", "text": "个人势"})
+            txn.create_membership("M1", "SP", "T", "档案", 0)        # verify = external
             txn.create_membership("M2", "SS", "T", "人际关系", 0)     # verify = none
         assert "T" not in {c["node_id"] for c in unverified_claims(store)}
         # with only the permissive parent it goes out normally

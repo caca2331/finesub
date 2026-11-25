@@ -1,18 +1,25 @@
 """Gemini 3.5 Transcribe ("35t") through `/v1beta/interactions`, free keys only.
 
-The source is cut into WINDOW s windows overlapping by OVERLAP s and sent one
-after another. Each answer is read in output order (35t emits by speaker: B's
-backchannel comes after A's sentence although it is earlier) and repaired:
+The source is cut into windows of at most WINDOW s at Silero pauses and sent
+one after another: a window ends at a pause in the REACH s before WINDOW, the
+next starts at one 60-90 s before that end (`cuts`), the previous window's
+words lowering the bar where they break. Each answer is read in
+output order (35t emits by speaker: B's backchannel comes after A's sentence
+although it is earlier) and repaired:
 
 1. bad times: a word with end < start or longer than BAD_DUR, or one starting
    more than BACK_JUMP before the previous word of the same speaker ended,
    starts a run that is shifted back as a whole when a matching opposite jump
    closes it; otherwise only the bad word is fixed (`fix_times`);
 2. degeneration: a 1-4 word sequence repeated REPEAT times in a row, or an
-   answer whose status is not `completed`, splits the window in two halves;
+   answer whose status is not `completed`, splits the window in two halves,
+   each strictly shorter, cut at pauses OVERLAP / 2 s either side of the
+   middle (`_split`);
 3. early stop: a window whose last word ends more than GAP s before the window
-   does continues from CONTINUE_BACK s before that word (at least MIN_ADVANCE
-   past the window start); the last window continues once.
+   does continues from a pause CONTINUE_BACK s before that word, at least
+   MIN_ADVANCE past the window start (`_continued`); the last window continues
+   once. A window read once is never the continuation (a cached half of a
+   degenerate window is not read again as the tail).
 
 Keys: the `GEMINI_FREE` pool, one key until Gemini answers that its requests
 per day are spent, then the next (owner: never the paid pool automatically).
@@ -28,7 +35,7 @@ import statistics
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from finesub import api_keys
 from finesub.api_http import (
@@ -42,7 +49,7 @@ from finesub.media.ffmpeg import extract_upload_mp3, probe_media_duration
 from finesub.reporting import bind_reporter, current_reporter
 
 from ...subtitles.metrics import weighted_char_count
-from . import GEMINI_35T
+from . import GEMINI_35T, cuts
 from . import live as live_client
 from . import repair as R
 from .cache import CacheMiss, CallCache, audio_fingerprint
@@ -52,14 +59,23 @@ from .quota import PACIFIC, KeyLedger, QuotaExhausted, pick_key
 from .relink import VOICEPRINTS, Voiceprints, Voices
 from .stitch import stitch
 
+if TYPE_CHECKING:
+    from .stage import AlignerUse
+
 MODEL = "gemini-3.5-transcribe"
 UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 INTERACTIONS = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
 WINDOW = 540.0
-OVERLAP = 60.0
+#: The least overlap of two windows (`cuts.OVERLAP`), as the cached answers' identity records it.
+OVERLAP = cuts.OVERLAP[0]
+#: A window's end looks for a pause this far before WINDOW, as every cut's does (owner 2026-11-22); a cached window
+#: is still found ending up to CACHED_REACH s before it, the reach windows were cut by from 2026-11-21 to 11-22.
+REACH = cuts.REACH
+CACHED_REACH = 60.0
 MIN_ADVANCE = 120.0
-CONTINUE_BACK = 10.0
+#: An early stop goes on from a pause this far before the last word: at least, at most.
+CONTINUE_BACK = (10.0, 20.0)
 GAP = 30.0
 BAD_DUR = 3.0
 BACK_JUMP = 0.5
@@ -268,10 +284,12 @@ class Caller:
     """One window's request on the first key with requests left today; a key Gemini reports spent is
     marked for (key, model) and the next one tried."""
 
-    def __init__(self, *, ledger: KeyLedger | None = None, entries=None, sleep: Callable[[float], None] = time.sleep):
+    def __init__(self, *, ledger: KeyLedger | None = None, entries=None, sleep: Callable[[float], None] = time.sleep,
+                 announce: Callable[[], None] = lambda: None):
         self.ledger = ledger or KeyLedger(GEMINI_35T, MODEL, PACIFIC)
         self._entries = entries
         self._sleep = sleep
+        self._announce = announce  # before each request, once a key is in hand
 
     def entries(self):
         if self._entries is None:
@@ -281,6 +299,7 @@ class Caller:
     def __call__(self, audio: Path, *, language: str | None, seconds: float) -> dict:
         while True:
             entry = pick_key(self.entries(), self.ledger, what="gemini-35t (GEMINI_FREE)")
+            self._announce()
             try:
                 body = self._once(audio, entry.key, language=language)
             except QuotaExhausted:
@@ -351,7 +370,8 @@ def _answer(r) -> dict | None:
 #: it writes between those words is new (`repair.anchored`); heard alone, Live wrote variants of the neighbours and
 #: half sentences, which lost the reader vote. When that call fails, or Live wrote nothing over the window though
 #: 35t has words on both sides of the spot, or (a run) Live's answer does not hold the sides, the spot alone is heard,
-#: LIVE_PAD s either side (`_Spot.deaf`).
+#: LIVE_PAD s either side out to a Silero pause (`_Spot.deaf`, `cuts.padded`). The wide window needs no pause: its
+#: edges are 35t's own words', EDGE s outside them.
 CTX = 5.0
 EDGE = 0.3
 LIVE_PAD = 1.0
@@ -362,8 +382,8 @@ LIVE_CACHE = f"{GEMINI_35T}-live"
 #: New text for a miss that weighs less (`weighted_char_count`) is not inserted: 1-3 character fragments.
 MIN_NEW = 3.0
 #: `--asr-repair quota`: re-asks on the daily requests, their own cache directory; a span is padded by
-#: REASK_PAD s (and widened to REASK_MIN s); a speakerless window is asked again as two REASK_HALF s windows;
-#: at most REASK_CAP calls per source, the rest are left to Live.
+#: REASK_PAD s (and widened to REASK_MIN s); a speakerless window is asked again in two halves of at most REASK_HALF s
+#: (`_split`); at most REASK_CAP calls per source, the rest are left to Live.
 REASK_CACHE = f"{GEMINI_35T}-repair"
 REASK_PAD = 10.0
 REASK_MIN = 30.0
@@ -458,30 +478,55 @@ def _voiced_spans(pcm, a: float, b: float) -> list[tuple[float, float]]:
     return [(x + a, y + a) for x, y in moss_timing.speech_spans(moss_timing.frame_probabilities(pcm[lo:hi]))]
 
 
-def _padded(a: float, b: float, total: float) -> tuple[float, float]:
-    lo, hi = a - REASK_PAD, b + REASK_PAD
-    short = max(0.0, REASK_MIN - (hi - lo)) / 2
-    return max(0.0, lo - short), min(total, hi + short)
+def _padded(a: float, b: float, total: float, pauses: cuts.Pauses, known: Sequence[tuple[float, float]],
+            breaks: cuts.Breaks = ()) -> tuple[float, float]:
+    """[a, b] padded by REASK_PAD s, widened to REASK_MIN s, each edge out to a pause (`cuts.padded`) no further
+    than one window allows (the pads themselves are always given)."""
+    short = max(0.0, REASK_MIN - (b - a + 2 * REASK_PAD)) / 2
+    return cuts.padded(a - short, b + short, REASK_PAD, pauses, total, known, longest=WINDOW, breaks=breaks)
 
 
-def _halves(s: float, e: float) -> list[tuple[float, float]]:
-    if e - s > REASK_HALF:
-        return [(s, s + REASK_HALF), (e - REASK_HALF, e)]
-    mid = (s + e) / 2
-    return [(s, min(e, mid + OVERLAP / 2)), (max(s, mid - OVERLAP / 2), e)]
+def _split(s: float, e: float, pauses: cuts.Pauses, known: Sequence[tuple[float, float]],
+           longest: float | None = None, breaks: cuts.Breaks = ()) -> list[tuple[float, float]]:
+    """[s, e] as two overlapping halves, each strictly shorter: the first ends `d` s after the middle and the second
+    starts `d` s before it (`d` = OVERLAP / 2 -- the fixed halves before 2026-11-21 -- in a window long enough that
+    each half is a second shorter, else a third of the window), each out to a pause up to a third of `d` further,
+    a second short of the window's edges; with `longest` and a window longer, the first ends `longest` s after `s`
+    and the second starts that before `e`, each in to a pause up to OVERLAP / 6 s. A known span (cached) in those
+    ranges instead. `breaks`: the window's words', where they can be trusted (not a degenerate window's)."""
+    if longest is not None and e - s > longest:
+        h = OVERLAP / 6
+        ends, starts = (s + longest - h, s + longest), (e - longest, e - longest + h)
+        nominal = (s + longest, e - longest)
+    else:
+        mid = (s + e) / 2
+        d = OVERLAP / 2 if e - s >= OVERLAP + 2.0 else (e - s) / 3
+        ends = (mid + d, max(mid + d, min(mid + d * 4 / 3, e - 1.0)))
+        starts = (min(mid - d, max(mid - d * 4 / 3, s + 1.0)), mid - d)
+        nominal = (mid + d, mid - d)
+    first = cuts.cached(known, (s, s), ends) or (s, cuts.pause_in(pauses, *ends, nominal[0], breaks))
+    second = cuts.cached(known, starts, (e, e)) or (cuts.pause_in(pauses, *starts, nominal[1], breaks), e)
+    return [first, second]
 
 
 def reasked(units: list[dict], *, total: float, ask: Callable[[float, float], list[dict]], speech: SpeechSpans,
-            voices: Voices, speakerless: list[tuple[float, float]]) -> tuple[list[dict], list[dict]]:
+            voices: Voices, speakerless: list[tuple[float, float]],
+            asked: Sequence[tuple[float, float]] = ()) -> tuple[list[dict], list[dict]]:
     """`--asr-repair quota`: up to REASK_CAP spans asked of 35t again (`ask(lo, hi)`: its words, absolute, times
     fixed): the misses with the most speech first, then repetition runs at talking speed, then the halves of
-    speakerless windows. What a re-ask leaves wrong, or one not made, is Live's after it."""
+    speakerless windows. What a re-ask leaves wrong, or one not made, is Live's after it. Every span is cut at
+    Silero pauses; `asked` holds the spans already asked (cached), taken where they fall in a cut's ranges."""
     plan: list[tuple[str, float, float, Any]] = []
-    spans = R.merged(R.gaps(units, total, speech.voiced), longest=WINDOW - 2 * REASK_PAD)  # one window at most
+    # one window at most
+    spans = R.merged(R.gaps(units, total, speech.voiced), longest=WINDOW - 2 * REASK_PAD)
+    runs = [r for r in R.runs(units) if not r.fast]
+    pauses = cuts.pauses_of(speech.spans()) if spans or runs or speakerless else []
+    breaks = cuts.word_breaks(units) if spans or runs or speakerless else []
     for a, b, found in sorted(spans, key=lambda m: -sum(g.voiced for g in m[2])):
-        plan.append(("miss", *_padded(a, b, total), found))
-    plan += [("repeat", *_padded(r.start, r.end, total), r) for r in R.runs(units) if not r.fast]
-    plan += [("speakerless", lo, hi, None) for s, e in speakerless for lo, hi in _halves(s, e)]
+        plan.append(("miss", *_padded(a, b, total, pauses, asked, breaks), found))
+    plan += [("repeat", *_padded(r.start, r.end, total, pauses, asked, breaks), r) for r in runs]
+    plan += [("speakerless", lo, hi, None) for s, e in speakerless
+             for lo, hi in _split(s, e, pauses, asked, REASK_HALF, breaks)]
     log, done = [], []
     for kind, lo, hi, what in plan[:REASK_CAP]:
         entry = {"repair": kind, "via": "35t", "span": [round(lo, 2), round(hi, 2)]}
@@ -499,13 +544,12 @@ def reasked(units: list[dict], *, total: float, ask: Callable[[float, float], li
             impact="这几处改交 35t Live 补；metadata 里记了是哪几处")
     if len(plan) > REASK_CAP:
         log.append({"repair": "quota_cap", "left_to_live": len(plan) - REASK_CAP})
-    known = [u for u in units if u.get("speaker") is not None]
     units = [dict(u) for u in units]
     # Labels first, then runs from the last (their indices hold until a miss inserts), then misses.
     order = {"speakerless": 0, "repeat": 1, "miss": 2}
     done.sort(key=lambda d: (order[d[0]], -d[3].first if d[0] == "repeat" else 0))
     for kind, lo, hi, what, words, entry in done:
-        mapping = R.relabel(known, words, lo, hi, voices)
+        mapping = R.relabel(words, voices)
         entry["speakers"] = mapping
         if kind == "speakerless":  # only the labels move: each loose word takes the re-ask word it overlaps most
             moved = 0
@@ -542,17 +586,18 @@ def reasked(units: list[dict], *, total: float, ask: Callable[[float, float], li
 
 
 def repaired(units: list[dict], *, total: float, language: str | None, live_cache: CallCache,
-             live_wide_cache: CallCache, live, speech: SpeechSpans, voiceprints: Voiceprints, aligner: bool,
-             reask=None, speakerless: list[tuple[float, float]] = ()) -> tuple[list[dict], list[dict]]:
+             live_wide_cache: CallCache, live, speech: SpeechSpans, voiceprints: Voiceprints,
+             aligner: AlignerUse | None, reask=None, speakerless: list[tuple[float, float]] = (),
+             asked: Sequence[tuple[float, float]] = ()) -> tuple[list[dict], list[dict]]:
     """The stitched units (output order) with what Live and local rules repair (`--asr-repair on`), and one log
-    entry per spot; with `reask` (`quota`), 35t's own re-asks first (`reasked`). Words of a speakerless window
-    carry `nospk`."""
+    entry per spot; with `reask` (`quota`), 35t's own re-asks first (`reasked`, `asked` the spans it has cached).
+    Words of a speakerless window carry `nospk`."""
     units = [dict(u) for u in units]
     log: list[dict] = []
     voices = Voices(speech.pcm, voiceprints, R.blocks([u for u in units if not u.get("nospk")]))
     if reask is not None:
         units, log = reasked(units, total=total, ask=reask, speech=speech, voices=voices,
-                             speakerless=list(speakerless))
+                             speakerless=list(speakerless), asked=asked)
 
     # Speakerless windows: each block of their words takes the nearest voice (off until judged).
     loose = [u for u in units if u.get("nospk") and u.get("speaker") is None]
@@ -577,6 +622,13 @@ def repaired(units: list[dict], *, total: float, language: str | None, live_cach
              for r in found_runs if not r.fast]
     spots += [_Spot("gap", g.start, g.end, units, total, gap=g) for g in R.gaps(units, total, speech.voiced)]
     pcm = speech.pcm() if spots else None
+    pauses = cuts.pauses_of(speech.spans()) if spots else []
+    breaks = cuts.word_breaks(units) if spots else []
+    # A wide window's edges, 35t's words', go out to the middle of a pause they lie in; a cached window between
+    # those and its old edges (named so before 2026-11-22) is taken (`cuts.widened`).
+    wide_known = cuts.spans_named(live_wide_cache.names(), "ctx") if spots else []
+    for spot in spots:
+        spot.lo, spot.hi = cuts.widened(spot.lo, spot.hi, pauses, 0.0, total, wide_known)
     align = None
     if aligner and spots:
         from .aligner import aligned_units
@@ -587,7 +639,8 @@ def repaired(units: list[dict], *, total: float, language: str | None, live_cach
             if broken:  # failed once (no model, no transformers): not again for every spot
                 return None
             try:
-                return aligned_units([segment], all_segments=[segment, *neighbours], pcm16k=pcm).get(0)
+                return aligned_units([segment], all_segments=[segment, *neighbours], pcm16k=pcm,
+                                     device=aligner.device).get(0)
             except Exception as error:  # noqa: BLE001 -- S5b, as for a segment the aligner gives up on
                 broken.append(str(error))
                 current_reporter().warning("cloud-repair-aligner", f"强制对齐失败（{error}），修补补回的字改用 Silero 定时")
@@ -607,7 +660,8 @@ def repaired(units: list[dict], *, total: float, language: str | None, live_cach
 
     def alone(spot: _Spot) -> None:
         try:
-            text = live_cache.fetch(spot.name, listen(max(0.0, spot.start - LIVE_PAD), spot.end + LIVE_PAD))["text"]
+            text = live_cache.fetch(spot.name, listen(*cuts.padded(spot.start, spot.end, LIVE_PAD, pauses, total,
+                                                                   breaks=breaks)))["text"]
         except CacheMiss:
             error = "not cached (calls off)"
         except Exception as e:  # noqa: BLE001 -- a failed spot is given up, the task goes on (owner 2026-11-02)
@@ -702,6 +756,18 @@ def _near(units: list[dict], a: float, b: float) -> list[dict]:
     return ([max(before, key=lambda u: u["end"])] if before else []) + ([min(after, key=lambda u: u["start"])] if after else [])
 
 
+def _continued(last: float, floor: float, pauses: cuts.Pauses,
+               breaks: cuts.Breaks = ()) -> tuple[tuple[float, float], float]:
+    """Where a window that stopped early goes on (the range a cached window may start in, and the start): at a pause
+    CONTINUE_BACK s before its `last` word, not before `floor`; when the floor is the later, at a pause up to
+    CONTINUE_BACK[1] - CONTINUE_BACK[0] s after it. `breaks`: the window's words'."""
+    width = CONTINUE_BACK[1] - CONTINUE_BACK[0]
+    nominal = max(last - CONTINUE_BACK[0], floor)
+    lo = max(last - CONTINUE_BACK[1], floor)
+    hi = max(last - CONTINUE_BACK[0], floor + width)
+    return (lo, hi), cuts.pause_in(pauses, lo, hi, nominal, breaks)
+
+
 def _trimmed(new: list[dict], around: list[dict], a: float, b: float) -> list[dict]:
     left, right = R.neighbours(around, a, b)
     first, end = R.trim_echo([u["text"] for u in new], left, right)
@@ -709,6 +775,18 @@ def _trimmed(new: list[dict], around: list[dict], a: float, b: float) -> list[di
 
 
 # --- one source -------------------------------------------------------------------------------------------
+
+
+def _window_read(raw: dict, start: float, end: float) -> dict:
+    """One window's answer read: its words (times fixed, `fix_times`), status, longest repeat, whether it gave no
+    speakers."""
+    words, events = fix_times(raw_words(raw, start))
+    rep, unit = longest_repeat(words)
+    no_speaker = bool(words) and not any(w["speaker"] for w in words)
+    if no_speaker:  # for the repair (`nospk`); `Unit` does not keep it
+        words = [dict(x, nospk=True) for x in words]
+    return {"start": start, "end": end, "status": answer_status(raw), "words": words, "events": events,
+            "repeat": rep, "repeat_unit": unit, "no_speaker": no_speaker}
 
 
 def identity(source: Path, language: str | None) -> dict:
@@ -728,16 +806,21 @@ def transcribe(
     live=None,
     speech: SpeechSpans | None = None,
     voiceprints: Voiceprints | None = None,
-    aligner: bool = False,
+    aligner: AlignerUse | None = None,
+    answer: dict | None = None,
 ) -> Transcript:
     """The source's 35t transcript; every call cached under `cache_root/gemini-35t/`, Live's under
-    `cache_root/gemini-35t-live-ctx/` and `cache_root/gemini-35t-live/`. `repair` is `--asr-repair` (`repair.MODES`)."""
+    `cache_root/gemini-35t-live-ctx/` and `cache_root/gemini-35t-live/`. `repair` is `--asr-repair` (`repair.MODES`).
+    `answer`: one answer over the whole source from 0 s (a transcript file, `--asr-transcript`), read as a window's
+    (its times fixed): no cache, no call, no split of a degenerate window, no repair (those would call)."""
 
     src = Path(source)
     code = LANGUAGE_CODES.get((language or "").lower())
     cache = CallCache(cache_root, GEMINI_35T, identity=identity(src, code), offline=offline)
     call = caller or Caller()
     total = duration if duration is not None else probe_media_duration(src)
+
+    read: set[str] = set()  # the windows read so far, by name: a later step never takes one of them again
 
     def window(start: float, end: float) -> dict:
         def ask() -> dict:
@@ -746,41 +829,81 @@ def transcribe(
                 clip = extract_upload_mp3(src, start, end, Path(tmp) / "window.mp3")
                 return call(clip, language=code, seconds=end - start)
 
-        raw = cache.fetch(f"w-{start:.1f}-{end:.1f}", ask)
-        words, events = fix_times(raw_words(raw, start))
-        rep, unit = longest_repeat(words)
-        no_speaker = bool(words) and not any(w["speaker"] for w in words)
-        if no_speaker:  # for the repair (`nospk`); `Unit` does not keep it
-            words = [dict(x, nospk=True) for x in words]
-        return {"start": start, "end": end, "status": answer_status(raw), "words": words, "events": events,
-                "repeat": rep, "repeat_unit": unit, "no_speaker": no_speaker}
+        read.add(f"w-{start:.1f}-{end:.1f}")
+        return _window_read(cache.fetch(f"w-{start:.1f}-{end:.1f}", ask), start, end)
 
-    parts, log = [], []
-    start, tail_done = 0.0, False
+    if answer is not None:
+        part = _window_read(answer, 0.0, total)
+        log = [dict(e, window=[0.0, total]) for e in part["events"]]
+        if part["repeat"] >= REPEAT:
+            log.append({"repeat": part["repeat"], "unit": part["repeat_unit"]})
+        if part["no_speaker"]:
+            log.append({"no_speaker_windows": 1})
+        return Transcript(GEMINI_35T, MODEL, total, "word", turns_from_units(Unit.from_dict(u) for u in part["words"]),
+                          log)
+
+    speech = speech or SpeechSpans(src)  # decoded on first use: by the cuts and the repair, once
+    silences: list[tuple[float, float]] | None = None
+
+    def pauses() -> list[tuple[float, float]]:  # only a source cut anywhere needs Silero
+        nonlocal silences
+        if silences is None:
+            silences = cuts.pauses_of(speech.spans())
+        return silences
+
+    named = cuts.spans_named(cache.names(), "w")
+
+    def known() -> list[tuple[float, float]]:
+        """The cached windows not read yet (a tail goes on from a degenerate window's half: not that half again)."""
+        return [k for k in named if f"w-{k[0]:.1f}-{k[1]:.1f}" not in read]
+
+    def span(starts: tuple[float, float], start: float) -> tuple[tuple[float, float], bool, bool]:
+        """The window from `start` (or a cached one starting in `starts`), whether it is the last, and whether it is
+        a window already read (its answer again)."""
+        ends = lambda s: (total, total) if total - s <= WINDOW else (s + WINDOW - CACHED_REACH, s + WINDOW)  # noqa: E731
+        found = cuts.cached(known(), starts, ends)
+        if found is not None:  # named to 0.1 s
+            return found, found[1] >= total - cuts.NAMED, False
+        planned = (start, total) if total - start <= WINDOW else (start, cuts.end_before(start + WINDOW, pauses(), REACH))
+        return planned, planned[1] == total, f"w-{planned[0]:.1f}-{planned[1]:.1f}" in read
+
+    parts, log, split = [], [], set()
+    nxt, starts, tail_done = 0.0, (0.0, 0.0), False
     while True:
-        end = min(total, start + WINDOW)
+        (start, end), final, again = span(starts, nxt)
         w = window(start, end)
-        if w["repeat"] >= REPEAT or w["status"] != "completed":
-            mid = (start + end) / 2
-            halves = [window(start, mid + OVERLAP / 2), window(mid - OVERLAP / 2, end)]
+        degenerate = w["repeat"] >= REPEAT or w["status"] != "completed"
+        # Only a tail can plan a window already read (a half of a split one): its words are in already, but a
+        # degenerate one not split yet is split now, its halves in its place.
+        if again and (not degenerate or (start, end) in split):
+            log.append({"tail_read_already": [round(start, 1), round(end, 1)]})
+            break
+        if again:
+            name = f"w-{start:.1f}-{end:.1f}"
+            parts = [p for p in parts if f"w-{p['start']:.1f}-{p['end']:.1f}" != name]
+        if degenerate:
+            split.add((start, end))
+            halves = [window(a, b) for a, b in _split(start, end, pauses(), known())]
             log.append({"split": [start, end], "repeat": w["repeat"], "unit": w["repeat_unit"], "status": w["status"]})
             parts.extend(halves)
             last = max((x["end"] for h in halves for x in h["words"]), default=start)
+            breaks = cuts.word_breaks(halves[-1]["words"])  # the whole window's words are not trusted
         else:
             parts.append(w)
             last = max((x["end"] for x in w["words"]), default=start)
-        if end >= total:
+            breaks = cuts.word_breaks(w["words"])
+        if final:
             if total - last > GAP and not tail_done:
                 log.append({"tail": [last, total]})
-                start, tail_done = max(last - CONTINUE_BACK, start + 1.0), True
+                starts, nxt = _continued(last, start + 1.0, pauses(), breaks)
+                tail_done = True
                 continue
             break
         if end - last > GAP:
-            nxt = max(last - CONTINUE_BACK, start + MIN_ADVANCE)
+            starts, nxt = _continued(last, start + MIN_ADVANCE, pauses(), breaks)
             log.append({"early_stop": [start, end], "last_word": round(last, 1), "next": round(nxt, 1)})
         else:
-            nxt = end - OVERLAP
-        start = nxt
+            starts, nxt = (end - cuts.OVERLAP[1], end - cuts.OVERLAP[0]), cuts.start_before(end, pauses(), breaks=breaks)
     units = stitch([(p["start"], p["end"], p["words"]) for p in parts], segments=False)
     log.extend(dict(e, window=[p["start"], p["end"]]) for p in parts for e in p["events"])
     if any(p["no_speaker"] for p in parts):
@@ -792,7 +915,7 @@ def transcribe(
                                identity={"provider": LIVE_CACHE, "pad": LIVE_PAD, **asked})
         live_wide_cache = CallCache(cache_root, LIVE_WIDE_CACHE, offline=offline,
                                     identity={"provider": LIVE_WIDE_CACHE, **asked})
-        reask = None
+        reask, asked = None, []
         if mode == "quota":
             reask_cache = CallCache(cache_root, REASK_CACHE, offline=offline,
                                     identity=dict(identity(src, code), provider=REASK_CACHE, pad=REASK_PAD))
@@ -806,9 +929,12 @@ def transcribe(
 
                 return fix_times(raw_words(reask_cache.fetch(f"r-{lo:.1f}-{hi:.1f}", ask), lo))[0]
 
+            asked = cuts.spans_named(reask_cache.names(), "r")
+
         units, fixes = repaired(units, total=total, language=language, live_cache=live_cache,
-                                live_wide_cache=live_wide_cache, live=live or live_client.Live(), speech=speech or SpeechSpans(src),
+                                live_wide_cache=live_wide_cache, live=live or live_client.Live(), speech=speech,
                                 voiceprints=voiceprints or VOICEPRINTS, aligner=aligner, reask=reask,
-                                speakerless=[(p["start"], p["end"]) for p in parts if p["no_speaker"]])
+                                speakerless=[(p["start"], p["end"]) for p in parts if p["no_speaker"]],
+                                asked=asked)
         log.extend(fixes)
     return Transcript(GEMINI_35T, MODEL, total, "word", turns_from_units(Unit.from_dict(u) for u in units), log)

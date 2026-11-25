@@ -14,6 +14,9 @@ from ...text_cells import decode_text_cell
 
 #: The categories the system prompt numbers under「改什么」.
 CATEGORIES = range(1, 7)
+#: A text cell the reply left as the input line's own (the prompt lets an unchanged cell say so), filled back in
+#: where the change is written into the rows (`restored`).
+SAME = "="
 
 
 class AnswerError(ValueError):
@@ -23,7 +26,7 @@ class AnswerError(ValueError):
 @dataclass(frozen=True)
 class Change:
     """One line the model changed: its number in the window (1-based), the category, the line's corrected text
-    and translation as they should read, and why."""
+    and translation as they should read -- either may be `SAME`, the input line's own -- and why."""
 
     position: int
     category: int
@@ -42,7 +45,8 @@ def parse_changes(text: str, count: int) -> list[Change]:
     any of them, the reason included, shifts the texts into the wrong columns with nothing to tell, so a line with
     more refuses the reply (the prompt forbids `|` in the reason; the input writes it full-width). The texts are
     read as the prompt wrote them (`\n` a line break). A number
-    outside the window or given twice, a category outside 1-6, an empty corrected text or translation, or a line
+    outside the window or given twice, a category outside 1-6, an empty corrected text or translation, both texts
+    `SAME` (a line that changed nothing, which the prompt says to leave out), or a line
     that names the block's own opening tag refuses the reply: the block cannot tell where a reply that opened it
     again meant its answer to start, and a draft above that line would be read as answer."""
     match = re.search(r"<proofread>(.*?)</proofread>", text or "", re.S)
@@ -68,6 +72,13 @@ def parse_changes(text: str, count: int) -> list[Change]:
             raise AnswerError(f"类别不是 1–6：{line.strip()!r}")
         if not corrected.strip() or not translation.strip():
             raise AnswerError(f"纠错文或译文是空的：{line.strip()!r}")
+        if corrected == SAME and translation == SAME:
+            raise AnswerError(f"纠错文和译文都写了 =，这一行什么也没改：没改的行不写，改了的那格写出改后的全文：{line.strip()!r}")
         seen.add(int(number))
         out.append(Change(int(number), int(category), corrected, translation, why))
     return out
+
+
+def restored(cell: str, original: str) -> str:
+    """A changed line's text cell as it should read: the input line's own where the reply wrote `SAME`."""
+    return original if cell == SAME else cell

@@ -7,6 +7,12 @@ harness persists each block as a task artifact (``correction_window_task_feedbac
 aggregates them into the structured inputs of the unified knowledge update:
 per-window feedback slices, the research-wide slice, and the merged
 ``knowledge_hints`` that drive knowledge-entry prefetching.
+
+``name_checks`` (what a searching task found on the 未核 中文定名 it was
+about to write) is the one field the knowledge update never reads: it is
+the clues of the name check that opens the knowledge-update stage
+(`knowledge/name_check_step.py`), so it stays out of every rendering and
+hash the update sees (docs/knowledge.md「任务里的核查」).
 """
 
 from __future__ import annotations
@@ -67,6 +73,34 @@ class KnowledgeHint:
         return data
 
 
+#: The longest quote a name-check record keeps (the prompt asks for a sentence or two).
+NAME_CHECK_QUOTE_MAX_CHARS = 120
+
+
+@dataclass(frozen=True)
+class NameCheckRecord:
+    """One search a task made on an 未核 name: what it found (``found`` empty when nothing) and where."""
+
+    source: str
+    kb_zh: str
+    found: str = ""
+    url: str = ""
+    quote: str = ""
+    query: str = ""
+    #: ``prepare`` or ``window <chunk id>``: where the clue came from (the check session reads it)
+    origin: str = ""
+
+
+def _parse_name_check(data: Any, origin: str) -> NameCheckRecord | None:
+    if not isinstance(data, Mapping):
+        return None
+    fields = {key: str(data.get(key) or "").strip() for key in ("source", "kb_zh", "found", "url", "quote", "query")}
+    if not fields["source"] or not fields["kb_zh"]:
+        return None
+    fields["quote"] = fields["quote"][:NAME_CHECK_QUOTE_MAX_CHARS]
+    return NameCheckRecord(**fields, origin=origin)
+
+
 @dataclass(frozen=True)
 class TaskFeedback:
     """One parsed ``<task_update_feedback>`` block."""
@@ -82,9 +116,13 @@ class TaskFeedback:
     #: call-level evidence backfilled at persist time, never parsed from the
     #: model's output: the model asked to copy its own URLs simply drops them.
     retrieval_urls: tuple[str, ...] = ()
+    #: the name-check clues; never rendered for the knowledge update (module docstring)
+    name_checks: tuple[NameCheckRecord, ...] = ()
 
     @property
     def is_empty(self) -> bool:
+        """Nothing for the knowledge update (the name checks are not its input)."""
+
         return not (self.hints or self.asr_corrections or self.uncertainties)
 
     def to_dict(self) -> dict[str, Any]:
@@ -230,6 +268,18 @@ def parse_task_update_feedback(
                 hints.append(hint)
     elif raw_hints not in (None, []):
         warnings.append("knowledge_hints is not a list; ignored")
+    name_checks: list[NameCheckRecord] = []
+    raw_checks = data.get("name_checks")
+    if isinstance(raw_checks, Sequence) and not isinstance(raw_checks, str):
+        source_of = "prepare" if origin == "research" else f"window {chunk_id}"
+        for item in raw_checks:
+            record = _parse_name_check(item, source_of)
+            if record is None:
+                warnings.append("a name_checks item without source or kb_zh; ignored")
+            else:
+                name_checks.append(record)
+    elif raw_checks not in (None, []):
+        warnings.append("name_checks is not a list; ignored")
     return TaskFeedback(
         origin=origin,
         chunk_id=chunk_id,
@@ -238,6 +288,7 @@ def parse_task_update_feedback(
         uncertainties=_string_items(data.get("uncertainties")),
         warnings=tuple(warnings),
         retrieval_urls=urls,
+        name_checks=tuple(name_checks),
     )
 
 
@@ -282,6 +333,15 @@ class FeedbackAggregate:
     window_feedback: Mapping[str, TaskFeedback] = field(default_factory=dict)
     research_feedback: TaskFeedback | None = None
     warnings: tuple[str, ...] = ()
+    #: every preparation chunk's name checks: a long file's chunks each search their own names, and the research
+    #: slice above keeps only the last chunk's feedback
+    research_name_checks: tuple[NameCheckRecord, ...] = ()
+
+    def all_name_checks(self) -> list[NameCheckRecord]:
+        """The task's name-check clues: the preparation chunks' first, then each window's in window order."""
+
+        return [*self.research_name_checks,
+                *(record for _id, feedback in sorted(self.window_feedback.items()) for record in feedback.name_checks)]
 
     @property
     def is_empty(self) -> bool:
@@ -361,12 +421,15 @@ def aggregate_task_update_feedback(
     """Read feedback artifacts and aggregate them (last record wins per key).
 
     Reads only the structured feedback artifact kinds — never the full window
-    responses. Retries and reruns append multiple records for the same window;
-    the latest one reflects the committed output.
+    responses. A window's record is written when its answer is committed
+    (`stages.correction.attempts._write_window_feedback`), so a rerun that asks
+    a window again appends another and the latest one reflects the committed
+    output; an empty one clears the window.
     """
 
     window_feedback: dict[str, TaskFeedback] = {}
     research_feedback: TaskFeedback | None = None
+    research_checks: list[NameCheckRecord] = []
     warnings: list[str] = []
     for record in iter_task_artifacts(artifact_paths):
         kind = record.get("kind")
@@ -380,7 +443,10 @@ def aggregate_task_update_feedback(
             feedback = parse_task_update_feedback(
                 body, origin="window", chunk_id=chunk_id, retrieval_urls=recorded_urls
             )
-            window_feedback[chunk_id] = feedback
+            if feedback.is_empty and not (feedback.name_checks or feedback.warnings):
+                window_feedback.pop(chunk_id, None)  # the committed answer gave none: an earlier record is void
+            else:
+                window_feedback[chunk_id] = feedback
             warnings.extend(
                 f"window {chunk_id}: {warning}" for warning in feedback.warnings
             )
@@ -388,6 +454,7 @@ def aggregate_task_update_feedback(
             research_feedback = parse_task_update_feedback(
                 body, origin="research", retrieval_urls=recorded_urls
             )
+            research_checks.extend(research_feedback.name_checks)
             warnings.extend(
                 f"research: {warning}" for warning in research_feedback.warnings
             )
@@ -395,4 +462,5 @@ def aggregate_task_update_feedback(
         window_feedback=window_feedback,
         research_feedback=research_feedback,
         warnings=tuple(warnings),
+        research_name_checks=tuple(research_checks),
     )

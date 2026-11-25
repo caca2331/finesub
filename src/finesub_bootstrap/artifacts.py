@@ -44,6 +44,10 @@ REMOVABLE_SUFFIXES = (
     "-vad.json",
     "-vad-energy.npz",
     "-aligned.json",
+    # `--asr moss-diarization-aligner`'s record of its steps (the word backend's lines, each part's picks, the
+    # labels, the overlap cues): written for inspection and for replaying a change to the stitching off the GPU;
+    # nothing reads it, and the aligned JSON holds the result.
+    "-moss-diar.json",
     "-raw.srt",
     "-translated.srt",
     "-metadata.json",
@@ -90,12 +94,16 @@ _METADATA_SUFFIX = "-metadata.json"
 #: confidence marks and cuts need the evidence sidecar, which is removable; and
 #: the products after it count its lines. They exist only when `--diarize` (and,
 #: for the verdicts, the LLM speaker judge) ran; absent files are not copied.
+#: `-joint-voices.json` (a cloud task's labels compared by voice) gates the
+#: judge's merges: made again on other hardware, or once a model that was
+#: missing is back, a pair near the floor may land on the other side.
 RECORD_SUFFIXES = (
     "-stable.json",
     "-annotated.csv",
     "-diar.json",
     "-diar-rows.json",
     "-speaker-judge.json",
+    "-joint-voices.json",
 )
 
 #: Directories beside the subtitle that a run keeps, which cleanup never

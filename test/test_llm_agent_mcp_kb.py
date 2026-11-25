@@ -672,6 +672,30 @@ def test_batch_refuses_an_empty_call_list_and_nesting(tmp_path, monkeypatch) -> 
     assert "cannot run in a batch" in nested["results"][0]["error"]
 
 
+def test_batch_offers_only_the_lookups_the_session_has(tmp_path, monkeypatch) -> None:
+    """A batch member the session does not have drew a model to it: a native round's GPT-6 called the batch's
+    `web_search` (not registered: the round searches with Codex's own) and gave up on `Unknown tool` (2026-11-21).
+    So `batch` names only the registered lookups, and a session with none has no batch."""
+
+    _seed(tmp_path)
+    server = _batch_server(monkeypatch, tmp_path)
+    server._web_tools = False
+
+    def batch():  # type: ignore[no-untyped-def]
+        return next((tool for tool in server.tool_definitions if tool["name"] == "batch"), None)
+
+    offered = batch()
+    members = offered["inputSchema"]["properties"]["calls"]["items"]["properties"]["tool"]["enum"]
+    assert "kb_read" in members and not {"web_search", "web_fetch"} & set(members)
+    assert "web_search" not in offered["description"]
+    refused = _payload(server, 1, "batch", calls=[{"tool": "web_search", "arguments": {"query": "x"}}])
+    assert "cannot run in a batch" in refused["results"][0]["error"]
+    server._web_tools = True
+    assert "web_search" in batch()["inputSchema"]["properties"]["calls"]["items"]["properties"]["tool"]["enum"]
+    server._web_tools, server._kb_tool_names = False, ()
+    assert batch() is None
+
+
 def test_every_codex_tool_passes_codex_auto_approval(tmp_path, monkeypatch) -> None:
     """Codex runs tools under `default_tools_approval_mode="auto"`, which lets
     a call through only when it is read-only, or neither destructive nor

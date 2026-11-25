@@ -422,6 +422,9 @@ class _ToolUsingFakeDriver:
     # Set to simulate a CLI that keeps talking after its submit: `run` then
     # only returns once the harness's completion predicate says so.
     hang_after_script = False
+    # The CLI's final chat text. It is offered as the answer when the session never submitted (docs §4), so
+    # a test of a premature stop under a validator sets one that does not pass.
+    final_text = "submitted"
 
     def run(self, messages, **kwargs):
         self.calls.append((list(messages), kwargs))
@@ -448,7 +451,7 @@ class _ToolUsingFakeDriver:
             completion = kwargs["completion"]
             assert completion(), "the runtime knows the task is accepted; the driver may reclaim"
         return SimpleNamespace(
-            content="submitted",
+            content=self.final_text,
             reported_model="claude",
             execution_attempt={"backend": "local_agent", "capsule_id": "cap-1"},
             episode_id="cap-1",
@@ -618,6 +621,7 @@ def test_an_empty_turn_without_a_submit_is_still_the_targets_failure(
 def test_a_tool_session_that_never_submits_is_a_failed_call(tmp_path, monkeypatch) -> None:
     _no_api(monkeypatch)
     driver = _ToolUsingFakeDriver(lambda server: _call(server, 1, "next_task"))
+    driver.final_text = "bad"  # what it left is not a passing answer
     client = _client(driver, tmp_path)
 
     with pytest.raises(Exception) as excinfo:
@@ -1114,8 +1118,10 @@ def test_the_switch_off_opens_the_session_as_before(tmp_path, monkeypatch) -> No
 def test_a_premature_stop_gets_the_same_opening_and_a_fresh_booking(
     tmp_path, monkeypatch, _opening_on
 ) -> None:
-    """The reset clears the ledger; the second CLI is handed the same opening
-    and the harness books it again, so it owes nothing either."""
+    """On a driver that does not resume a tool session, the reset clears the
+    ledger; the second CLI is handed the same opening, then the follow-up with
+    the text the first left, and the harness books it again, so it owes
+    nothing either."""
 
     _no_api(monkeypatch)
     seen: list = []
@@ -1128,13 +1134,16 @@ def test_a_premature_stop_gets_the_same_opening_and_a_fresh_booking(
         _call(server, 2, "submit", payload="good")
 
     driver = _ToolUsingFakeDriver(agent, mcp_opening="inline")
+    driver.final_text = "bad"  # what it left is not a passing answer
     result = _client(driver, tmp_path).complete(
         LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}
     )
     assert result.content == "good"
     assert seen == ["left", []]
     first, second = (call[0][0]["content"] for call in driver.calls)
-    assert first == second
+    assert second.startswith(first + "\n\n")
+    assert "<previous_chat_text>\nbad\n</previous_chat_text>" in second[len(first):]
+    assert all(call[1]["session_scope"] == "task" for call in driver.calls)
 
 
 def _single_task_runtime(tmp_path, *, metadata=None, blocks=None, payload="the window text"):
@@ -1583,6 +1592,7 @@ def test_after_a_premature_stop_the_new_cli_finds_the_protocol_seen(
         _call(server, 2, "submit", payload="good")
 
     driver = _ToolUsingFakeDriver(agent, mcp_opening="inline")
+    driver.final_text = "bad"  # what it left is not a passing answer
     result = _client(driver, tmp_path).complete(
         LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}
     )

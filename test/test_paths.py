@@ -428,6 +428,7 @@ def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
         Path(paths.vad_json),
         Path(paths.vad_energy_npz),
         Path(paths.aligned_json),
+        Path(paths.moss_diar_json),
         # The clustering's evidence sidecar: reproducible from the audio, unlike the timeline
         # it sits beside, so it is cleaned while -diar.json is kept.
         evidence_path(paths.diar_json),
@@ -514,4 +515,8 @@ def test_every_pipeline_path_is_either_removable_or_a_record() -> None:
     assert sidecar_path(paths.stable_json) == paths.speaker_judge_json
     assert OVERLAY_SUFFIX in artifacts.RECORD_SUFFIXES
     assert overlay_path(paths.stable_json) == paths.diar_rows_json
+    from finesub.speech.joint.voices import VOICES_SUFFIX, voices_path  # a cloud task's, beside the stable
+
+    assert VOICES_SUFFIX in artifacts.RECORD_SUFFIXES
+    assert voices_path(paths.stable_json).name.endswith(VOICES_SUFFIX)
 

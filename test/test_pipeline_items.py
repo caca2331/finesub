@@ -705,6 +705,7 @@ def test_a_url_claims_its_destination_once_the_download_resolves_it(tmp_path, mo
         task_artifact_dir=srt.with_name("vid.llm-artifacts"),
         metadata_json=srt.with_name("vid-metadata.json"),
         cloud_dir=srt.with_name("vid-cloud"),
+        moss_diar_json=srt.with_name("vid-moss-diar.json"),
     )
     monkeypatch.setattr(
         pipeline,

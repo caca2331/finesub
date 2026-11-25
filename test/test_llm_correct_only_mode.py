@@ -291,16 +291,19 @@ def test_only_people_write_the_task_line(tmp_path):
             assert not _is_rejection({"reason": HIDDEN_LABEL_HELD})
 
 
-@pytest.mark.parametrize("knowledge, source, warned", [
-    ("read", "default", False),  # the default turns off silently
-    ("read", "explicit", True),
-    ("update", "preset:p", True),
-    ("none", "explicit", False),
+@pytest.mark.parametrize("knowledge, source, kept, warned", [
+    ("read", "default", "read", False),
+    ("read", "explicit", "read", False),
+    ("update", "preset:p", "update", True),  # the refined subtitle is not used: said once
+    ("update", "default", "update", True),
+    ("none", "explicit", "none", False),
 ])
-def test_a_correct_only_task_keeps_out_of_the_knowledge_base(tmp_path, monkeypatch, knowledge, source, warned):
-    """Owner 2026-11-06: a Chinese task neither reads nor writes the base, whatever was asked; the user who asked
-    is told once; nor is the model asked for feedback to update it with, even where the caller asked for it. A
-    translating task keeps its knowledge mode."""
+def test_a_correct_only_task_reads_the_knowledge_base_and_runs_no_knowledge_update(tmp_path, monkeypatch, knowledge,
+                                                                                   source, kept, warned):
+    """A Chinese task reads the base (2026-11-12) and runs no knowledge update (owner 2026-11-06): `update` stays
+    `update` -- its one write is the name check at the end (owner 2026-11-13, `_correct_only_tail`) -- but a refined
+    subtitle is not used (said once), nor is the model asked for feedback to update the base with, even where the
+    caller asked for it. A translating task keeps its knowledge mode."""
     from finesub.llm import correction_translation as orchestration
 
     warnings: list[str] = []
@@ -311,10 +314,10 @@ def test_a_correct_only_task_keeps_out_of_the_knowledge_base(tmp_path, monkeypat
         request, _ = orchestration._with_task_mode(
             _request(_stable(tmp_path, langs), knowledge=knowledge, refined_srt=refined,
                      switch_sources={"knowledge": source}, collect_feedback=True), tmp_path / "art")
-        assert request.knowledge == ("none" if correct_only else knowledge)
-        assert request.collect_feedback is not correct_only
+        assert request.knowledge == (kept if correct_only else knowledge)
+        assert request.collect_feedback is True, "a correct-only task under update still records its name checks"
         assert (request.refined_srt is None) is (correct_only or refined is None)
-        assert any("知识库" in w for w in warnings) is (warned and correct_only)
+        assert any("--refined-srt" in w for w in warnings) is (warned and correct_only)
 
 
 def test_a_plan_of_a_chinese_source_previews_the_correct_only_task(tmp_path):

@@ -1,8 +1,10 @@
-"""The word backends' text-side sentence-boundary model (`docs/joint-asr.md`; the P18 model, `docs/bench-baselines.md`).
+"""The joint backends' text-side sentence-boundary model (`docs/joint-asr.md`; the P18 model, `docs/bench-baselines.md`).
 
 35t's lines lost to production's on fragmenting; the probability that a sentence ends after each word, taken
 off the cost of cutting there, put 83% of the readers' windows on its side, Scribe's 81% and MAI2's 68% (2026-11
-Scribe report). Fixed on for all three (owner 2026-11-11: light enough, and no switch to add); `FINESUB_SBD=off`
+Scribe report). Fixed on for all three (owner 2026-11-11: light enough, and no switch to add) and for both MOSS
+backends, in every language (owner 2026-11-19 for Japanese, 2026-11-20 for the rest: no reason to differ from the
+other backends; measured on Chinese and English in the moss-word-cut report); `FINESUB_SBD=off`
 builds the lines without it, for the "without" arm of a comparison (`README_DEV.md`). A load that fails warns once
 per process and the lines are built without it, as `metadata.joint_asr.sentence_boundary_model` then records.
 

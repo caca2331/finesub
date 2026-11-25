@@ -352,7 +352,7 @@ def test_the_zero_thinking_retry_comes_before_the_turn(tmp_path, monkeypatch) ->
     silent = replace(_reply(ANSWER), thinking_level="high")
     calls, ledger = _run(tmp_path, monkeypatch, silent, _reply(ANSWER), _reply(_patch()))
     assert calls[1]["fresh_session"] and "followup_turns" not in calls[1]
-    assert calls[2]["followup_turns"] and ledger[0]["thinking"]["chosen"] == "retry"
+    assert calls[2]["followup_turns"] and ledger[0]["redo"]["chosen"] == "retry"
     assert ledger[0]["inline_proofread"] == inline_proofread.NO_CHANGE
 
 

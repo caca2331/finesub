@@ -11,4 +11,4 @@ $earlier_chunks_block带窗口标记的 ASR 字幕文本：
 $transcript
 </transcript>
 
-最后提醒（读完以上全部输入后）：$closing_reminder；不得因输出较长省略必需标签；必须按格式完整输出；除上述块外不要输出任何其他文字。
+最后提醒（读完以上全部输入后）：$closing_reminder；不得因答案较长省略必需标签；必须按格式写完整；答案里除上述块外不要有任何其他文字。

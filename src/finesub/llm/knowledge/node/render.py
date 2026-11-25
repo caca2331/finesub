@@ -23,7 +23,9 @@ from .model import (
 )
 from ...output_tags import neutralize_closing_tags
 from ..base import join_names
-from .presets import MATCHABLE_CATEGORIES, LabelSpec, preset_for_category
+from .name_trust import check_notes
+from .name_trust import trust_marks as line_trust_marks
+from .presets import MATCHABLE_CATEGORIES, LabelSpec, head_section_names, preset_for_category
 from .store import KnowledgeStore
 
 if TYPE_CHECKING:
@@ -147,19 +149,19 @@ def load_subject_tree(store: KnowledgeStore, subject_id: str, rev: int | None = 
 # ---- line formatting -----------------------------------------------------------
 
 
-def format_line(node: NodeVersion, aliases: Iterable[str] | None = None) -> str:
+def format_line(node: NodeVersion, aliases: Iterable[str] | None = None, *, desc_mark: str = "") -> str:
     """One stored line in the v3 grammar: an optional ``[标记]`` prefix plus a
     body. The label is a cross-kind payload key, so prefixing happens once
-    here rather than per kind."""
+    here rather than per kind. ``desc_mark``: see `model_line`."""
 
-    body = format_body(node, aliases)
+    body = format_body(node, aliases, desc_mark=desc_mark)
     label = str(node.payload.get("label") or "").strip()
     if not label or node.kind == "subject":
         return body
     return f"[{label}] {body}" if body else f"[{label}]"
 
 
-def format_body(node: NodeVersion, aliases: Iterable[str] | None = None) -> str:
+def format_body(node: NodeVersion, aliases: Iterable[str] | None = None, *, desc_mark: str = "") -> str:
     payload = node.payload
     kind = node.kind
     if kind == "term":
@@ -170,7 +172,7 @@ def format_body(node: NodeVersion, aliases: Iterable[str] | None = None) -> str:
         # items are matcher-only and never rendered.
         alias_column = join_names(dict.fromkeys(aliases or ()))
         return "|".join(
-            (payload.get("surface", ""), payload.get("zh", ""), alias_column, payload.get("desc", ""))
+            (payload.get("surface", ""), payload.get("zh", ""), alias_column, desc_mark + payload.get("desc", ""))
         )
     # Legacy kinds only exist between Phase A and Phase B of the re-import;
     # they keep their verbatim separator so that stretch stays byte-parity.
@@ -201,6 +203,38 @@ def node_aliases(store: KnowledgeStore, node: NodeVersion, rev: int | None = Non
         for item in store.items_of(node.local_id, rev)
         if item.field == "aliases" and item.maturity != "tentative"
     ]
+
+
+def model_line(
+    store: KnowledgeStore,
+    node: NodeVersion,
+    rev: int,
+    *,
+    trust_marks: bool = False,
+    marks: Mapping[str, str] | None = None,
+) -> str:
+    """One line as a model reads it -- the one place the trust mark is put,
+    so every way a correction task reads a line (`render_subject`, the
+    agent's ``kb_read_node``, the term hits of `knowledge.base.match_terms`)
+    shows it the same.
+
+    ``trust_marks``: a term line whose 中文定名 nobody checked (`name_trust`,
+    state 未核) gets ``（未核）`` -- ``（未核，查不到）`` while a check that
+    found nothing on that name still holds it back -- at the start of its
+    description column: after the name, so a model copying the second column
+    into a subtitle does not copy the mark. A correction task's prompts carry
+    it, translating or correct-only; a knowledge session's full preview and
+    the human projection (``rendered/``, ``show``) never do, so the harvest
+    cannot read it back into the library. ``marks`` is the caller's
+    precomputed `name_trust.trust_marks` (an entry's worth at once); without
+    it the line's state is looked up on its own."""
+
+    mark = ""
+    if trust_marks:
+        if marks is None:
+            marks = line_trust_marks(store, [node], rev)
+        mark = marks.get(node.local_id, "")
+    return format_line(node, aliases=node_aliases(store, node, rev), desc_mark=mark)
 
 
 def _legacy_line(store: KnowledgeStore, node: NodeVersion) -> str:
@@ -397,6 +431,8 @@ def render_subject(
     preview: str = "partial",
     marks: "LineMarks | None" = None,
     alias_row_handle: bool = True,
+    correct_only: bool = False,
+    trust_marks: bool = False,
 ) -> str:
     """Render one subject as markdown in the requested projection.
 
@@ -421,6 +457,19 @@ def render_subject(
     ``alias_row_handle`` -- with ``handles``, the `[别名]` slot carries an
     `@a` handle the model may `update` / `remove` (cold read Q5). The share
     conflict repair turns it off: its gate refuses entry aliases.
+
+    ``correct_only`` is what a task that only corrects a Chinese source reads
+    of a matchable entry (prompt mode, partial preview): the head -- H1, intro,
+    relation lines, the head sections (`档案`) whole -- and of every other
+    section its term lines alone. The free sentences are written for
+    translating (renderings, tone); a section left with no line is not
+    rendered. A standalone category (a style) is not projected: its body is
+    all free sentences, and it is the task's own. A term line whose 中文定名
+    nobody checked carries the trust mark (`model_line`).
+
+    ``trust_marks`` puts the trust mark on the 未核 term lines of a
+    translating correction task's projection too (prompt mode, partial
+    preview), the rest of it unchanged; ``correct_only`` implies it.
     """
 
     if mode not in MODES:
@@ -441,6 +490,23 @@ def render_subject(
     trailing_blank: dict[str, int] = layout.get("trailing_blank", {})
     preset = preset_for_category(payload.get("category") or "common")
     wanted = set(sections) if sections is not None else None
+    if correct_only and (mode != "prompt" or preview != "partial"):
+        raise ValueError("the correct-only projection is a read-only prompt face")
+    trust_marks = trust_marks or correct_only
+    if trust_marks and (mode != "prompt" or preview != "partial"):
+        raise ValueError("the trust marks belong to a read-only prompt face")
+    terms_only = correct_only and (payload.get("category") or "common") in MATCHABLE_CATEGORIES
+    head_sections = head_section_names() if terms_only else frozenset()
+    # the trust marks of the whole entry in one lookup (`model_line`)
+    trust = (
+        line_trust_marks(store, (child for view in tree.sections for _, child in view.entries), tree.rev)
+        if trust_marks else {}
+    )
+    # a person's view ends each term line in its check note (`name_trust.check_note`), stripped on the way back in
+    notes = (
+        check_notes(store, (child for view in tree.sections for _, child in view.entries), tree.rev)
+        if mode == "human" else {}
+    )
 
     out: list[str] = []
     out.append(f"# {payload.get('surface', '')}")
@@ -480,6 +546,8 @@ def render_subject(
     for view in ordered:
         if wanted is not None and view.name not in wanted:
             continue
+        if terms_only and view.name not in head_sections:
+            view = SectionView(view.name, [entry for entry in view.entries if entry[1].kind == "term"])
         spec = preset.section(view.name)
         used_labels = {line_label(child.payload) for _, child in view.entries}
         slots = (
@@ -508,7 +576,7 @@ def render_subject(
             line = (
                 _legacy_line(store, child)
                 if mode == "legacy"
-                else format_line(child, aliases=node_aliases(store, child, tree.rev))
+                else model_line(store, child, tree.rev, trust_marks=trust_marks, marks=trust)
             )
             if mode == "human":
                 # rendered/ is edited in markdown editors too, some of which
@@ -522,12 +590,14 @@ def render_subject(
                 # of getting a second: a real archive whose sections used
                 # markdown lists rendered 291 lines as `- - …` across 23 of 27
                 # entries (2026-09-01). The cost is that the harvest's
-                # `_strip_bullet` then eats the user's own dash, so a leading
+                # `edit._bare_line` then eats the user's own dash, so a leading
                 # `- ` is ABSORBED by the bullet convention and does not
                 # survive an edit round-trip — accepted deliberately (owner
                 # 2026-09-01) over the alternative of escaping it, which would
                 # put an escape character in front of a human reader.
                 line = line if line.startswith("- ") else f"- {line}"
+                if child.local_id in notes:
+                    line += f"  <!-- {notes[child.local_id]} -->"
             if mode == "prompt" and handles is not None:
                 # membership handles (@m) are not rendered: no op the model can
                 # emit consumes them today, so inline they are only noise tokens

@@ -59,12 +59,13 @@ asr bin 的 GPU 道固定为 1，每个文件独占整个 profile 的 shard/sepa
   这次的 `--asr`）。答不出（读产物出错、答了不认识的道）就走 GPU 道，由 stage 自己报错。
 - **网络道上并行带来的共享状态**：Silero 模型有状态，每次整段打分都用自己的一份拷贝
   （`silero_ghost.SileroProbStream`），共用的只有加载时的那一次，在锁里；SBD 的首次加载有锁，强制对齐模型的加载与每次前向都在 `joint.GPU_LOCK` 里；强制对齐（`--asr-aligner`）
-  一次只跑一份。混合批（本地与带对齐的云端任务同时在跑）里对齐会和本地 Whisper 同时占显卡，
-  这一处没有挡；有 GPU 时 MOSS Pro 与 35t 的修补默认就对齐（`--asr-aligner auto`），混合批里这种情形是常态。
+  一次只跑一份。混合批（本地与带对齐的云端任务同时在跑）里对齐模型（千问）会和本地 Whisper 同时占显卡，
+  这一处没有挡；MOSS Pro 与 35t 的修补默认就对齐（`--asr-aligner auto`），有 GPU 时 MOSS 两家对齐之后还载 Whisper 重定没把握的切点（对齐模型先卸，峰值估计约 2.2 GB），混合批里这种情形是常态；Whisper 是 CT2，CUDA OOM 是进程级中止（见 [`gpu-profiles.md`](gpu-profiles.md)），所以这一步进 `GPU_STAGE_GATE`、自成一族（`joint-whisper`），等 GPU 道上的分离器、本机 Whisper 或说话人分离做完再上卡，它们也等它（owner 2026-11-20）；对齐模型本身仍不进门（torch，OOM 能接住、退回 Silero）。⚠ 重定是持着 `joint.GPU_LOCK` 等门的，所以门的持有者（分离器、VAD-ASR 的 `wt` 租约里、说话人分离）不得去拿 `GPU_LOCK`，否则两边互等、不报错。GPU 道上本机任务的说话人分离（torch，在 `wt` 租约放掉之后跑）也自成一族（`diarization`，`speech/diarization/stage.py`，owner 2026-11-20）：它是 torch，显存不足只让这一个任务失败、不中止进程，但同时上卡的重定是 CT2，会中止整个进程，所以两者互相等；放门之前它先把留在卡上的东西放掉（出错时先清掉还引用着模型的栈帧）；混合批没有实测过（[`speech-followups.md`「一体转写」](speech-followups.md#一体转写)）。代价是吞吐：GPU 道上一份本机 ASR 或说话人分离占着门时（本机 ASR 在长素材上十几分钟），等门的重定拿着 `GPU_LOCK`，这段时间里别的网络任务的千问对齐也排在后面。
 - **本地 MOSS 走 GPU 道**（`--asr moss-local`，在本机显卡上解码）：解码期间持有 `joint.GPU_LOCK`，
   网络道上的强制对齐等它（两者都是一体转写的 GPU 用户；对齐模型在每个任务用完就卸载，还在显存里时本地 MOSS 按已分配的
   显存算预算会扣掉它）。⚠ 锁的顺序是先 `GPU_LOCK` 再 Silero 的锁：本地 MOSS 拿着前者跑 Silero，
   反过来拿会死锁。它设的进程级显存上限在这一步结束（含失败）时复原。
+- **`--asr moss-diarization-aligner` 也走 GPU 道**（`joint.GPU_BACKENDS`）：第一步拿别家的行（读转写文件、缓存或调 API，35t 的修补还会对齐），第二步本地 MOSS 强制解码。`GPU_LOCK` 只包第二步（解码与 CUDA 声纹），第一步不拿：35t 修补里的对齐器自己拿这把锁，它不可重入。代价：行要现转时，等 API 的那几分钟也占着 GPU 道（卡是闲的）。
 - **MOSS Pro 的额度**：选 key 时就把这次调用记进本地账（`KeyLedger.reserve`），服务端肯定没收下
   才退回（上传被 4xx 拒绝，或根本没连上），两个任务不会同时挤进同一把 key 剩下的额度；上传之后
   丢了回答、轮询失败都照记：服务端可能已计费，宁可早一步换 key，也不让账户余额被扣。35t 不按本地账预判、撞到服务端的日上限才换 key，不受影响。

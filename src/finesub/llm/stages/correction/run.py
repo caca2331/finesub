@@ -136,11 +136,11 @@ def _shadow_scan_windows(
     """
 
     try:
-        from ...knowledge.base import knowledge_root_path, knowledge_signals_enabled, version_rev
+        from ...knowledge.base import entry_signals_enabled, knowledge_root_path, version_rev
         from ...knowledge.node.matching import shadow_scan
         from ...knowledge.node.repo import KnowledgeRepo
 
-        if not knowledge_signals_enabled(knowledge_root):
+        if not entry_signals_enabled(knowledge_root):
             return
         rev = version_rev(version)
         store = KnowledgeRepo.open(knowledge_root_path(knowledge_root)).store
@@ -175,11 +175,11 @@ def _log_landed_windows(
     scan; reruns deduplicate on the event key."""
 
     try:
-        from ...knowledge.base import knowledge_root_path, knowledge_signals_enabled, version_rev
+        from ...knowledge.base import entry_signals_enabled, knowledge_root_path, version_rev
         from ...knowledge.node.repo import KnowledgeRepo
         from ...knowledge.node.signals import log_landed_windows
 
-        if not knowledge_signals_enabled(knowledge_root):
+        if not entry_signals_enabled(knowledge_root):
             return
         window_of: dict[str, str] = {}
         for window in windows:
@@ -349,11 +349,14 @@ def _report_correction_summary(run: CorrectionRun) -> None:
             by_tier[tier] = by_tier.get(tier, 0) + 1
     for tier, count in sorted(by_tier.items()):
         metrics[f"{tier} 调用"] = count
-    # A note, not a warning: whether it is a bad draw is still being measured (`degeneration`)
+    # Notes, not warnings: a held answer was asked once more, and the one kept may still be unmerged (`degeneration`)
+    reasons = {"zero_thinking": "没思考", "unmerged": "可并几乎没并"}
+    redone = sorted(run.redone_windows)
+    metrics["重答"] = (f"{len(redone)} 窗（" + "，".join(
+        f"{chunk} {'、'.join(reasons.get(sign, sign) for sign in signs)}" for chunk, signs in redone) + "）"
+        if redone else 0)
     unmerged = sorted(run.unmerged_windows)
     metrics["可并几乎没并"] = f"{len(unmerged)} 窗（{', '.join(unmerged)}）" if unmerged else 0
-    rethought = sorted(run.rethought_windows)
-    metrics["没思考、重答"] = f"{len(rethought)} 窗（{', '.join(rethought)}）" if rethought else 0
     if run.inline_proofread:
         labels = {"applied": "用上补丁", "no_change": "没要改", "fallback": "回落底稿", "skipped": "没问"}
         metrics["窗内校对"] = "，".join(f"{labels.get(status, status)} {count} 窗"

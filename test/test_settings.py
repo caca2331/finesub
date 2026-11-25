@@ -176,6 +176,8 @@ def test_the_tuning_tables_give_each_setting_its_declared_default() -> None:
     for setting, cell in rows:
         if setting.kind is bool:
             agrees = cell in words[setting.default]
+        elif setting.kind is str and setting.default is None:
+            agrees = cell == "无"
         elif setting.kind is str:
             value = re.match(r"`([^`]*)`", cell)
             agrees = value is not None and value[1] == setting.default

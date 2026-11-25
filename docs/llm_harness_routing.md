@@ -232,7 +232,7 @@ Sonnet 5.5（直连 API）在 effort `medium` 下纠错与说话人判断的首�
 并轨的窗认人准确率从约六成到九成五（2026-11），所以自己接的 Sonnet 写 `high,high,medium`：只挪不想的那一档（`low` 跟着
 抬一格），`high` 本来正常，不跟着抬成 `xhigh`。
 
-**给爱想的模型封顶**：出厂的 3.8 Flash 各行（免费、付费、agy；agy 的 Gemini 4 Argon 照它）写 `medium,medium,low`——它在同一个
+**给爱想的模型封顶**：出厂的 3.8 Flash 各行（免费、付费、agy；agy 的 Gemini 4 Hydrogen 与 Neon 照它）写 `medium,medium,low`——它在同一个
 抽象档位上比之前的 3.7 Flash 多想约 1.5 倍，而思考与字幕正文共用同一份输出上限，所以 high 被压回 medium。medium 那一格
 **故意不再往下**：实测把它降到 `low` 之后，五个纠错窗里有四个一个思考 token 都不出——`low` 是把要不要想交给模型，不是少想一点。
 

@@ -6,8 +6,10 @@ books the other three and the claim-level evidence rows they feed.
 
 Everything here is telemetry with the same discipline as the shadow scan —
 idempotent inserts keyed by canonical dedupe hashes, never read back into any
-prompt (plan §5.4), and never worth failing a run over (callers wrap in
-fail-soft guards).
+prompt (plan §5.4) but for two exceptions (docs/knowledge.md「信号与证据」:
+the share review's threshold pre-pass, and the correct-only projection's
+trust mark, `name_trust.py`), and never worth failing a run over (callers
+wrap in fail-soft guards).
 
 Level semantics (plan §5.1):
 
@@ -547,14 +549,15 @@ def refined_alignment_evidence(
     (the correction the item claims to catch), the refined text keeping that
     ``zh`` confirms exactly that item's claim; the refined text dropping it is
     the strongest negative signal and refutes it (§5.3: one claim, never the
-    whole node). Returns ``(confirmed, refuted)`` new-row counts."""
+    whole node). A confirmation also confirms the term's ``payload.zh``
+    (`name_trust`: one of the two checks 已核 needs). Returns ``(confirmed,
+    refuted)`` new-row counts of the items."""
 
     at = store.current_rev() if rev is None else rev
     index = ExactIndex.build(store, at, include_tentative=True)
-    zh_of: dict[str, str] = {
-        term.local_id: scan_normalize(term.payload.get("zh", ""))
-        for term in store.nodes_of_kind("term", at)
-    }
+    terms = store.nodes_of_kind("term", at)
+    zh_of: dict[str, str] = {term.local_id: scan_normalize(term.payload.get("zh", "")) for term in terms}
+    zh_raw: dict[str, str] = {term.local_id: str(term.payload.get("zh") or "") for term in terms}
     item_value: dict[str, str] = {
         item.item_id: item.value for item in store.all_items(at) if item.field == "misheard"
     }
@@ -581,6 +584,13 @@ def refined_alignment_evidence(
                 task_id=task_id,
                 span=window_id,
             )
+            if verdict == "confirmed":
+                # The refinement kept the name itself, too: one confirmation of `payload.zh` toward its trust
+                # state (`name_trust`; a refutation of the item says nothing against the name, so none is booked).
+                record_evidence(
+                    store, node_id=node_id, field_path="payload.zh", value_hash=digest(zh_raw[node_id]),
+                    verdict="confirmed", evidence_kind=EVIDENCE_KIND_REFINED, task_id=task_id, span=window_id,
+                )
             if new:
                 if verdict == "confirmed":
                     confirmed += 1

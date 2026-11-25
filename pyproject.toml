@@ -69,6 +69,9 @@ asr = [
   "ctranslate2==4.8.1",
   "scipy",
   "onnxruntime",
+  # MOSS's lines take the sentence-boundary model (speech/joint/sbd.py); as in `[cloud]`.
+  "onnx",
+  "sentencepiece>=0.2.2",
   # Capped: the demix runner takes its step from the separator's `overlap`
   # (speech/preprocessing/separator/demix.py), and 0.47 turned that into the
   # checkpoint YAML's overlap count -- 2 on ours, so the step would drop from
@@ -96,6 +99,11 @@ asr = [
   "opencc-python-reimplemented==0.1.7",
   "pykakasi==2.3.0",
   "pypinyin==0.55.0",
+  # Japanese word split for MOSS's lines (speech/joint/lines.py `groups`: the
+  # line DP cuts only between word groups). nagisa is what transformers' Qwen3
+  # processors split Japanese with; brings DyNet38, wheels on every platform.
+  # Pinned exactly: the split, and so where lines may be cut, moves with it.
+  "nagisa==0.3.2",
 ]
 # `[asr]` with AMD's Windows torch line instead of the CUDA one. AMD publishes
 # Windows ROCm wheels only at repo.radeon.com, and that line stops at 2.9.1
@@ -124,6 +132,9 @@ asr-win-rocm = [
   "ctranslate2==4.8.1",
   "scipy",
   "onnxruntime",
+  # MOSS's lines take the sentence-boundary model (speech/joint/sbd.py); as in `[cloud]`.
+  "onnx",
+  "sentencepiece>=0.2.2",
   "audio-separator<0.47",
   "numba",
   "silero-vad",
@@ -131,6 +142,11 @@ asr-win-rocm = [
   "opencc-python-reimplemented==0.1.7",
   "pykakasi==2.3.0",
   "pypinyin==0.55.0",
+  # Japanese word split for MOSS's lines (speech/joint/lines.py `groups`: the
+  # line DP cuts only between word groups). nagisa is what transformers' Qwen3
+  # processors split Japanese with; brings DyNet38, wheels on every platform.
+  # Pinned exactly: the split, and so where lines may be cut, moves with it.
+  "nagisa==0.3.2",
 ]
 # `[asr]` with Intel's XPU torch line instead of the CUDA one. The XPU wheels
 # are published only on download.pytorch.org/whl/xpu, so `[asr]` would replace
@@ -164,6 +180,9 @@ asr-win-xpu = [
   "ctranslate2==4.8.1",
   "scipy",
   "onnxruntime",
+  # MOSS's lines take the sentence-boundary model (speech/joint/sbd.py); as in `[cloud]`.
+  "onnx",
+  "sentencepiece>=0.2.2",
   "audio-separator<0.47",
   "numba",
   "silero-vad",
@@ -171,6 +190,11 @@ asr-win-xpu = [
   "opencc-python-reimplemented==0.1.7",
   "pykakasi==2.3.0",
   "pypinyin==0.55.0",
+  # Japanese word split for MOSS's lines (speech/joint/lines.py `groups`: the
+  # line DP cuts only between word groups). nagisa is what transformers' Qwen3
+  # processors split Japanese with; brings DyNet38, wheels on every platform.
+  # Pinned exactly: the split, and so where lines may be cut, moves with it.
+  "nagisa==0.3.2",
 ]
 # From stable.json onward: LLM correction/translation harness only.
 # No GPU / torch required; >=4GB system RAM; ffmpeg + ffprobe on PATH; API keys in .env.
@@ -236,6 +260,8 @@ cloud = [
   "onnxruntime",
   # 0.2.2: character offsets through `offset_mapping` (the older offset form is gone).
   "sentencepiece>=0.2.2",
+  # MOSS Pro's Japanese lines (speech/joint/lines.py `groups`); as in `[asr]`.
+  "nagisa==0.3.2",
   "huggingface-hub",
   "tzdata ; platform_system == 'Windows'",
 ]

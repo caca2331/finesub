@@ -222,6 +222,47 @@ def test_a_window_sent_back_for_a_structural_error_also_splits_its_merges_across
     assert ledger[-1]["turn_violations"] == []
 
 
+def test_a_window_sent_back_for_a_long_merge_carries_the_split_guidance_once(tmp_path, monkeypatch):
+    """The harness's repair round shows what the tool session's does (`CsvValidationResult.repair_messages`). This
+    answer goes back whole, so the guidance is last in the errors; a patch round's instruction holds it instead
+    (`test_llm_correction_patch`)."""
+    stable = labelled_stable(tmp_path, [speaker(1), speaker(1), speaker(1)], texts=["一。", "二。", "三。"])
+    long = reply(f"sub|1,2|一。二。|{'啊' * 40}|high|", "sub|3|三。|三|high|")
+    fixed = reply("sub|1|一。|一|high|", "sub|2|二。|二|high|", "sub|3|三。|三|high|")
+    calls: list[list[str]] = []
+    instructions: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            calls.append(list(kwargs.get("validation_errors", ())))
+            instructions.append(kwargs.get("repair_instruction", ""))
+            return LLMCallResult(content=long if len(calls) == 1 else fixed, role=LLMRole.AUDIO_MULTIMODAL,
+                                 model="fake", fallback_used=False,
+                                 raw_response={"candidates": [{"finishReason": "STOP"}]})
+
+    setattr_correction(monkeypatch, "RoleClient", FakeClient)
+    execute_correction_windows(stable_json=stable, output_path=tmp_path / "out.srt",
+                               token_counter=FakeTokenCounter(), max_retries_per_window=1,
+                               max_replacements_per_window=0, profile=resolve_profile("text", "none", "quality"),
+                               task_artifact_dir=tmp_path / "artifacts", length_scale=1.0)
+    assert len(calls) == 2 and calls[0] == []
+    assert any("absolute limit" in error for error in calls[1])
+    head = "上面越过绝对门槛的合并行要拆开"
+    assert instructions[1] == ""
+    assert [error for error in calls[1] if error.startswith(head)] == [calls[1][-1]]
+    from finesub.llm.knowledge.base import TASK_ARTIFACT_FILENAME
+
+    records = [json.loads(line) for line in (tmp_path / "artifacts" / TASK_ARTIFACT_FILENAME)
+               .read_text(encoding="utf-8").splitlines()]
+    recorded = [error for record in records if record["kind"] == "correction_window_response"
+                for error in record["payload"]["validation_errors"]]
+    assert any("absolute limit" in error for error in recorded)
+    assert not any("上面越过绝对门槛" in error for error in recorded)
+
+
 def test_a_merge_skipping_lines_is_checked_against_every_line_it_spans():
     from finesub.llm.output_protocol import TranslatedCsvSegment, _turn_violation_rows
 

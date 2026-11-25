@@ -20,15 +20,16 @@
   从 agy 的模型表里消失（服务端，CLI 没升级）后删掉，所有 agy 组改回 3.8（owner 同日决定，thinking 映射照旧）。
   3.6 Flash（只给验收跑当「弱一点的 capable」，不在出厂组里）到 2026-10-23 也从模型表里消失（agy 1.4.7），fact 与一对 target 随之删掉
   （owner 2026-10-24：agy 的 Flash 只留 3.8）。
-- **Gemini 4 Argon**（2026-10-18 接线）：fact `local-agy-gemini-4-argon`，target 同名，窗口、输出上限与媒体能力照 3.8 Flash 填（没单独核实），能力档「高」（估计）。
-  2026-10-19 在三个日语直播窗上与 3.8 Flash 各跑一遍带音频的三个 pass（同为 medium 思考）：owner 判质量略优、token 效率高出一些（未缓存输入约一半、输出加思考约三分之一，单遍），字幕合并得比 Flash 保守；单价比 Flash 贵。
-  thinking 映射与 3.8 Flash 相同，`medium,medium,low`（owner 2026-10-19：两者同档比较）。Pro 订阅上它有单独一份只按周计的额度（`/usage` 里的「Gemini 4 Argon」组），所以额度池是自己的
-  `AGY_ARGON`。每个出厂 agy 组里，agy 的 Gemini（原来是 3.8 Flash，2026-11-13 起是 Hydrogen）后面紧跟 Argon，当它的替补（owner 2026-10-18）。
+- **Gemini 4 Argon**（2026-10-18 接线，2026-11-23 删掉）：Pro 订阅上它曾有单独一份只按周计的额度（池 `AGY_ARGON`），所以排在每个出厂 agy 组的 Gemini 后面当替补。
+  2026-11-23 那份并进了 Gemini 那份，替补没了意义，owner 又判它不如 Neon：fact 与池一起删掉，组里它的位置换成 Neon。
 - **Gemini 4 Hydrogen**（2026-11-12 接线，对标 Flash 系列）：fact `local-agy-gemini-4-hydrogen`，target 同名，窗口、输出上限与媒体能力照 3.8 Flash 填（没单独核实），
   能力档「中」，thinking 映射与 3.8 Flash 相同（`medium,medium,low`，同档比较）。agy 1.4.11 的模型表列出 `gemini-4-hydrogen-low|medium|high|xhigh`，
   `--model gemini-4-hydrogen --effort medium` 实测能答。`/usage` 里没有它自己的一组，所以额度池记作 `AGY_GEMINI`（与 3.8 Flash 同池，没用请求核实过）。
   2026-11-13 起每个出厂 agy 组（含 `agy`、`agy-fast` 两个预设的 `test_target`）里 agy 的 Gemini 都是它，代替 3.8 Flash；AI Studio 免费档那一行 `gemini-free-4-hydrogen` 另在出厂的三个 capable 组里
   （理由都在 `docs/llm_design_notes.md`「Gemini 4 Hydrogen 进出厂模型组的决策记录」）。
+- **Gemini 4 Neon**（2026-11-23 接线）：fact `local-agy-gemini-4-neon`，target 同名，能力档「高」，窗口与媒体能力照 Hydrogen 填（没单独核实），
+  thinking 映射与 Hydrogen 相同，`medium,medium,low`（owner 2026-11-23）。agy 的模型表列出 `gemini-4-neon-low|medium|high|xhigh`；`/usage` 里它在「Gemini Models」组，额度池 `AGY_GEMINI`。
+  每个出厂 agy 组里紧跟 Hydrogen，当它的故障替补（超时、不可用、限速与其他临时失败；owner 2026-11-23），不是额度替补：agy 用尽额度时的报错不明说，FineSub 分不出它与临时失败，所以 Gemini 那份用完时 Hydrogen 与 Neon 通常各失败一次、再探一次才冻结整份。
 - **2026-09-02：接线从 3.7 Flash 整体换成 3.8 Flash**（`agy models` 里 3.8 已上，3.7 仍在）。
   owner 同日决定**不做复测就换**：同尺寸的新一代 Flash 默认更好，同素材 A/B 也不指望测出显著
   差别。下面各节的实测数字**全部取自 3.7 Flash**，没有在 3.8 上复测过——形态结论（MIME 拦截、
@@ -348,6 +349,9 @@ server 把放不下的回复写成 `<assignment>/control/spill/<请求 id>/part-
   不用续读、不切坏字；内容按行写成文本，不是一行 JSON。一步里并行三个 45 KB 的 `view_file`，三份都整份读到（2026-10-22）。
 - driver 每次 invocation 把本次调用的 assignment root 写进槽位 project 的 `.agents/view_roots.json`，tool guard 放行 **realpath 落在这些根之下的现有文件**的
   `read_file`，其余 `read_file` 与一切别的原生工具照旧 deny；project 记录不需要额外 grant（媒体 project 同款，hook 的 allow 即足够）。
+- 份的路径里有 64 位十六进制的运行时目录名，模型抄的时候会抄丢一段，再拿同一个错路径重试：Gemini 4 Hydrogen 在一个片段的 13 个会话里 5 个出过读文件被拒，
+  其中一窗三次都没读到 `kb_read` 的回复（2026-11-21）。所以 tool guard 拒掉一个读取时，在这些根之下找路径结尾与它对得上至少两段、且唯一最长的那个文件，
+  把它的完整路径写进拒绝理由，叫模型照抄（只看最多 5,000 个文件；只有文件名对得上、或两个文件并列时不点名）。capsule 的 guard 不做：它的根是整个运行时域，没出过这个问题。
 - 份的清单放不进 argv（整条命令行按 UTF-16 超过 30,000）或桩时，改写成「目录 + `part-01.md` to `part-NN.md`」，模型照样一步读完。
 - 不选的路：继续按 2,800 字节分页（中文一页约 800 字，一个大条目十几轮）；让 hook 放行 agy 自己外置的那个文件（在 agy 的私有目录里，hook 要知道会话 id，
   超过 46 KB 还要续读，放宽读边界会露出别的会话的文件）；正文走 stdin（`--input-format stream-json`，实测 150 KB 整条送到，但多维护一条路，带媒体的调用又用不上，owner 2026-10-23 定只留一条路）。

@@ -8,13 +8,12 @@ $claims_text
 输出要求：输出**有且仅有一个** `<verify_results>` 块，内容为 JSON 数组，
 每个校验对象一行结论：
 <verify_results>
-[{"claim_id": "c1", "verdict": "confirmed", "url": "https://…", "note": "官方页面确认译名"},
- {"claim_id": "c2", "verdict": "unverifiable", "note": "官网、日文 wiki 与发售公告都没提到这一行的说法"}]
+[{"claim_id": "某条的 claim_id", "verdict": "confirmed", "url": "https://…", "note": "这一页写着同样的事实"},
+ {"claim_id": "某条的 claim_id", "verdict": "unverifiable", "note": "查过哪些方向，都没提到这一句的说法"}]
 </verify_results>
 
 规则：
-- 核什么：term 行是 `源词|中文定名|别名|描述` 四列，以源词、中文定名与身份为准——它们获可靠来源支持就是 `confirmed`，描述里的细节查不到不影响；
-  描述被明确反驳时判 `refuted`。别名列只供辨认，不在这次核查之内。档案 fact 核对该行写的事实。
+- 核什么：每条是知识库条目里的一句事实（不是术语行），核对这一句写的事实。
 - `verdict` 三个值：`confirmed`（你亲自打开并核实过的 URL 支持该内容——必须给 `url`）、
   `refuted`（可靠来源**明确反驳**该内容——同样必须给 `url`，note 写明矛盾点；「查到反证」和
   「查不到」是两回事，不要混用）、`unverifiable`（查不到可靠来源，或可靠来源互相矛盾——note 写查过哪些方向，矛盾时再写明两边，都写短；**不要**因此建议删除，

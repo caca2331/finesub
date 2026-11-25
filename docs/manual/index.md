@@ -22,7 +22,7 @@
 | 字幕太长或太短；调识别侧与 LLM 侧的参数；想知道大概要跑多久 | [调参](tuning.md) |
 | 一次跑多个输入：manifest 怎么写、运行期加任务与插队、中断后续跑 | [一次跑多个输入](batch.md) |
 | 判出每行字幕是谁说的（`--diarize`）：怎么开、⚠ 模型许可、GPU 与 CPU、多出来的产物；⚠ 成品译文不标说话人，能直接按人分轨导出的只有识别原文 | [说话人分离](diarization.md) |
-| 选转写后端（`--asr`）：本机 Whisper、本机显卡上的开源 MOSS，或直接给出时间与说话人的云端 MAI2、MOSS Pro、Gemini 3.5 Transcribe——几家怎么比、要跑多久、隐私与费用、额度与 key；续跑用的是谁 | [转写后端](asr-backend-choice.md) |
+| 选转写后端（`--asr`）：本机 Whisper、本机显卡上的开源 MOSS，或直接给出时间与说话人的云端 MAI2、Scribe、MOSS Pro、Gemini 3.5 Transcribe，以及云端的文字配本机 MOSS 说话人的 `moss-diarization-aligner`——几家怎么比、要跑多久、隐私与费用、额度与 key；续跑用的是谁 | [转写后端](asr-backend-choice.md) |
 | 素材是中文：只纠错不翻译、统一简体、推荐怎么转写 | [中文素材](chinese.md) |
 | 让它记住专有名词与译名，或沿用一套翻译口味（`--style`） | [知识库](knowledge.md) |
 | 自己开一个共享知识库给别人投稿、拉取 | [自建共享库](share-server.md) |

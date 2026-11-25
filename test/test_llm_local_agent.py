@@ -186,6 +186,39 @@ def test_agy_is_told_where_the_validation_errors_are(tmp_path: Path) -> None:
     assert text.endswith("fix it\n@@ harness validation errors\nRow 1 references unknown source id 3.\n")
 
 
+def test_agy_s_repair_round_carries_the_split_guidance_once(tmp_path: Path) -> None:
+    """The capsule gets the round's `repair_messages()`; the guidance is in its error file and task parts once."""
+    from finesub.llm.chunking import SubtitleSegment
+    from finesub.llm.output_protocol import validate_correction_output_text
+    from finesub.llm.prompt_constants import Thresholds
+    from finesub.llm.prompt_variants import resolve_variant
+
+    sources = [SubtitleSegment(str(i), i * 2.0, i * 2.0 + 1.0, "あ") for i in range(1, 5)]
+    header = "type|position|corrected_text|translation|conf|note"
+    answer = (f"<translated>\n{header}\nsub|1,2|ああ|{'啊' * 40}|high|\n"
+              f"sub|3,4|ああ|{'啊' * 40}|high|\n</translated>")
+    result = validate_correction_output_text(answer, sources, variant=resolve_variant("capableC"),
+                                             thresholds=Thresholds.at(1.0))
+    assert result.long_merges == 2
+    manager = AgentCapsuleManager(tmp_path / "runtime")
+    capsule, _ = manager.create(
+        manager.resolve_location(), [{"role": "user", "content": "hi"}], task="correction",
+        native_search=False, profile_id="test", max_result_bytes=1024, timeout_seconds=900,
+        previous_output=answer, validation_errors=result.repair_messages(),
+    )
+    head = "上面越过绝对门槛的合并行要拆开"
+    errors = (capsule.root / "input" / "validation-errors.txt").read_text(encoding="utf-8")
+    assert errors.count(head) == 1 and errors.count("absolute limit") == 2
+
+    driver = _agy_driver(tmp_path)
+    driver._resolved_command = ("agy",)
+    driver._ensure_project = lambda _root, native=False: ("project-id", "digest")
+    driver._prepare_capsule_input(capsule, b"")
+    task = capsule.root.joinpath(*local_agent_module.AGY_TASK_PARTS_DIR)
+    assert "".join(path.read_text(encoding="utf-8") for path in sorted(task.glob("part-*.md"))).count(head) == 1
+
+
+
 def test_a_repair_instruction_replaces_the_stock_wording(tmp_path: Path) -> None:
     """The correction window's patch round asks for part of the answer: the
     capsule carries its wording instead of "a complete result", and agy -- whose

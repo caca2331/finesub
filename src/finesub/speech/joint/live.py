@@ -65,10 +65,11 @@ class Live:
     `GEMINI_FREE` pool: Live takes no daily requests, so there is no key to move on to."""
 
     def __init__(self, *, entries=None, connect: Callable[..., Any] = _connect,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, announce: Callable[[], None] = lambda: None):
         self._entries = entries
         self._connect = connect
         self._sleep = sleep
+        self._announce = announce  # before the request, once the key is in hand
 
     def _key(self) -> str:
         if self._entries is None:
@@ -79,6 +80,7 @@ class Live:
 
     def __call__(self, pcm: bytes, *, language: str | None) -> str:
         key = self._key()
+        self._announce()
         last = ""
         for attempt in range(ATTEMPTS):
             try:

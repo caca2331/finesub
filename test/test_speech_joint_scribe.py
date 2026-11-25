@@ -137,3 +137,93 @@ def test_a_split_shapes_its_words_as_scribe_does():
     assert [w["text"] for w in words] == ["Hello", "world", "。は", "い"] and notes == 1
     untimed = dict(token, characters=[dict(c, start=None) for c in token["characters"]])
     assert S.split_glued(untimed) == [] and S.unglued([untimed])[0] == [untimed]  # kept whole, still reported
+
+
+# --- a source longer than one call -------------------------------------------------------------------------
+
+
+def test_a_source_over_the_file_limit_is_cut_at_a_pause_and_its_pieces_stitched(tmp_path, monkeypatch):
+    from finesub.speech.joint.mosspro import SpeechSpans
+
+    monkeypatch.setattr(S, "LIMIT", 660.0)  # 15 h in production
+    monkeypatch.setattr(S, "LONGEST", 600.0)
+    spans, asked = [], []
+    monkeypatch.setattr(S, "upload_flac", lambda src, out, span=None: spans.append(span) or Path(out))
+
+    def caller(audio, *, language, seconds, whole):
+        lo, hi = spans[-1]
+        asked.append((lo, hi, whole))
+        # one person throughout, numbered anew in the second piece; a second person only after 900 s
+        return {"words": [word(f"w{t}", t - lo, t - lo + 0.5,
+                               speaker="speaker_0" if lo == 0 else "speaker_9" if t >= 900 else "speaker_5")
+                          for t in range(int(lo) + 1, int(hi) - 1, 2)]}
+
+    source = tmp_path / "long.wav"
+    source.write_bytes(b"RIFF")
+    heard = SpeechSpans(source, [(0.0, 579.5), (580.5, 1000.0)])  # a pause at 580 s, in the REACH s before 600
+
+    def run(**kw):
+        return S.transcribe(source, cache_root=tmp_path / "cloud", language="ja", repair="off", duration=1000.0,
+                            speech=heard, **kw)
+
+    t = run(caller=caller)
+    assert asked == [(0.0, 580.0, True), (520.0, 1000.0, True)]  # the next starts 60 s before the cut: no pause there
+    assert {"pieces": [[0.0, 580.0], [520.0, 1000.0]]} in t.log
+    units = t.units()
+    texts = [u.text for u in units]
+    assert len(texts) == len(set(texts)) and texts == [f"w{x}" for x in range(1, 999, 2)]
+    speaker = {u.text: u.speaker for u in units}
+    # each piece's speakers kept apart (no linking by the overlap, owner 2026-11-19): only voice merges them
+    assert (speaker["w101"], speaker["w701"], speaker["w951"]) == ("w0:speaker_0", "w1:speaker_5", "w1:speaker_9")
+
+    replayed = run(offline=True)
+    assert [(u.text, u.speaker) for u in replayed.units()] == [(u.text, u.speaker) for u in units]
+
+
+@pytest.mark.parametrize("mark, start", [(True, 510.0), (False, 495.0)])
+def test_the_next_piece_starts_at_a_pause_the_words_before_break_at(tmp_path, monkeypatch, mark, start):
+    from finesub.speech.joint.mosspro import SpeechSpans
+
+    monkeypatch.setattr(S, "LIMIT", 660.0)  # 15 h in production
+    monkeypatch.setattr(S, "LONGEST", 600.0)
+    spans, asked = [], []
+    monkeypatch.setattr(S, "upload_flac", lambda src, out, span=None: spans.append(span) or Path(out))
+
+    def caller(audio, *, language, seconds, whole):
+        lo, hi = spans[-1]
+        asked.append((lo, hi))
+        words = []
+        for t in range(int(lo) + 1, int(hi) - 1):
+            words.append(word(f"w{t}", t - lo, t - lo + 0.5))
+            if mark and t == 509:  # Scribe's mark is a token of its own
+                words.append(word("。", t - lo + 0.5, t - lo + 0.5))
+        return {"words": words}
+
+    source = tmp_path / "long.wav"
+    source.write_bytes(b"RIFF")
+    # pauses at 580 s (the end), 495 s (1 s) and 510 s (0.4 s), both 60-90 s before that end
+    heard = SpeechSpans(source, [(0.0, 494.5), (495.5, 509.8), (510.2, 579.0), (581.0, 1000.0)])
+    S.transcribe(source, cache_root=tmp_path / "cloud", language="ja", repair="off", duration=1000.0, speech=heard,
+                 caller=caller)
+    assert asked == [(0.0, 580.0), (start, 1000.0)]
+
+
+def test_a_source_up_to_the_file_limit_is_sent_whole(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "upload_flac", lambda src, out, span=None: Path(out))
+    asked = []
+
+    def caller(audio, *, language, seconds, whole):
+        asked.append(seconds)
+        return {"words": [word("a", 1.0, 1.5)]}
+
+    source = tmp_path / "long.wav"
+    source.write_bytes(b"RIFF")
+    total = S.LIMIT - 30.0  # longer than one piece, not than a file
+    S.transcribe(source, cache_root=tmp_path / "cloud", language="ja", repair="off", duration=total, caller=caller)
+    assert asked == [total] and (tmp_path / "cloud" / S.SCRIBE / f"{S.CALL}.raw.json").exists()
+
+
+def test_shifted_moves_words_and_their_characters():
+    got = S.shifted([word("ab", 1.0, 2.0, chars=[{"text": "a", "start": 1.0, "end": 1.5}]), word("c", 3.0, 3.1)], 10.0)
+    assert [(w["start"], w["end"]) for w in got] == [(11.0, 12.0), (13.0, 13.1)]
+    assert got[0]["characters"][0]["start"] == 11.0

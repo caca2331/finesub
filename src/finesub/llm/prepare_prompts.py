@@ -32,11 +32,13 @@ from .prompts import (
     _numbered,
     _r1_entry_blocks,
     _research_task_feedback_block,
+    unchecked_search_rule,
     _search_queries_rules,
     render_knowledge_indexes,
 )
 from .prompt_compose import (
-    prompt_phrases, render_glossary_index, renumber_rules, search_results_usage, search_rules_shared, task_mode_texts,
+    kb_term_lines_note, prompt_phrases, render_glossary_index, renumber_rules, search_results_usage, search_rules_shared,
+    task_mode_texts,
 )
 from .knowledge.style import FACTORY_STYLE_NAME, catalog_offers_default, factory_style_text
 from .routing.config import (
@@ -59,6 +61,14 @@ def _tool_list(*, search: bool, knowledge: bool) -> str:
     )
 
 
+def prepare_collects_feedback(collect_task_feedback: bool, *, correct_only: bool, emits_entries: bool,
+                              searches: bool) -> bool:
+    """Whether the preparation task delivers `<task_update_feedback>`: under ``update``; a correct-only task's
+    holds only the name checks, so it has none to give unless it reads the library and can search."""
+
+    return collect_task_feedback and (not correct_only or (emits_entries and searches))
+
+
 def _acquire_section(
     *,
     emits_queries: bool,
@@ -68,6 +78,7 @@ def _acquire_section(
     max_requested_entries: int,
     agentic: bool = False,
     task_update_feedback: bool = False,
+    correct_only: bool = False,
 ) -> str:
     """The "how to get what you lack" section, per grant and strategy."""
 
@@ -83,7 +94,8 @@ def _acquire_section(
                 _load_prompt_template(
                     "fragment_native_search_research_v1.md",
                     shared_rules=search_rules_shared(
-                        prepare=True, task_update_feedback=task_update_feedback, knowledge=emits_entries
+                        prepare=True, task_update_feedback=task_update_feedback, knowledge=emits_entries,
+                        names_only=correct_only,
                     ),
                 ).strip()
             )
@@ -93,7 +105,8 @@ def _acquire_section(
         request_blocks.append(_r1_entry_blocks(max_requested_entries, keep_source_block="`<preinjected_entries>`"))
     if emits_queries:
         request_blocks.append(
-            _search_queries_rules(max_search_queries, knowledge_enabled=emits_entries)
+            _search_queries_rules(max_search_queries, knowledge_enabled=emits_entries,
+                                  unchecked_rule=unchecked_search_rule(prepare=True) if emits_entries else "")
         )
     if request_blocks:
         what = "、".join(
@@ -226,8 +239,10 @@ def build_prepare_task_messages(
     same grant, fetched by the model inside its tool session, delivered in
     one reply. ``style_catalog`` (non-empty under ``--style auto``) adds the
     candidate list and asks the delivery for a ``<style_selection>`` block.
-    ``speakers`` (only with the speaker judge on) also asks, lightly, for
-    the people who speak in the material: the judge's candidates. Off, the
+    ``speakers`` (only with the speaker judge on) also asks for the people
+    who speak in the material, each with a description to tell them by (v2,
+    speaker judge v27: who they are, what they are called in the lines, their
+    self-reference and why they are listed): the judge's candidates. Off, the
     prompt is what it always was. ``earlier_chunks`` (a long file's later
     chunk: the names and summaries the chunks before settled,
     `general_context.carry_text`) adds that block, the duty to reuse it and the
@@ -235,6 +250,9 @@ def build_prepare_task_messages(
     """
 
     can_request = (emits_queries or emits_entries) and not agentic
+    searches = emits_queries or native_search
+    collect_task_feedback = prepare_collects_feedback(
+        collect_task_feedback, correct_only=correct_only, emits_entries=emits_entries, searches=searches)
     phrases = prompt_phrases("prepare")
     # Agentic: the index is a required block of the manifest (the submit
     # gate checks that read), so it is not inlined as well -- the same as
@@ -279,6 +297,9 @@ def build_prepare_task_messages(
     )
     # No search and no knowledge base: nothing can back a name or fill `sources`.
     no_evidence = not (emits_queries or emits_entries or native_search)
+    # A task that reads the library and can search searches an unchecked name before adopting it (owner
+    # 2026-11-20); what it found goes to the feedback's `name_checks` when it collects feedback.
+    kb_unchecked_search = mode["kb_unchecked_search"] if emits_entries and searches else ""
     sources_clause = "；".join(
         phrases[key] for key, on in (("sources_web", not no_evidence), ("sources_kb", emits_entries)) if on
     )
@@ -296,26 +317,28 @@ def build_prepare_task_messages(
             max_requested_entries=max_requested_entries,
             agentic=agentic,
             task_update_feedback=collect_task_feedback,
+            correct_only=correct_only,
         ),
         style_section=style_section,
         uncertainty_sources=uncertainty_sources + ("都" if "、" in uncertainty_sources else ""),
         sources_clause=(sources_clause + "。") if sources_clause else "",
-        name_conflict_clause=_load_prompt_template(
-            "fragment_prepare_name_conflict_v1.md"
+        name_conflict_clause=(
+            _load_prompt_template("fragment_prepare_name_conflict_v1.md", strict=True,
+                                  kb_conflict_spoken=mode["kb_conflict_spoken"], kb_unchecked_search=kb_unchecked_search)
             if emits_entries
-            else "fragment_prepare_name_conflict_no_kb_v1.md"
+            else _load_prompt_template("fragment_prepare_name_conflict_no_kb_v1.md")
         ).strip(),
         sources_example="[]" if no_evidence else phrases["sources_example"],
         speakers_duty=(
             "\n" + _load_prompt_template(
-                "fragment_prepare_speakers_duty_v1.md", strict=True,
+                "fragment_prepare_speakers_duty_v2.md", strict=True,
                 # Only a task that can look things up needs telling not to for this duty.
-                no_search=_load_prompt_template("fragment_prepare_speakers_no_search_v1.md").strip()
+                no_search=_load_prompt_template("fragment_prepare_speakers_no_search_v2.md").strip()
                 if (emits_queries or emits_entries or native_search) else "",
             ).rstrip("\n") if speakers else ""
         ),
         speakers_field=(
-            "\n" + _load_prompt_template("fragment_prepare_speakers_field_v1.md").rstrip("\n") if speakers else ""
+            "\n" + _load_prompt_template("fragment_prepare_speakers_field_v2.md").rstrip("\n") if speakers else ""
         ),
         earlier_chunks_duty=(
             "\n" + _load_prompt_template("fragment_prepare_earlier_chunks_duty_v1.md") if earlier_chunks else ""
@@ -342,7 +365,8 @@ def build_prepare_task_messages(
             else ""
         ),
         task_update_feedback_block=(
-            _research_task_feedback_block(local_source_ids=False)
+            _research_task_feedback_block(local_source_ids=False, name_checks=emits_entries and searches,
+                                          names_only=correct_only)
             if collect_task_feedback
             else ""
         ),
@@ -370,6 +394,7 @@ def build_prepare_task_messages(
                 else "知识库索引：\n" + render_knowledge_indexes(knowledge_indexes) + "\n\n"
             ),
             preinjected_entries=preinjected_entries.strip() or "（无）",
+            kb_term_lines_note=kb_term_lines_note(mode, window=False),
         )
         if emits_entries
         else "\n"
@@ -429,6 +454,7 @@ def build_prepare_results_message(
     emits_keep: bool = True,
     style_selection: bool = False,
     knowledge: bool,
+    correct_only: bool = False,
 ) -> Dict[str, str]:
     """The fill turn: what the batch produced, and the order to deliver.
     ``knowledge``: the task has a readable knowledge base (the search rules then say how to weigh a
@@ -454,7 +480,8 @@ def build_prepare_results_message(
         else ""
     )
     usage = (
-        search_results_usage(prepare=True, task_update_feedback=collect_task_feedback, knowledge=knowledge)
+        search_results_usage(prepare=True, task_update_feedback=collect_task_feedback, knowledge=knowledge,
+                             names_only=correct_only)
         if requested_search and search_results.strip()
         else ""
     )

@@ -1,8 +1,12 @@
 """ElevenLabs Scribe v3.
 
-One multipart call per source (Scribe takes up to 15 h a file and splits anything over 8 minutes into up to four
-parallel parts itself), the source as 16 kHz mono FLAC. The answer times every word -- in Japanese and Chinese every
-character -- and labels it with a speaker; `spacing` tokens are dropped (the line builder joins words by language)
+One multipart call per source, the source as 16 kHz mono FLAC: Scribe takes up to 15 h and 5 GB a file (15 h of this
+FLAC is about 1 GB) and transcribes anything over 8 minutes in up to four parallel parts itself, which is trusted
+(owner 2026-11-21: 「可以相信服务器上的切分的处理已经是他们优化过了的了」). Only a source longer than LIMIT is cut
+here, at Silero pauses (`cuts.window`; a piece's start where the previous piece's words break too) into pieces of at
+most LONGEST: each piece is one call (`p-<start>-<end>`), stitched as MAI2's windows are (each piece's labels kept
+apart, `stitch`); each piece is repaired on its own words before the stitch, so a repair never replaces another
+piece's. The answer times every word -- in Japanese and Chinese every character -- and labels it with a speaker; `spacing` tokens are dropped (the line builder joins words by language)
 and so are `audio_event` tokens (laughter, applause), counted in the log. Keys: the `ELEVENLABS` pool in `.env`, front to back
 (`scribe_keys`; a key needs the speech_to_text permission, and user_read to have its balance checked).
 
@@ -10,8 +14,9 @@ What the adapter fixes in the answer: a stretch of talk returned as one word tok
 own characters (`unglued`); a mark's time is not the word's (`_closing_marks`), a bracketed note for what Scribe
 could not make out is dropped (`without_notes`; both in `answer_units`). Repair (`--asr-repair on`,
 `docs/joint-asr.md`「退化的修补」): a timestamp collapse (`collapses`) and a glued word are asked of Scribe again for
-their span only (`reask`), REASK_PAD s of audio either side; the span's words are replaced by what the re-ask hears
-between the words either side, its speakers linked as MAI2's re-asks are. A glued word not re-asked keeps the split
+their span only (`reask`), REASK_PAD s of audio either side out to a Silero pause (`cuts.padded`); the span's words are replaced by what the re-ask hears
+between the words either side, its speakers matched by voice as MAI2's re-asks are (a glued word's label matched
+to no one but with RESCUE_MIN s of voice is a new person, `c<k>:`). A glued word not re-asked keeps the split
 and its one speaker label, with a warning.
 """
 
@@ -23,24 +28,29 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from finesub.api_http import CONNECT_TIMEOUT_SECONDS, RETRYABLE_TRANSPORT, api_http_client, retryable_status
 from finesub.media.ffmpeg import _clip_duration, _format_seconds, _run_ffmpeg, probe_media_duration, resolve_ffmpeg
 from finesub.reporting import current_reporter
 
-from . import SCRIBE
+from . import SCRIBE, cuts
 from . import repair as R
 from .cache import CacheMiss, CallCache, audio_fingerprint
 from .model import Transcript, Unit, turns_from_units
 from .mosspro import SpeechSpans
 from .relink import VOICEPRINTS, Voiceprints, Voices
+from .stitch import stitch
 
 MODEL = "scribe_v3"
 API = "https://api.elevenlabs.io/v1/speech-to-text"
 KEY_ENV = "ELEVENLABS"
 #: The single call's cache name: the whole source.
 CALL = "full"
+#: The longest file ElevenLabs takes (docs, 2026-11-21): a source up to it is sent whole.
+LIMIT = 15 * 3600.0
+#: A longer one is cut into pieces of at most this: a minute under LIMIT.
+LONGEST = LIMIT - 60.0
 #: The cache directory of the repair's re-asks, beside the call's.
 REPAIR_CACHE = f"{SCRIBE}-repair"
 REASK_PAD = 10.0
@@ -220,13 +230,24 @@ def unglued(words: list[dict]) -> tuple[list[dict], list[Glued]]:
     return out, found
 
 
+def shifted(words: list[dict], offset: float) -> list[dict]:
+    """An answer's `words` (and their characters) moved `offset` s on: a piece's times as the source's."""
+
+    def moved(x: dict) -> dict:
+        return {**x, **{k: float(x[k]) + offset for k in ("start", "end") if x.get(k) is not None}}
+
+    return [{**moved(w), "characters": [moved(c) for c in w["characters"]]} if w.get("characters") else moved(w)
+            for w in words]
+
+
 def answer_units(words: list[dict], offset: float = 0.0) -> tuple[list[dict], int]:
     """(word units in output order, how many audio_event tokens were dropped) of an answer's `words`; bracketed
-    notes dropped too (`without_notes`)."""
+    notes dropped too (`without_notes`). An entry without `type` is a word: Scribe always sends one, a transcript
+    file written by hand in its shape may not."""
     units, events = [], 0
     words, _ = without_notes(words)
     for w in words:
-        kind = w.get("type")
+        kind = w.get("type", "word")
         if kind == "audio_event":
             events += 1
             continue
@@ -326,45 +347,84 @@ def identity(source: Path, language: str | None) -> dict:
 
 def transcribe(source: str | Path, *, cache_root: str | Path, language: str | None, repair: str,
                caller: Callable[..., dict] | None = None, offline: bool = False, duration: float | None = None,
-               speech: SpeechSpans | None = None, voiceprints: Voiceprints | None = None) -> Transcript:
+               speech: SpeechSpans | None = None, voiceprints: Voiceprints | None = None,
+               answer: dict | None = None) -> Transcript:
     """The source's Scribe transcript, words in output order; the call cached under `cache_root/scribe/`, the
-    repair's under `cache_root/scribe-repair/`. `repair` is `--asr-repair` (`repair.MODES`; `quota` is `on`)."""
+    repair's under `cache_root/scribe-repair/`. `repair` is `--asr-repair` (`repair.MODES`; `quota` is `on`).
+    `answer`: one answer over the whole source from 0 s (a transcript file, `--asr-transcript`), read as the whole-
+    source call's: no cache, no call, no repair (that would call)."""
+    if answer is not None:
+        repair = "off"
     src = Path(source)
     cache = CallCache(cache_root, SCRIBE, identity=identity(src, language), offline=offline)
     total = duration if duration is not None else probe_media_duration(src)
 
-    def call(span: tuple[float, float] | None) -> dict:
+    def call(span: tuple[float, float] | None, whole: bool) -> dict:
+        """Scribe's answer for `span` (None: the whole source); `whole` for a main call, whose cost the pool says."""
         if caller is None:
             raise ScribeError(f"--asr scribe needs {KEY_ENV} in .env")
         lo, hi = span or (0.0, total)
         current_reporter().debug("scribe call", {"span": [round(lo, 1), round(hi, 1)]})
         with tempfile.TemporaryDirectory(prefix="finesub-scribe-") as tmp:
             return caller(upload_flac(src, Path(tmp) / "audio.flac", span), language=language, seconds=hi - lo,
-                          whole=span is None)
+                          whole=whole)
 
-    answer = cache.fetch(CALL, lambda: call(None))
-    words, glued = unglued(answer.get("words") or [])
-    units, events = answer_units(words)
-    log: list[dict] = [{"audio_events_dropped": events}] if events else []
-    found = collapses(words)
-    if (found or glued) and R.mode(repair) != "off":
-        repair_cache = CallCache(cache_root, REPAIR_CACHE, offline=offline,
-                                 identity=dict(identity(src, language), provider=REPAIR_CACHE, pad=REASK_PAD))
+    log: list[dict] = []
+    repair_cache = None
+
+    def repaired(units: list[dict], found: list[tuple[float, float]], glued: list[Glued]) -> list[dict]:
+        """`units` with their collapses and glued words asked again (`reask`), or as they are, logged."""
+        nonlocal repair_cache, speech
+        if not (found or glued) or R.mode(repair) == "off":
+            if found:
+                log.append({"collapses": [[round(a, 2), round(b, 2)] for a, b in found]})
+            log.extend({"glued": [round(g.first, 2), round(g.last, 2)], "chars": g.chars, "via": "split"} for g in glued)
+            return units
+        if repair_cache is None:
+            repair_cache = CallCache(cache_root, REPAIR_CACHE, offline=offline,
+                                     identity=dict(identity(src, language), provider=REPAIR_CACHE, pad=REASK_PAD))
+        speech = speech or SpeechSpans(src)
 
         # Named to 0.1 s: a detection change that moves `lo` by less reuses the answer, offset by the new `lo`.
         def ask(lo: float, hi: float) -> list[dict]:
-            got = repair_cache.fetch(f"r-{lo:.1f}-{hi:.1f}", lambda: call((lo, hi))).get("words") or []
+            got = repair_cache.fetch(f"r-{lo:.1f}-{hi:.1f}", lambda: call((lo, hi), False)).get("words") or []
             if any(is_glued(w) for w in got):
                 raise ScribeError("the re-ask glued a stretch of talk into one word again")
             return answer_units(got, lo)[0]
 
-        units, fixes = reask(units, found, glued, total=total, ask=ask, speech=speech or SpeechSpans(src),
-                             voiceprints=voiceprints or VOICEPRINTS)
-        log += fixes
+        units, fixes = reask(units, found, glued, total=total, ask=ask, speech=speech,
+                             voiceprints=voiceprints or VOICEPRINTS, known=cuts.spans_named(repair_cache.names(), "r"))
+        log.extend(fixes)
+        return units
+
+    if total <= LIMIT or answer is not None:
+        raw = answer if answer is not None else cache.fetch(CALL, lambda: call(None, True))
+        words, glued = unglued(raw.get("words") or [])
+        units, events = answer_units(words)
+        if events:
+            log.append({"audio_events_dropped": events})
+        units = repaired(units, collapses(words), glued)
     else:
-        if found:
-            log.append({"collapses": [[round(a, 2), round(b, 2)] for a, b in found]})
-        log += [{"glued": [round(g.first, 2), round(g.last, 2)], "chars": g.chars, "via": "split"} for g in glued]
+        speech = speech or SpeechSpans(src)
+        pauses, known = cuts.pauses_of(speech.spans()), cuts.spans_named(cache.names(), "p")
+        read, events, after, breaks = [], 0, None, []
+        while True:  # every main call before any repair, each answer kept as units and defects only
+            (lo, hi), last = cuts.window(0.0, total, LONGEST, pauses, after, breaks=breaks, known=known,
+                                             cached_reach=cuts.CACHED_REACH)
+            raw = cache.fetch(f"p-{lo:.1f}-{hi:.1f}", lambda: call((lo, hi), True))
+            words, glued = unglued(shifted(raw.get("words") or [], lo))
+            got, dropped = answer_units(words)
+            events += dropped
+            read.append((lo, hi, got, collapses(words), glued))
+            del raw, words
+            if last:
+                break
+            after, breaks = hi, cuts.word_breaks(got)  # the next piece starts where this one's words break too
+        log.append({"pieces": [[round(lo, 1), round(hi, 1)] for lo, hi, *_ in read]})
+        if events:
+            log.append({"audio_events_dropped": events})
+        # repaired on its own words: a repair across a seam replaces none of the other piece's
+        units = stitch([(lo, hi, repaired(got, found, glued)) for lo, hi, got, found, glued in read], segments=False)
     _warn_split(log)
     return Transcript(SCRIBE, MODEL, total, "word", turns_from_units(Unit.from_dict(u) for u in units), log)
 
@@ -408,20 +468,23 @@ def _entry(first: float, last: float, glued: list[Glued], lo: float, hi: float) 
 
 def reask(units: list[dict], found: list[tuple[float, float]], glued: list[Glued], *, total: float,
           ask: Callable[[float, float], list[dict]], speech: SpeechSpans,
-          voiceprints: Voiceprints) -> tuple[list[dict], list[dict]]:
+          voiceprints: Voiceprints, known: Sequence[tuple[float, float]] = ()) -> tuple[list[dict], list[dict]]:
     """`units` with every collapse's and glued word's units replaced by a re-ask of its span, and one log entry per
     span. `found` is `collapses`' (first start, last start) runs, `glued` `unglued`'s words; spots closer than
     `repair.MERGE_WITHIN` are one span. `ask(lo, hi)` is Scribe's units for [lo, hi], absolute times. The span's
     words go; the re-ask's words between the kept words either side come in, less an edge that repeats them
-    (`repair.trim_echo`). A failed glued span keeps its split units (`via: split`)."""
+    (`repair.trim_echo`). A failed glued span keeps its split units (`via: split`). Each span is padded out to a
+    Silero pause (`cuts.padded`); `known` holds the spans already asked (cached), taken where they fall in its ranges."""
     spans = _spans(found, glued)
     # a glued word's one label is not a voice: its units do not teach the voices
     suspect = [(g.first, g.last) for g in glued]
     voices = Voices(speech.pcm, voiceprints, R.blocks([u for u in units
                                                        if not any(a <= u["start"] <= b for a, b in suspect)]))
     log, failed = [], []
+    pauses = cuts.pauses_of(speech.spans()) if spans else []
+    breaks = cuts.word_breaks(units) if spans else []
     for k, (first, last, gs) in enumerate(spans, 1):
-        lo, hi = max(0.0, first - REASK_PAD), min(total, last + REASK_PAD)
+        lo, hi = cuts.padded(first, last, REASK_PAD, pauses, total, known, breaks=breaks)
         entry = _entry(first, last, gs, lo, hi)
         log.append(entry)
         try:
@@ -431,7 +494,7 @@ def reask(units: list[dict], found: list[tuple[float, float]], glued: list[Glued
         except Exception as error:  # noqa: BLE001 -- a failed spot is given up, the task goes on (owner 2026-11-02)
             entry["failed"] = f"{type(error).__name__}: {error}"[:300]
         else:
-            units = _splice(units, words, entry, first, last, lo, hi, voices, apart=f"r{k}" if gs else None)
+            units = _splice(units, words, entry, first, last, lo, hi, voices, apart=f"c{k}" if gs else None)
         if "failed" in entry:
             if gs:
                 entry["via"] = "split"
@@ -447,9 +510,10 @@ def reask(units: list[dict], found: list[tuple[float, float]], glued: list[Glued
 def _splice(units: list[dict], words: list[dict], entry: dict, first: float, last: float, lo: float, hi: float,
             voices: Voices, *, apart: str | None) -> list[dict]:
     """`units` with those starting in [first, last] replaced by the re-ask's `words` in the hole, `entry` updated;
-    unchanged, with `entry["failed"]`, when nothing comes back for the hole. The re-ask's speakers are linked to the
-    transcript's (`repair.relabel`); with `apart`, one linked to no one is a new person `<apart>:<label>`, else
-    unknown."""
+    unchanged, with `entry["failed"]`, when nothing comes back for the hole. The re-ask's speakers are matched to the
+    transcript's by voice (`repair.relabel`); with `apart`, one matched to no one with `relink.RESCUE_MIN` s of voice
+    is a new person `<apart>:<label>` (the judge reads `c<k>:` as a re-asked piece's), else unknown; with no
+    voiceprints to tell, every label with a block (`repair.blocks`) is a new person."""
     kept = [u for u in units if not first <= u["start"] <= last]
     edge = max((u for u in kept if u["start"] < first), key=lambda u: u["end"], default=None)
     a = edge["end"] if edge else lo
@@ -464,9 +528,12 @@ def _splice(units: list[dict], words: list[dict], entry: dict, first: float, las
     if not got:  # the hole's words are replaced, not added to: keep them rather than lose the lines
         entry["failed"] = "the re-ask heard nothing in the hole"
         return units
-    mapping = R.relabel(kept, words, lo, hi, voices)
+    mapping = R.relabel(words, voices)
     if apart is not None:
-        mapping.update({s: f"{apart}:{s}" for s in sorted({w["speaker"] for w in got} - set(mapping) - {None})})
+        blocks = R.blocks(words)
+        voiced = voices.voiced(blocks)
+        voiced = {block["speaker"] for block in blocks} if voiced is None else voiced
+        mapping.update({s: f"{apart}:{s}" for s in sorted(voiced - set(mapping))})
     for w in got:
         w["speaker"] = mapping.get(w["speaker"])
     entry.update(dropped=len(units) - len(kept), inserted=len(got), speakers=mapping)

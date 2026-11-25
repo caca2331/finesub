@@ -35,7 +35,7 @@ import re
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Sequence
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
@@ -44,6 +44,7 @@ from finesub.api_http import (
     HOST_BREAKER,
     Gate,
     HostUnreachableError,
+    api_http_client,
     current_route,
     is_connect_failure,
     is_retryable_http_error,
@@ -640,6 +641,11 @@ class WebSearchClient:
         # Serializes _pace across threads (parallel query rounds share one
         # client): the read-sleep-write on _last_query_at is a check-then-act.
         self._pace_lock = threading.Lock()
+
+    def has_provider(self) -> bool:
+        """Whether any provider is enabled and holds a key (it may still be locked or fail when asked)."""
+
+        return bool(self.exa_entries or self.gemma_entries or self.tavily_entries)
 
     @staticmethod
     def _entries_for(
@@ -2175,3 +2181,39 @@ def _compact_provider_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     if metadata.get("retried_without_visible_thinking"):
         compact["retried_without_visible_thinking"] = True
     return compact
+
+
+#: Hosts whose search-result links redirect to the page found (Gemini's and agy's grounding links): the name check
+#: (`knowledge/name_check_step.py`) follows one hop, so the session and the evidence see the page itself.
+SEARCH_REDIRECT_HOSTS = frozenset({"vertexaisearch.cloud.google.com"})
+#: One redirect hop asks for headers only.
+REDIRECT_TIMEOUT_SECONDS = 15
+
+
+def is_search_redirect(url: str) -> bool:
+    return (urlsplit(url).hostname or "").lower() in SEARCH_REDIRECT_HOSTS
+
+
+def follow_search_redirect(url: str) -> str:
+    """The page a search redirect link points to: its ``Location``, one hop, the page itself not read. The link
+    unchanged when it is no redirect link, its host is judged unreachable (`HOST_BREAKER`, an optional caller), the
+    request fails or answers with no redirect."""
+
+    if not is_search_redirect(url):
+        return url
+    host = urlsplit(url).hostname or url
+    route = current_route()
+    gate = HOST_BREAKER.gate_optional(host, route)
+    if gate is Gate.SKIP:
+        return url
+    location = ""
+    with HOST_BREAKER.probing(host, route, gate):
+        try:
+            with api_http_client(timeout=REDIRECT_TIMEOUT_SECONDS) as client, track_reach(url, route=route):
+                with client.stream("GET", url) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location", "").strip()
+        except httpx.HTTPError:
+            return url
+    target = urljoin(url, location) if location else ""
+    return target if target.startswith(("http://", "https://")) else url

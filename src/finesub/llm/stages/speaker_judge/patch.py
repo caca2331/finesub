@@ -24,6 +24,9 @@ from .answers import BLOCK, collapsed, line_id, survey
 #: The repair turn asking for a patch, and the one asking for the whole answer again.
 PATCH_TEMPLATE = "speaker_judge_repair_patch_v1.md"
 WHOLE_TEMPLATE = "speaker_judge_repair_whole_v1.md"
+#: With the person table (a cloud task's): `<tracks>` holds only what is new, and a whole answer has `<people>` too
+PATCH_PEOPLE_TEMPLATE = "speaker_judge_repair_patch_people_v1.md"
+WHOLE_PEOPLE_TEMPLATE = "speaker_judge_repair_whole_people_v1.md"
 
 
 #: A patch's faulty lines, each kind reported once (`answers.collapsed`).
@@ -66,19 +69,21 @@ def _error_list(errors: Sequence[str]) -> str:
     return "\n".join(f"- {text}" for text in (str(item).strip() for item in errors) if text)
 
 
-def patch_instruction(base: RepairBase, errors: Sequence[str]) -> str:
-    """The patch round's user turn: the errors, the ids to answer again, and the patch rules."""
+def patch_instruction(base: RepairBase, errors: Sequence[str], people: bool = False) -> str:
+    """The patch round's user turn: the errors, the ids to answer again, and the patch rules (`people`: the person
+    table's)."""
     return load_prompt_template(
-        PATCH_TEMPLATE, strict=True,
+        PATCH_PEOPLE_TEMPLATE if people else PATCH_TEMPLATE, strict=True,
         validation_errors=_error_list(errors),
         pending_ids="、".join(base.pending),
     ).strip()
 
 
-def whole_instruction(errors: Sequence[str]) -> str:
+def whole_instruction(errors: Sequence[str], people: bool = False) -> str:
     """The user turn asking for the whole answer again with ``errors`` fixed, in the judge's own format (the
-    client's generic round speaks of a header and columns the judge does not have)."""
-    return load_prompt_template(WHOLE_TEMPLATE, strict=True, validation_errors=_error_list(errors)).strip()
+    client's generic round speaks of a header and columns the judge does not have; `people`: the person table's)."""
+    return load_prompt_template(WHOLE_PEOPLE_TEMPLATE if people else WHOLE_TEMPLATE, strict=True,
+                                validation_errors=_error_list(errors)).strip()
 
 
 def rows_to_fix(base: RepairBase) -> str:

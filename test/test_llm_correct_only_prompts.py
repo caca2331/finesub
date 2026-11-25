@@ -3,9 +3,10 @@
 The guard renders what such a task's model can be shown -- the correction prompt over the switch grid, and
 the paths the grid does not reach (the request turn and its fill, the agentic acquire note, task feedback,
 the phonetic hints, the style picks, a style written for the task and the set that also names who speaks) -- and bans the words of translating in the whole text. Its scan surface is part of the
-guard: a path left out here never goes red. A second scan holds what such a task is really shown (no knowledge
-base) to no kana outside the worked examples, which come from Japanese material by the owner's call: the cue words
-the rules quote are Chinese.
+guard: a path left out here never goes red. A second scan holds what such a task is really shown (the knowledge
+base read, no feedback asked, no phonetic hints) to no kana outside the worked examples, which come from Japanese
+material by the owner's call: the cue words the rules quote are Chinese. The entries themselves are data: what a
+term line carries in its first column is the library's, not the templates'.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import pytest
 from finesub.llm.chunking import (
     CorrectionBudget, SubtitleSegment, SubtitleWindow, load_product_segments, plan_correction_windows,
 )
+from finesub.llm.knowledge.node.name_trust import UNCHECKED_MARK
 from finesub.llm.output_protocol import correction_output_header
 from finesub.llm import prompt_compose, prompt_tables
 from finesub.llm.prompt_compose import compose_correction_system, compose_correction_user
@@ -100,9 +102,11 @@ def _grid(knowledge_states=(True, False)):
 GRID = dict(_grid())
 
 
-def _other_paths():
+def _other_paths(*, taken: bool = False):
     """What the grid does not reach: the request turn and its fill, the agentic acquire note, the
-    feedback block, the phonetic hints."""
+    feedback block, the phonetic hints. ``taken`` leaves out the two blocks no correct-only task is ever
+    sent (`_with_task_mode` asks for no feedback; `kb_phonetic_hints.enabled` is off for it): the paths
+    as such a task really takes them."""
 
     base = dict(
         window=_window(),
@@ -110,8 +114,8 @@ def _other_paths():
         variant="capableC-polish",
         profile=resolve_profile("text", "local", "quality"),
         knowledge_enabled=True,
-        task_update_feedback=True,
-        phonetic_hints="1|原神 / 角色|桑多涅|桑多涅||木偶",
+        task_update_feedback=not taken,
+        phonetic_hints="" if taken else "1|原神 / 角色|桑多涅|桑多涅||木偶",
     )
     indexes = {"streamer": "- 主播A | 测试主播"}
     yield "direct", build_window_task_messages(**base)
@@ -120,7 +124,7 @@ def _other_paths():
     yield "fill", [
         build_correction_fill_message(
             entry_details="# 主播A", search_results="wiki", requested_entries=True, requested_search=True,
-            task_update_feedback=True,
+            task_update_feedback=not taken,
         )
     ]
 
@@ -132,7 +136,7 @@ def _other_paths():
         profile = resolve_profile("text", "none" if shape == "style_only" else "local", "quality")
         yield f"pick-{shape}", build_window_task_messages(
             **{**base, "profile": profile, "knowledge_enabled": shape != "style_only",
-               "task_update_feedback": shape != "style_only"},
+               "task_update_feedback": shape != "style_only" and not taken},
             request_channel=request_channel, agentic=agentic, style_catalog=catalog, extra_style_hint="多用短句",
             knowledge_indexes=indexes if shape != "style_only" else None,
         )
@@ -171,7 +175,7 @@ def _tracked_window(directory: Path, *, marks: bool) -> SubtitleWindow:
 
 def _tracked_paths():
     """The correct-only set that also names who speaks (an intermediate task with the speaker judge on): system and
-    user, with and without the confidence marks, over the media. It never reads the knowledge base."""
+    user, with and without the confidence marks, over the media. Built here without the knowledge base: its lines are scanned on the other paths."""
 
     with tempfile.TemporaryDirectory() as directory:
         for marks, media in itertools.product((False, True), MEDIA):
@@ -208,21 +212,53 @@ def test_no_mode_text_slot_is_left_unfilled(name):
     assert SLOT.findall(text) == []
 
 
-#: The other paths a correct-only task really takes: it never reads the knowledge base (`_with_task_mode`).
-WITHOUT_KNOWLEDGE = ("pick-style_only", "pick-prepare", "prepare-", "tracked-")
-
-
 def test_the_rules_quote_no_japanese_outside_the_worked_examples(monkeypatch):
+    """Every path a correct-only task takes, the knowledge base read or not (`--knowledge read` is its default)."""
+
     monkeypatch.setattr(prompt_compose, "build_examples", lambda **_: "")
-    texts = {name: text for name, (_, _, text) in _grid(knowledge_states=(False,))}
+    texts = {name: text for name, (_, _, text) in _grid()}
     texts.update({name: "\n".join(str(message["content"]) for message in messages)
-                  for name, messages in itertools.chain(_other_paths(), _tracked_paths())
-                  if name.startswith(WITHOUT_KNOWLEDGE)})
+                  for name, messages in itertools.chain(_other_paths(taken=True), _tracked_paths())})
     texts.update({f"pass1-{source}": shape_section(source, correct_only=True) for source in SOURCE_WORDS})
     assert "下面的示范" not in "".join(texts.values()), "the examples are left out"
     kana = {name: line for name, text in texts.items() for line in text.splitlines()
             if KANA.search(line) or "假名" in line}
     assert kana == {}
+
+
+def test_the_term_lines_are_explained_wherever_entries_are_first_shown():
+    """A term line's first column is mostly a foreign word: wherever a correct-only task is first shown entries
+    (the window's first message, the preparation task) it is told once to write the second column. The fill turn
+    continues a conversation that was told; a task that reads no knowledge base has no entries to explain. A
+    translation is told how to read the marks too (owner 2026-11-20), in its own words. A window also takes a name
+    the background survey settled; the preparation task is that survey, so its note does not name one."""
+
+    mode = prompt_tables.task_mode_texts(True)
+    note, prepare_note = (prompt_compose.kb_term_lines_note(mode, window=w).strip() for w in (True, False))
+    translation_note = prompt_compose.kb_term_lines_note(prompt_tables.task_mode_texts(False), window=True).strip()
+    assert note and translation_note and note != translation_note
+    assert UNCHECKED_MARK in note and UNCHECKED_MARK in translation_note, "it says what the mark means"
+    assert "背景调查" in note and "背景调查" not in prepare_note
+    for name, (_, _, text) in GRID.items():
+        assert text.count(note) == ("kb=True" in name), name
+    for name, text in OTHER.items():
+        shown = name in ("direct", "request", "agentic", "pick-request", "pick-agentic")
+        assert text.count(note) == shown, name
+        assert text.count(prepare_note) == name.startswith("prepare-"), name
+
+
+def test_the_preparation_task_keeps_a_spoken_name_the_library_writes_differently():
+    """The preparation task's rule takes the library's name over the transcript's. A correct-only task writes what
+    was said, so its rule excepts a row whose name nobody checked (the `（未核）` mark the projection puts on it: a
+    sourced spelling from the search results comes first, else what was said) and a name said repeatedly that
+    sounds clearly different; a translation's rule excepts only the unchecked row (owner 2026-11-20)."""
+
+    exception = prompt_tables.task_mode_texts(True)["kb_conflict_spoken"]
+    assert exception and UNCHECKED_MARK in exception
+    assert UNCHECKED_MARK in prompt_tables.task_mode_texts(False)["kb_conflict_spoken"]
+    for name, text in OTHER.items():
+        assert text.count(exception) == name.startswith("prepare-"), name
+    assert all(exception not in text for _, _, text in GRID.values())
 
 
 def test_the_other_paths_really_carry_their_blocks():

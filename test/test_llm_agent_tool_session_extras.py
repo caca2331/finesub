@@ -85,6 +85,7 @@ def test_a_premature_stop_gets_one_fresh_session_on_the_same_worker(tmp_path, mo
         _call(server, 20, "submit", payload="good")
 
     driver = _ToolUsingFakeDriver(agent)
+    driver.final_text = "bad"  # what it left is not a passing answer
     client = _client(driver, tmp_path)
 
     result = client.complete(
@@ -128,6 +129,7 @@ def test_a_premature_stop_keeps_the_start_its_driver_retried_past(tmp_path, monk
         _call(server, 20, "submit", payload="good")
 
     driver = _RetriedPastDriver(agent)
+    driver.final_text = "bad"  # what it left is not a passing answer
     result = _client(driver, tmp_path).complete(
         LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}
     )
@@ -169,12 +171,163 @@ def test_a_driver_error_after_the_accept_keeps_every_start_it_carried(tmp_path, 
 def test_two_premature_stops_fail_the_call(tmp_path, monkeypatch) -> None:
     _no_api(monkeypatch)
     driver = _ToolUsingFakeDriver(lambda server: _call(server, 1, "next_task"))
+    driver.final_text = "bad"  # what it left is not a passing answer
     client = _client(driver, tmp_path)
 
     with pytest.raises(Exception) as excinfo:
-        client.complete(LLMRole.GENERAL_CAPABLE, MESSAGES)
+        client.complete(LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}})
     assert "without an accepted submit" in str(excinfo.value)
     assert len(driver.calls) == AGENT_PREMATURE_STOP_RETRIES + 1
+
+
+class _TextLeavingDriver(_ToolUsingFakeDriver):
+    """A CLI whose final chat text is set per session: the answer it wrote instead of calling submit."""
+
+    def __init__(self, script, texts) -> None:
+        super().__init__(script)
+        self.texts = list(texts)
+
+    def run(self, messages, **kwargs):
+        result = super().run(messages, **kwargs)
+        result.content = self.texts[len(self.calls) - 1]
+        return result
+
+
+def _read_blocks_and_leave(server) -> None:
+    task = _call(server, 1, "next_task")
+    for index, block in enumerate(task["required_blocks"]):
+        _call(server, 10 + index, "read_context", ref=block["ref"])
+
+
+def test_a_session_that_leaves_a_passing_answer_as_text_delivers_it(tmp_path, monkeypatch) -> None:
+    """Claude Code's Sonnet wrote its whole answer as the final message and never called submit: an answer
+    that passes as a submit would is the session's answer, with no second CLI."""
+
+    _no_api(monkeypatch)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        "finesub.llm.client.current_reporter",
+        lambda: SimpleNamespace(warning=lambda code, message: warnings.append(code)),
+    )
+    driver = _TextLeavingDriver(_read_blocks_and_leave, ["good"])
+    client = _client(driver, tmp_path)
+
+    result = client.complete(
+        LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}
+    )
+
+    assert result.content == "good"
+    assert len(driver.calls) == 1
+    assert warnings == ["agent-session-text"]
+
+
+def test_under_the_no_op_validator_the_text_is_the_answer(tmp_path, monkeypatch) -> None:
+    """The preparation task's case: no runtime validator, so any submit would have passed and so does the
+    text; the caller's own parse is the check."""
+
+    _no_api(monkeypatch)
+    driver = _TextLeavingDriver(_read_blocks_and_leave, ["<context_pack>{}</context_pack>"])
+
+    result = _client(driver, tmp_path).complete(LLMRole.GENERAL_CAPABLE, MESSAGES)
+
+    assert result.content == "<context_pack>{}</context_pack>"
+    assert len(driver.calls) == 1
+
+
+def test_a_failing_text_answer_changes_nothing_and_is_a_premature_stop(tmp_path, monkeypatch) -> None:
+    """The text is judged, not submitted: a rejection spends no repair and keeps no draft, and the session
+    is asked again as any premature stop is."""
+
+    _no_api(monkeypatch)
+    seen: list[dict] = []
+
+    def agent(server):
+        _read_blocks_and_leave(server)
+        record = server.runtime.task_record(assignment_id=server.assignment_id, task_id="call")
+        seen.append(record)
+        if len(seen) == 2:
+            _call(server, 20, "submit", payload="good")
+
+    driver = _TextLeavingDriver(agent, ["bad", "submitted"])
+    client = _client(driver, tmp_path)
+
+    result = client.complete(
+        LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}},
+        max_repair_attempts=3,
+    )
+
+    assert result.content == "good"
+    assert len(driver.calls) == 2
+    # What the second session found: the first one's text left no trace on the task.
+    assert seen[1]["last_candidate"] is None
+    assert seen[1]["repair_rounds_remaining"] == seen[0]["repair_rounds_remaining"]
+    assert seen[1]["validation_errors"] == []
+    assert result.execution_attempts[0]["premature_stop"] is True
+    assert result.execution_attempts[0]["final_text_tail"] == "bad"
+
+
+class _ResumingDriver(_TextLeavingDriver):
+    """A CLI that keeps its tool sessions as conversations (Claude Code): every session reports a handle."""
+
+    resumes_tool_sessions = True
+
+    def run(self, messages, **kwargs):
+        result = super().run(messages, **kwargs)
+        result.conversation_handle = "conv-1"
+        return result
+
+
+def test_a_premature_stop_is_asked_again_in_the_same_conversation(tmp_path, monkeypatch) -> None:
+    """On a driver that resumes tool sessions, the session runs as a kept conversation and a stop without
+    a submit is followed up in it: only the follow-up is sent, with what the text failed, and what the
+    session read still counts."""
+
+    _no_api(monkeypatch)
+    owed: list = []
+
+    def agent(server):
+        if not owed:
+            _read_blocks_and_leave(server)
+            owed.append("left")
+            return
+        owed.append(_call(server, 30, "pull_status")["owed_blocks"])
+        _call(server, 31, "submit", payload="good")
+
+    driver = _ResumingDriver(agent, ["bad", "submitted"])
+    result = _client(driver, tmp_path).complete(
+        LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}
+    )
+
+    assert result.content == "good"
+    assert owed == ["left", []]
+    (first_messages, first), (second_messages, second) = driver.calls
+    assert first["session_scope"] == second["session_scope"] == "assignment"
+    assert first["conversation_key"] == second["conversation_key"] == "tool-session"
+    assert "conversation_handle" not in first
+    assert second["conversation_handle"] == "conv-1" and second["continuation"] is True
+    (followup,) = second_messages
+    assert followup["content"].startswith("Your previous turn ended without a call to `submit`")
+    assert "did not pass" in followup["content"]
+    assert "<previous_chat_text>" not in followup["content"]  # the conversation already holds it
+    assert result.execution_attempts[0]["premature_stop"] is True
+
+
+def test_a_fresh_session_carries_no_chat_text_past_the_opening_limit(tmp_path, monkeypatch) -> None:
+    """Without resume the follow-up rides the fresh opening; a last text that would push the two past the
+    driver's opening limit is left out, and what it failed still goes."""
+
+    from finesub.llm.agent.channels import ChannelLimits
+    from finesub.llm.client import _session_followup
+
+    verdict = {"validation_errors": ["the answer is bad"]}
+    roomy = _session_followup("x" * 50, verdict, resumed=False, opening="OPEN", limits=ChannelLimits())
+    tight = _session_followup(
+        "x" * 5000, verdict, resumed=False, opening="OPEN",
+        limits=ChannelLimits(opening_max_chars=1500, opening_unit="chars"),
+    )
+    assert roomy.startswith("OPEN\n\n") and "<previous_chat_text>" in roomy
+    assert tight.startswith("OPEN\n\n") and "<previous_chat_text>" not in tight
+    assert "- the answer is bad" in tight
 
 
 def _execution_attempts(error: BaseException) -> list:
@@ -204,18 +357,19 @@ def test_every_no_submit_attempt_is_named_and_keeps_its_text(tmp_path, monkeypat
 
     _no_api(monkeypatch)
     driver = _ToolUsingFakeDriver(lambda server: _call(server, 1, "next_task"))
+    driver.final_text = "bad"  # what it left is not a passing answer
     client = _client(driver, tmp_path)
 
     with pytest.raises(Exception) as excinfo:
-        client.complete(LLMRole.GENERAL_CAPABLE, MESSAGES)
+        client.complete(LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}})
 
     attempts = _execution_attempts(excinfo.value)
     assert len(attempts) == AGENT_PREMATURE_STOP_RETRIES + 1
     assert all(attempt["premature_stop"] is True for attempt in attempts)
     # The fake driver's CLI "says" this on every run; it is what a real one
     # would have left in its final message instead of calling submit.
-    assert all(attempt["final_text_tail"] == "submitted" for attempt in attempts)
-    assert all(attempt["final_text_chars"] == len("submitted") for attempt in attempts)
+    assert all(attempt["final_text_tail"] == "bad" for attempt in attempts)
+    assert all(attempt["final_text_chars"] == len("bad") for attempt in attempts)
 
 
 def test_the_no_submit_text_tail_is_bounded() -> None:
@@ -554,6 +708,7 @@ def test_a_premature_stop_retires_the_task_so_the_next_session_starts_clean(
         _call(server, 20, "submit", payload="good")
 
     driver = _ToolUsingFakeDriver(agent)
+    driver.final_text = "bad"  # what it left is not a passing answer
     client = _client(driver, tmp_path)
     result = client.complete(
         LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}

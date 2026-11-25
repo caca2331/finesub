@@ -8,9 +8,40 @@
     "げんしん",
     "げんしんインパクト"
    ],
-   "url": "https://github.com/caca2331/finesub/releases/download/glossary-genshin-2026-11-12/glossary-genshin-2026-11-12.json",
-   "size": 1480084,
-   "sha256": "66a793db78c7ad1d7b446ba24c5e5c8416a86e6414282e10a899ba7bdef08c7f"
+   "url": "https://github.com/caca2331/finesub/releases/download/glossary-genshin-2026-11-13/glossary-genshin-2026-11-13.json",
+   "size": 2651940,
+   "sha256": "4f11b41c2a46f242a896fd996b1a4af954a7fc3a156534a1043fab30b428bedc"
+  },
+  {
+   "game": "崩坏：星穹铁道",
+   "aliases": [
+    "Honkai: Star Rail",
+    "Honkai Star Rail",
+    "Star Rail",
+    "星穹铁道",
+    "崩坏星穹铁道",
+    "星铁",
+    "崩壊：スターレイル",
+    "崩壊スターレイル",
+    "スターレイル",
+    "スタレ"
+   ],
+   "url": "https://github.com/caca2331/finesub/releases/download/glossary-starrail-2026-11-13/glossary-starrail-2026-11-13.json",
+   "size": 1403231,
+   "sha256": "064696807f7b89f1f407bcc5ea2d74cae697dcc59eef86d380c1c2c9c38cf579"
+  },
+  {
+   "game": "绝区零",
+   "aliases": [
+    "Zenless Zone Zero",
+    "ZZZ",
+    "ゼンレスゾーンゼロ",
+    "ゼンゼロ",
+    "绝区零"
+   ],
+   "url": "https://github.com/caca2331/finesub/releases/download/glossary-zzz-2026-11-13/glossary-zzz-2026-11-13.json",
+   "size": 1154270,
+   "sha256": "b98c91ae154ef683ca12aae129ccfa586aeb5a58def71beb646765ebe5f8a271"
   }
  ]
 }

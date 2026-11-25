@@ -10,7 +10,11 @@ import pytest
 
 from finesub.llm.chunking import SubtitleSegment
 from finesub.llm.example_builder import build_examples
-from finesub.llm.output_protocol import TRANSLATED_MAX_MERGED_SOURCES, validate_correction_output_text
+from finesub.llm.output_protocol import (
+    TRANSLATED_MAX_MERGED_SOURCES,
+    correction_output_header,
+    validate_correction_output_text,
+)
 from finesub.llm.prompt_compose import (
     SHAPE_SAME_PERSON_FRAGMENT,
     compose_correction_system,
@@ -158,3 +162,39 @@ def test_every_example_capable_c_shows_renders_in_three_passes_or_says_it_does_n
             continue
         assert render_example(example, variant="capableC", with_start=False, profile=profile,
                               grouped=True, thresholds=STANDARD).strip(), example.id
+
+
+def _guided(result) -> list[str]:
+    return [message for message in result.repair_messages() if message.startswith("上面越过绝对门槛的合并行要拆开")]
+
+
+@pytest.mark.parametrize(("scale", "hard"), [(1.0, "20 字、4 秒左右"), (0.8, "16 字、3.2 秒左右")])
+def test_a_round_with_long_merges_carries_the_split_guidance_once_at_the_window_s_tier(scale, hard) -> None:
+    sources = [SubtitleSegment(str(i), i * 2.0, i * 2.0 + 1.0, "あ") for i in range(1, 5)]
+    wordy = "啊" * 40
+    two_long = (f"<translated>\n{SIX}\nsub|1,2|ああ|{wordy}|high|\nsub|3,4|ああ|{wordy}|high|\n</translated>")
+    result = validate_correction_output_text(two_long, sources, variant=resolve_variant("capableC"),
+                                             thresholds=Thresholds.at(scale))
+    assert result.long_merges == 2 == sum("absolute limit" in error for error in result.errors)
+    [guidance] = _guided(result)
+    assert guidance == result.repair_messages()[-1] and hard in guidance
+    assert guidance not in result.errors
+
+    fine = f"<translated>\n{SIX}\nsub|1,2|ああ|啊啊|high|\nsub|3|あ|啊|high|\n</translated>"  # missing source 4
+    missing = validate_correction_output_text(fine, sources, variant=resolve_variant("capableC"), thresholds=STANDARD)
+    assert not missing.ok and missing.long_merges == 0 and missing.split_guidance == ""
+
+
+@pytest.mark.parametrize(("name", "guided"), [("capableC-tracked", True), ("capableC-polish", False),
+                                             ("capableC-tracked-polish", False)])
+def test_the_tracked_set_gets_the_split_guidance_and_no_correct_only_set_does(name, guided) -> None:
+    # a correct-only set's polished text keeps to its row; the guidance moves words across rows
+    variant = resolve_variant(name)
+    sources = [SubtitleSegment("1", 0.0, 1.0, "あ"), SubtitleSegment("2", 1.1, 2.0, "い")]
+    header = correction_output_header(variant)
+    spk = "|?" if "spk" in header.split("|") else ""
+    row = f"sub|1,2{spk}|{'字' * 40}|{'字' * 40}|high|"
+    result = validate_correction_output_text(f"<translated>\n{header}\n{row}\n</translated>",
+                                             sources, variant=variant, thresholds=STANDARD)
+    assert result.long_merges == 1 and not result.ok
+    assert bool(result.split_guidance) is guided and len(_guided(result)) == int(guided)

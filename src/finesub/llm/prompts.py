@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import json
+from string import Template
 from typing import Any, Dict, List, Mapping, Sequence
 
 from finesub.reporting import current_reporter
@@ -39,6 +40,7 @@ from .routing.config import (
 from .routing.profiles import DEFAULT_PROFILE, TranslationProfile
 from .token_budget import TokenCounter, default_token_counter
 from .token_truncate import truncate_to_token_window
+from .prompt_tables import prompt_phrases
 from .prompt_compose import (
     PromptAssemblyError,
     compose_correction_system,
@@ -71,23 +73,40 @@ def _query_style_rules() -> str:
     return _load_prompt_template("fragment_query_style_v1.md").strip()
 
 
-def _search_queries_rules(max_queries: int, *, knowledge_enabled: bool = True) -> str:
+def _search_queries_rules(max_queries: int, *, knowledge_enabled: bool = True, unchecked_rule: str = "") -> str:
     # The knowledge-owned tail of the "don't waste queries" rule leaves with
     # the knowledge switch: it argues against entries a knowledge-off round
-    # will never be shown (docs/llm_prompts.md, injection reality).
+    # will never be shown (docs/llm_prompts.md, injection reality). With it goes
+    # the exception for the 未核 names (``unchecked_rule``: the window's or the
+    # preparation task's `fragment_unchecked_search_*`).
     return _load_prompt_template(
         "fragment_search_queries_output_v1.md",
         max_queries=max_queries,
         query_style=_query_style_rules(),
         knowledge_query_note=(
-            _load_prompt_template("fragment_search_queries_kb_note_v1.md").strip() if knowledge_enabled else ""
+            _load_prompt_template("fragment_search_queries_kb_note_v1.md", unchecked_search_rule=unchecked_rule).strip()
+            if knowledge_enabled else ""
         ),
     ).strip()
 
 
+def unchecked_search_rule(*, prepare: bool) -> str:
+    """The exception that spends queries on the 未核 names a task is about to write (owner 2026-11-20)."""
+
+    return _load_prompt_template(
+        "fragment_unchecked_search_prepare_v1.md" if prepare else "fragment_unchecked_search_window_v1.md").strip()
 
 
-def _feedback_schema(*, local_source_ids: bool) -> str:
+
+
+def _name_checks_rule() -> str:
+    return _load_prompt_template("fragment_task_feedback_name_checks_v1.md").strip()
+
+
+def _feedback_schema(*, local_source_ids: bool, name_checks: bool = False) -> str:
+    """The `<task_update_feedback>` schema; ``name_checks``: the task searched the 未核 names, so it records
+    what it found (`knowledge/feedback.py`'s ``name_checks``, the check step's clues)."""
+
     # one window's local line numbers (mapped back by the harness), or the stable source ids of the transcript
     source_ids_rule = _load_prompt_template(
         "fragment_task_feedback_source_ids_local_v1.md"
@@ -97,15 +116,32 @@ def _feedback_schema(*, local_source_ids: bool) -> str:
     return _load_prompt_template(
         "fragment_task_feedback_schema_v3.md",
         source_ids_rule=source_ids_rule,
+        name_checks_schema=(
+            _load_prompt_template("fragment_task_feedback_name_checks_schema_v1.md").strip() if name_checks else ""),
+        name_checks_rule=f"\n9. {_name_checks_rule()}" if name_checks else "",
     ).strip()
 
 
-def _research_task_feedback_block(*, local_source_ids: bool) -> str:
-    """Feedback-collection addendum for the preparation task's delivery."""
+def _name_checks_feedback_block(position_sentence: str) -> str:
+    """A correct-only task's feedback: only the name-check records (owner 2026-11-20)."""
 
+    return _load_prompt_template(
+        "task_name_checks_feedback_v1.md",
+        position_sentence=position_sentence,
+        feedback_schema=_load_prompt_template(
+            "fragment_task_feedback_schema_names_only_v1.md", name_checks_rule=_name_checks_rule()).strip(),
+    ).strip()
+
+
+def _research_task_feedback_block(*, local_source_ids: bool, name_checks: bool = False,
+                                  names_only: bool = False) -> str:
+    """Feedback-collection addendum for the preparation task's delivery; ``names_only``: a correct-only task's."""
+
+    if names_only:
+        return "\n" + _name_checks_feedback_block(prompt_phrases("name_checks")["position_prepare"]) + "\n"
     return "\n" + _load_prompt_template(
         "research_task_feedback_v1.md",
-        feedback_schema=_feedback_schema(local_source_ids=local_source_ids),
+        feedback_schema=_feedback_schema(local_source_ids=local_source_ids, name_checks=name_checks),
     ).strip() + "\n"
 
 
@@ -570,6 +606,25 @@ def _r1_entry_blocks(max_requested_entries: int, *, keep_source_block: str) -> s
     ).strip()
 
 
+def _window_searches(profile: TranslationProfile, *, knowledge_enabled: bool, self_search: bool) -> bool:
+    """Whether a correction window may search (its own tools, the provider's, or the harness's request round): it
+    then searches the 未核 names it is about to write first, and records what it found when the task collects
+    feedback (`name_checks`)."""
+
+    return knowledge_enabled and (self_search or profile.native_search or profile.external_injection)
+
+
+def window_asks_feedback(
+    profile: TranslationProfile, *, knowledge_enabled: bool, self_search: bool, task_update_feedback: bool
+) -> bool:
+    """Whether a correction window is asked for `<task_update_feedback>`: a correct-only window's one item is the
+    name checks, so it is asked only when it may search."""
+
+    return task_update_feedback and (
+        _window_searches(profile, knowledge_enabled=knowledge_enabled, self_search=self_search)
+        or not profile.correct_only)
+
+
 def build_correction_csv_messages(
     *,
     window: SubtitleWindow,
@@ -637,22 +692,29 @@ def build_correction_csv_messages(
         length_scale=window.length_scale,
         track_marks=window.speakers is not None and window.speakers.marked(window.source_ids),
     )
-    if task_update_feedback:
-        system = (
-            f"{system.rstrip()}\n\n"
-            + _load_prompt_template(
+    searches = _window_searches(profile, knowledge_enabled=knowledge_enabled, self_search=self_search)
+    asks_feedback = window_asks_feedback(
+        profile, knowledge_enabled=knowledge_enabled, self_search=self_search, task_update_feedback=task_update_feedback)
+    if asks_feedback:
+        # The block anchors after whatever really closes the reply:
+        # parallel has no <next_advice>/<keep_entries> (plan A.7).
+        position_clause = (
+            " `<next_advice>` 与 `<keep_entries>` 块之后"
+            if PromptContext(profile=profile, knowledge_enabled=knowledge_enabled).keeps_entries
+            else " `<next_advice>` 块之后"
+            if profile.continuity == "serial"
+            else " `<translated>` 块之后"
+        )
+        system = f"{system.rstrip()}\n\n" + (
+            # a correct-only task writes nothing to the library but the name checks (owner 2026-11-20)
+            _name_checks_feedback_block(
+                Template(prompt_phrases("name_checks")["position_window"]).substitute(clause=position_clause))
+            if profile.correct_only
+            else _load_prompt_template(
                 "correction_task_update_feedback_v2.md",
                 **mode_texts(variant, tier),
-                feedback_schema=_feedback_schema(local_source_ids=True),
-                # The block anchors after whatever really closes the reply:
-                # parallel has no <next_advice>/<keep_entries> (plan A.7).
-                feedback_position_clause=(
-                    " `<next_advice>` 与 `<keep_entries>` 块之后"
-                    if PromptContext(profile=profile, knowledge_enabled=knowledge_enabled).keeps_entries
-                    else " `<next_advice>` 块之后"
-                    if profile.continuity == "serial"
-                    else " `<translated>` 块之后"
-                ),
+                feedback_schema=_feedback_schema(local_source_ids=True, name_checks=searches),
+                feedback_position_clause=position_clause,
             )
         )
     # Plan 5r B2 (experiment): empty unless FINESUB_OVERLAP_CANDIDATES is set.
@@ -698,10 +760,11 @@ def build_correction_csv_messages(
         turns=turns,
         grouped=grouped,
         keyed=keyed,
-        task_update_feedback=task_update_feedback,
+        task_update_feedback=asks_feedback,
         agentic=agentic,
         length_scale=window.length_scale,
         speakers=window.speakers,
+        self_search=self_search,
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -893,7 +956,7 @@ def build_knowledge_update_messages(
     as evidence, plus the style entry it may propose into); the
     ``artifacts_only`` variant has neither.
     ``window_packs`` is the rendered per-window material blocks of ONE chunk;
-    ``multi_chunk`` marks a 100k-budget chunked run (the notice states no
+    ``multi_chunk`` marks a chunked run (the notice states no
     total, since over-limit chunks may split further at run time).
     The style entry, when the run named one, arrives through ``kb_entries``
     like every other entry — same handles, same apply path.
@@ -1042,6 +1105,39 @@ def agent_tool_worker_opening(
             if block_files
             else ""
         ),
+    )
+
+
+def agent_tool_session_followup(*, resumed: bool, chat_text: str = "", errors: Sequence[str] = ()) -> str:
+    """What a single-task tool session is asked after it left without
+    submitting (docs/llm_agent_tool_protocol.md §4): the answer counts only as
+    a `submit`, and what its final chat text failed when judged as one.
+
+    ``resumed``: the turn continues the session's own conversation, which
+    holds the task and that text. Otherwise it follows the opening of a fresh
+    session and carries ``chat_text`` (empty when it is left out).
+    """
+
+    if resumed:
+        previous = _load_prompt_template("fragment_agent_tool_followup_resumed_v1.md")
+    else:
+        previous = _load_prompt_template(
+            "fragment_agent_tool_followup_fresh_v1.md",
+            chat_text=(
+                _load_prompt_template("fragment_agent_tool_followup_chat_text_v1.md", text=chat_text.strip())
+                if chat_text.strip()
+                else ""
+            ),
+        )
+    verdict = (
+        _load_prompt_template(
+            "fragment_agent_tool_followup_errors_v1.md", errors="\n".join(f"- {error}" for error in errors)
+        )
+        if errors
+        else ""
+    )
+    return _load_prompt_template(
+        "agent_tool_session_followup_v1.md", strict=True, previous=previous, verdict=verdict
     )
 
 

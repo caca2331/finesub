@@ -73,6 +73,10 @@ class PipelinePaths(NamedTuple):
     metadata_json: Path
     #: A cloud backend's raw answers, one file per call (`speech/joint/cache.py`): kept, since they cost quota.
     cloud_dir: Path
+    #: `moss-diarization-aligner`'s record of its steps (`speech/joint/stage.py` `_diarization_aligned`): the word
+    #: backend's lines, each part's picks and candidates, the labels, the overlap cues. Written beside the aligned
+    #: JSON and never read back: what a later change to the stitching can be replayed from without the GPU.
+    moss_diar_json: Path
 
     @property
     def srt(self) -> Path:
@@ -257,6 +261,7 @@ def default_pipeline_paths(
         task_artifact_dir=base.with_name(f"{base.name}.llm-artifacts"),
         metadata_json=metadata_path_for_output(srt_path),
         cloud_dir=base.with_name(f"{base.name}-cloud"),
+        moss_diar_json=base.with_name(f"{base.name}-moss-diar.json"),
     )
 
 
@@ -775,9 +780,11 @@ def _note_task_backend(paths: PipelinePaths, backend: str, requested: str | None
     an explicit `--asr-aligner` does nothing for this backend (`[asr] aligner` is a standing preference for
     the MOSS and 35t tasks, not worth a line on every other one). A batch item's two halves each call this, so a run
     past raw-srt says it twice; that is the price of saying it wherever `run_pipeline` is entered."""
-    if aligner == "on" and backend not in (*joint_stage.SEGMENT_BACKENDS, joint_stage.GEMINI_35T):
-        print(f"Warning: --asr-aligner only applies to moss-pro, moss-local and gemini-35t; ignored for {backend}",  # product output
-              file=sys.stderr)
+    if aligner == "on" and backend not in (*joint_stage.SEGMENT_BACKENDS, joint_stage.GEMINI_35T,
+                                           joint_stage.MOSS_DIAR_ALIGNER):
+        print(  # product output
+            f"Warning: --asr-aligner only applies to moss-pro, moss-local and gemini-35t (also as "
+            f"{joint_stage.MOSS_DIAR_ALIGNER}'s --asr-rows); ignored for {backend}", file=sys.stderr)
     if requested is None or not (paths.stable_json.exists() or paths.aligned_json.exists()):
         return
     if joint_stage.resolve_backend(requested) == backend:
@@ -789,21 +796,47 @@ def _note_task_backend(paths: PipelinePaths, backend: str, requested: str | None
     )
 
 
+def _refuse_rows_options(paths: PipelinePaths, backend: str, requested: str | None, rows: str | None,
+                         transcript: str | None) -> None:
+    """`--asr-rows` / `--asr-transcript` given to a task whose backend is not `moss-diarization-aligner` stop it:
+    ignored, `--asr mai2 --asr-transcript x` would upload and bill as if no file were given. A task whose products
+    record another backend is told how to switch."""
+    if backend == joint_stage.MOSS_DIAR_ALIGNER or (rows is None and transcript is None):
+        return
+    given = "--asr-rows" if rows is not None else "--asr-transcript"
+    why = ""
+    if paths.stable_json.exists() or paths.aligned_json.exists():  # the backend is the products', not this run's
+        why = " (its products say so)"
+        if requested is not None and joint_stage.resolve_backend(requested) == joint_stage.MOSS_DIAR_ALIGNER:
+            why += (f"; to switch, delete its -aligned.json, -stable.json and everything after them, or give this "
+                    f"source another output with --asr-transcript {paths.cloud_dir}")
+    raise ValueError(f"{given} only applies to --asr {joint_stage.MOSS_DIAR_ALIGNER}; this task's recognition is "
+                     f"{backend}{why}")
+
+
 def _backend_diarize(
     paths: PipelinePaths, backend: str, requested: str | None, diarize: str, aligner: str | None,
+    asked_diarize: str | None = None,
 ) -> str:
-    """The task's `--diarize` level for its backend, having said where a resumed task's recognition came from."""
+    """The task's `--diarize` level for its backend, having said where a resumed task's recognition came from.
+    `asked_diarize`: `--diarize` as given (None: not given)."""
     _note_task_backend(paths, backend, requested, aligner)
+    if backend == joint_stage.MOSS_DIAR_ALIGNER and asked_diarize == "off" and not paths.aligned_json.exists():
+        print(f"Warning: --diarize off does not apply to --asr {backend}: choosing each line's speaker is what it "  # product output
+              "does, so its lines carry speakers", file=sys.stderr)
     # A joint-ASR task's own transcription labels its lines; writing them costs nothing (`docs/joint-asr.md`).
     return "acoustics" if backend != joint_stage.LOCAL and diarize == "off" else diarize
 
 
 def _run_joint_aligned(
     paths: PipelinePaths, source_path: Path, *, backend: str, language: str | None, aligner: str | None,
-    repair: str | None, speaker_merge: str | None, split_length_scale: float | None, gpu_tier: str,
-    device: str | None, stage_timing: dict[str, Any], announce: Callable[..., None],
+    repair: str | None, split_length_scale: float | None, gpu_tier: str,
+    device: str | None, stage_timing: dict[str, Any], announce: Callable[..., None], rows: str | None = None,
+    transcript: str | None = None, overlap_cue: bool | None = None,
 ) -> None:
-    """A joint-ASR task's `-aligned.json`: the joint transcription through production's sentence DP."""
+    """A joint-ASR task's `-aligned.json`: the joint transcription through production's sentence DP. `rows`,
+    `transcript` and `overlap_cue` are `moss-diarization-aligner`'s (`--asr-rows`, `--asr-transcript`,
+    `--asr-overlap-cue`)."""
     aligned_existed = paths.aligned_json.exists()
     announce("aligned", "reused" if aligned_existed else "running")
     asr_t0 = _stage_clock()
@@ -812,8 +845,9 @@ def _run_joint_aligned(
         "joint ASR",
         lambda temporary: joint_stage.run(
             source_path, backend=backend, output_path=temporary, cache_root=paths.cloud_dir, language=language,
-            aligner=aligner, repair=repair, speaker_merge=speaker_merge, split_length_scale=split_length_scale,
-            gpu_tier=gpu_tier, device=device,
+            aligner=aligner, repair=repair, split_length_scale=split_length_scale,
+            gpu_tier=gpu_tier, device=device, rows=rows, transcript=transcript, overlap_cue=overlap_cue,
+            diar_record=paths.moss_diar_json,
         ),
     )
     _record_stage_time(paths, stage_timing, "asr", asr_t0, status="reused" if aligned_existed else "executed")
@@ -1103,8 +1137,10 @@ def run_pipeline(
     # auto | on | off; None = `[asr] aligner`, then auto (`joint_stage.uses_aligner`).
     asr_aligner: str | None = None,
     asr_repair: str | None = None,
-    # auto | on | off; None = `[asr] speaker_merge`, then auto (off: `relink.speaker_merge`).
-    asr_speaker_merge: str | None = None,
+    # moss-diarization-aligner only: None = `[asr] rows` (then an error), no file, `[asr] overlap_cue` (then on).
+    asr_rows: str | None = None,
+    asr_transcript: str | None = None,
+    asr_overlap_cue: bool | None = None,
     separator_sample_rate: int | None = None,
     # None = follow `[separator] enabled`, then the stage's default (on).
     # `--no-separate` is for input that is already a clean vocal track: the
@@ -1154,8 +1190,7 @@ def run_pipeline(
     #: through to `[llm] style` in the config; the backend resolver decides,
     #: not argparse (README_DEV.md 开发原则's option-default chain).
     style: str | None = None,
-    #: none / read / update — see `knowledge/style.py`. `None` reads
-    #: `[llm] style_mode`, then defaults to `read`.
+    #: none / read / update — see `knowledge/style.py`. `None` reads `[llm] style_mode`, then defaults to `read`.
     style_mode: str | None = None,
     download_video_source: bool = True,
     knowledge: str | None = None,
@@ -1271,10 +1306,12 @@ def run_pipeline(
     )
     if resolved_task_artifact_dir != paths.task_artifact_dir:
         paths = paths._replace(task_artifact_dir=resolved_task_artifact_dir)
+    asked_diarize = diarize
     diarize = task_diarize(paths, diarize, _diarize_default or default_diarize(stage, profile), resume=resume)
     backend = joint_stage.task_backend(paths.stable_json, paths.aligned_json, asr)
+    _refuse_rows_options(paths, backend, asr, asr_rows, asr_transcript)
     joint = backend != joint_stage.LOCAL
-    diarize = _backend_diarize(paths, backend, asr, diarize, asr_aligner)
+    diarize = _backend_diarize(paths, backend, asr, diarize, asr_aligner, asked_diarize)
     # The LLM keys become the one value the correction task takes, here and not
     # at the LLM stage: building it is where a contradictory request is found
     # (a speaker judge at efficiency, a video switch without a video), and
@@ -1357,9 +1394,9 @@ def run_pipeline(
     )
     if joint and target_order >= PIPELINE_STAGE_ORDER["aligned"] and aligned_required:
         _run_joint_aligned(paths, source_path, backend=backend, language=language, aligner=asr_aligner,
-                           repair=asr_repair, speaker_merge=asr_speaker_merge, split_length_scale=split_length_scale,
-                           gpu_tier=gpu_tier,
-                           device=device, stage_timing=stage_timing, announce=announce)
+                           repair=asr_repair, split_length_scale=split_length_scale,
+                           gpu_tier=gpu_tier, device=device, stage_timing=stage_timing, announce=announce,
+                           rows=asr_rows, transcript=asr_transcript, overlap_cue=asr_overlap_cue)
     elif target_order >= PIPELINE_STAGE_ORDER["aligned"] and aligned_required:
         aligned_existed = paths.aligned_json.exists()
         announce("aligned", "reused" if aligned_existed else "running")

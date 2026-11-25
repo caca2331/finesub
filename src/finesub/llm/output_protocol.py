@@ -201,6 +201,12 @@ class CsvValidationResult:
     # The same rows as notes for the model, in its local ids: when the window
     # goes back for a structural error anyway, they ride along on the repair.
     turn_notes: tuple[str, ...] = ()
+    # Rows sent back for merging past the absolute threshold (`_long_merge_errors`; each also has its error).
+    long_merges: int = 0
+    # How to split such rows (`LONG_MERGE_SPLIT_FRAGMENT`), once per round with any of them; empty otherwise and
+    # for a correct-only set. Not an error: it belongs to no row, so in ``errors`` it would turn a patch
+    # repair into a rewrite (`correction_patch.repair_base`).
+    split_guidance: str = ""
     # Sources of the rows that slid off their own sources (`serial_shift`), model-local before remapping,
     # source ids after: the stretch a repair has to redo. The error saying so is in ``errors`` and belongs to
     # no row, so this is how a patch repair knows which rows to send back.
@@ -213,6 +219,15 @@ class CsvValidationResult:
     # patch repair (`correction_patch`) keeps of a rejected answer and which
     # sources it sends back. Empty when the block itself is missing.
     rows: tuple[RowVerdict, ...] = ()
+
+    def repair_messages(self, *, guidance: bool = True) -> tuple[str, ...]:
+        """Everything a repair round shows the model about this answer, in order: the errors, the turn notes
+        riding along, the split guidance. Every transport's repair round is built from this. A patch round
+        renders all of it into its instruction and lists the rest beside it (``guidance=False``): transports that
+        show both would otherwise give the guidance twice."""
+
+        tail = (self.split_guidance,) if guidance and self.split_guidance else ()
+        return (*self.errors, *self.turn_notes, *tail)
 
 
 def _parse_conf(cell: str) -> Optional[str]:
@@ -510,6 +525,10 @@ def _carries_guide_columns(parts: Sequence[str]) -> bool:
     )
 
 
+#: The repair round's guidance on how to split a row sent back by `_long_merge_errors` (`CsvValidationResult.split_guidance`).
+LONG_MERGE_SPLIT_FRAGMENT = "fragment_repair_long_merge_split_v1.md"
+
+
 def _long_merge_errors(
     row_number: int, start: float, end: float, translation: str, limits: Thresholds
 ) -> List[str]:
@@ -657,27 +676,21 @@ def validate_translated_csv_text(
 
     ``max_merged_sources``: how many sources a row merges before it is warned about
     (a soft cap, never an error; the variant's, `CorrectionVariant.max_merged_sources`).
-    ``long_merge_limits``: given, a row merging sources whose span is over their
-    ``absolute_seconds`` (at the 0.1 s the window shows) or whose translation is over their
-    ``absolute_chars`` weighted characters fails and goes back for repair (owner Q13,
-    2026-10-30: the single pass capableC, at the window's thresholds); a single source past
-    them passes. None rejects no merge for its length.
+    ``long_merge_limits``: given, a row merging sources whose span is over their ``absolute_seconds`` (at the
+    0.1 s the window shows) or whose translation is over their ``absolute_chars`` weighted characters fails and goes
+    back for repair, counted in ``long_merges`` (owner Q13, 2026-10-30: the single pass capableC, at the window's
+    thresholds); a single source past them passes. None rejects no merge for its length.
 
     ``spk``: capableC-tracked's rows carry a `spk` column after ``position``; a `sub` row whose cell is missing,
     empty or not a speaker fails and goes back for repair (`SpkCheck`). `discard` rows carry none.
 
-    `clip_start` is the absolute time of the window clip's 0 second; `insert`
-    rows carry clip-relative `(start, duration)` that is shifted by it into the
-    original timeline. `type`/`conf`/`note` are advisory: an absent/invalid
-    `conf` degrades to `None` (no error) and an unknown `type` degrades to
-    `sub`; legacy `plan` lines (`plan|…`, removed from prompts in v34) are
-    still skipped silently if present and never become segments. Only structural
-    problems (bad ids/order, empty text) fail a row
-    and trigger a retry upstream.
+    `clip_start` is the absolute time of the window clip's 0 second. `type`/`conf`/`note` are advisory: an
+    absent/invalid `conf` degrades to `None` (no error) and an unknown `type` degrades to `sub`; legacy `plan`
+    lines (`plan|…`, removed from prompts in v34) are still skipped silently and never become segments. Only
+    structural problems (bad ids/order, empty text) fail a row and trigger a retry upstream.
 
-    `insert` rows are always a structural error (v63 retired the row kind);
-    `KIND_INSERT` itself lives on because knowledge materials still read the
-    type back out of older `annotated.csv`.
+    `insert` rows are always a structural error (v63 retired the row kind); `KIND_INSERT` itself lives on
+    because knowledge materials still read the type back out of older `annotated.csv`.
 
     Rows ending with :data:VOID_ROW_MARKER are self-retracted by the model
     (v12): they are dropped before any structural checks, counted in
@@ -686,6 +699,7 @@ def validate_translated_csv_text(
 
     errors: List[str] = []
     warnings: List[str] = []
+    long_merges = 0
 
     refusal = _refused_reply(text, require_start_column, forbid_start_column)
     if refusal is not None:
@@ -910,6 +924,7 @@ def validate_translated_csv_text(
             long_merge = _long_merge_errors(row_number, first.start, end, shown_text, long_merge_limits)
             if long_merge:
                 errors.extend(long_merge)
+                long_merges += 1
                 continue
 
         translated_segments.append(
@@ -950,6 +965,7 @@ def validate_translated_csv_text(
         warnings=warnings,
         voided_rows=voided_rows,
         discarded_ids=tuple(sorted(discarded_ids, key=lambda s: source_index.get(s, 0))),
+        long_merges=long_merges,
         rows=verdicts,
     )
 
@@ -1052,6 +1068,10 @@ def validate_correction_output_text(
 
     return replace(
         result,
+        # Not for a correct-only set: its polished text keeps to its row, and the guidance moves words across rows.
+        split_guidance=load_prompt_template(
+            LONG_MERGE_SPLIT_FRAGMENT, strict=True, **thresholds.params()
+        ).strip() if result.long_merges and not variant.correct_only else "",
         turn_violation_rows=rows,
         turn_notes=tuple(
             load_prompt_template(

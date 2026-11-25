@@ -33,6 +33,7 @@ from ...reporting import current_reporter
 from .backend import Backend, DiarizationUnavailable
 from .evidence import evidence_path, read_if_present, timeline_key
 from .labels import SegmentSpeaker
+from ...subtitles.line_groups import SPEAKER_MARGIN
 from ...subtitles.stable_rows import (
     SPLIT_KEY, halves, legacy_overlay, overlay_for, overlay_path, stored_overlay, unreadable, write_overlay,
 )
@@ -58,6 +59,9 @@ from .segments import (
 #: 2.6). ⚠ Those readings came from 34 files that were also used to design vbx, so they show it
 #: works there, not that it generalises. DiariZen and Sortformer stay, named explicitly, for research.
 DEFAULT_BACKEND = "nemotron3"
+
+#: Its `GPU_STAGE_GATE` family: the timeline is computed alone on the card (owner 2026-11-20).
+GATE_FAMILY = "diarization"
 
 #: What a `-diar.json` without a `backend` field came from: it predates the seam, when Sortformer
 #: was the only backend. Not the default -- a reader's assumption about an old file.
@@ -273,14 +277,36 @@ def run_diarization(
     # made `--diarize` fail on exactly those runs; the checkpoint wants 16 kHz,
     # so the stage brings the audio there itself.
     waveform, _ = resample_if_needed(waveform, sample_rate, TARGET_SR)
-    produced = chosen.activity(waveform, handle=handle, device=device,
-                               max_speakers=max_speakers)
+    import gc
+
+    from ..runtime.device import device_type
+    from ..runtime.gpu_stage_gate import GPU_STAGE_GATE, clear_frames
+
+    # On the card, never together with the separator, the local Whisper ASR or the joint backends' Whisper re-timing:
+    # a batch's network task re-times on the GPU while this runs (`docs/batch-scheduler.md`). What this left on the
+    # card is freed before the gate lets another family on: the activity comes off it, and a failure's frames, which
+    # hold the model, are cleared.
+    on_card = device_type(device) == "cuda"
+    lease = GPU_STAGE_GATE.acquire(GATE_FAMILY, enabled=on_card)
+    try:
+        try:
+            produced = chosen.activity(waveform, handle=handle, device=device, max_speakers=max_speakers)
+            activity, evidence = produced.activity.float().cpu(), produced.evidence
+            del produced
+        except BaseException as error:
+            clear_frames(error)
+            raise
+        finally:
+            if on_card:
+                gc.collect()
+                torch.cuda.empty_cache()
+    finally:
+        lease.release()
     tracks = tuple(segments_from_activity(
-        produced.activity.float().cpu().tolist(),
+        activity.tolist(),
         frame_seconds=chosen.frame_seconds,
         parameters=smoothing,
     ))
-    evidence = produced.evidence
     if evidence is not None and evidence_path is not None:
         # ⚠ Never fatal: the evidence is an extra, and it is recomputable by rerunning the stage.
         try:
@@ -425,8 +451,9 @@ def write_joint_rows(stable_path: str | Path, *, backend: str, model: str) -> Pa
     """A joint-ASR task's `-diar-rows.json` (`docs/joint-asr.md`): each line's `line_speaker` from its own
     transcription, as tracks numbered in order of first appearance. No `-diar.json` is read or written -- the
     acoustic timeline is a product of this audio, the joint labels are a product of the transcription -- so
-    there are no confidence marks and no row splitting. Written again, like the acoustic rows, only when gone
-    or made for other lines."""
+    there are no confidence marks and no row splitting. `moss-diarization-aligner`'s margin of each line goes into
+    its extras (`speaker_margin`; recorded only). Written again, like the acoustic rows, only when gone or made for
+    other lines."""
     stable = Path(stable_path)
     payload = json.loads(stable.read_text(encoding="utf-8"))
     lines = payload.get("segments") if isinstance(payload, dict) else None
@@ -440,7 +467,10 @@ def write_joint_rows(stable_path: str | Path, *, backend: str, model: str) -> Pa
             rows.append({})
             continue
         track = tracks.setdefault(str(key), len(tracks))
-        rows.append(entry(SegmentSpeaker(track=track, extras={"tracks": [track], "joint_speaker": str(key)})))
+        extras = {"tracks": [track], "joint_speaker": str(key)}
+        if line.get(SPEAKER_MARGIN) is not None:
+            extras[SPEAKER_MARGIN] = line[SPEAKER_MARGIN]
+        rows.append(entry(SegmentSpeaker(track=track, extras=extras)))
     record = speaker_metadata(model=model, artifacts_revision="", track_count=len(tracks), parameters={}) | {
         "backend": JOINT_BACKEND_PREFIX + backend, "hints": {}, "marks": None, "reproducible": True}
     return _store(stable, overlay_for(lines, rows, speaker=record, split={"chosen": False, "cuts": 0}))

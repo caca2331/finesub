@@ -58,8 +58,8 @@ def _verdict(payload: Mapping[str, Any], known: set[int]) -> Verdict | None:
         return Verdict("keep", why)
     if answer == "abstain":
         return Verdict("abstain", why)
-    if answer.startswith("@") and answer[1:].strip():
-        return Verdict("new", why, label=answer[1:].strip())
+    if answer.startswith("@") and answer[1:].strip() and not answer[1:].strip().startswith("切"):
+        return Verdict("new", why, label=answer[1:].strip())  # `@切…` is a cut's piece's, never the judge's
     if (match := _COMPOUND.fullmatch(answer)) is not None and int(match.group(1)) in known:
         return Verdict("track", why, track=int(match.group(1)))
     return None
@@ -100,7 +100,15 @@ NOT_OBJECT = ("row is not a JSON object", "rows are not JSON objects")
 UNEXPECTED = ("row names an id that is not judged here", "rows name ids that are not judged here")
 REPEATED = ("id is written more than once", "ids are written more than once")
 NOT_AN_ANSWER = ("row's track is not one of the answers", "rows' tracks are not among the answers")
-FAULTS = (NOT_JSON, NOT_OBJECT, UNEXPECTED, REPEATED, NOT_AN_ANSWER)  # the order the errors are listed in
+#: A cut track's earlier piece (`s3-1`) is the person table's, never a `<judge>` answer
+OLD_PIECE = ("row answers an earlier piece of a cut track: <judge> answers track numbers only (s3), earlier pieces "
+             "(s3-1) are written in <tracks>",
+             "rows answer earlier pieces of cut tracks: <judge> answers track numbers only (s3), earlier pieces "
+             "(s3-1) are written in <tracks>")
+FAULTS = (NOT_JSON, NOT_OBJECT, UNEXPECTED, REPEATED, NOT_AN_ANSWER, OLD_PIECE)  # the order the errors are listed in
+#: what OLD_PIECE catches: a track with a piece number (any dash) or `前` (a name for an earlier piece the prompt does
+#: not use)
+_PIECE = re.compile(r"s\d+\s*(?:[-‐‑‒–—―ー−~〜～]\s*\d+|前\d*)")
 
 
 @dataclass(frozen=True)
@@ -178,7 +186,8 @@ def survey(text: str, ids: Sequence[str], tracks: Sequence[int] | None) -> Surve
         seen.add(key)
         lines[key] = line
         if tracks is not None and _verdict(payload, known) is None:
-            faults[NOT_AN_ANSWER].append(f"{key} ({str(payload.get('track', '')).strip()!r})")
+            answer = unicodedata.normalize("NFKC", str(payload.get("track", ""))).strip()
+            faults[OLD_PIECE if _PIECE.fullmatch(answer) else NOT_AN_ANSWER].append(f"{key} ({answer!r})")
             faulty[key] = None
             continue
         rows[key] = payload
@@ -251,8 +260,8 @@ def _speaker(answer: Any, known: set[int]) -> Verdict | None:
     """Who a heard edit names: a track the prompt shows or a new `@label`; None for anything else (`keep` and
     `abstain` included: there is no row of its own to keep)."""
     answer = str(answer or "").strip()
-    if answer.startswith("@") and answer[1:].strip():
-        return Verdict("new", label=answer[1:].strip())
+    if answer.startswith("@") and answer[1:].strip() and not answer[1:].strip().startswith("切"):
+        return Verdict("new", label=answer[1:].strip())  # `@切…` is a cut's piece's, never the judge's
     if (match := _COMPOUND.fullmatch(answer)) is not None and int(match.group(1)) in known:
         return Verdict("track", track=int(match.group(1)))
     return None
@@ -387,6 +396,14 @@ def parse_tracks(text: str) -> dict[str, str]:
         return {}
     pairs = (line.split("=", 1) for line in body.splitlines() if "=" in line)
     return {key.strip(): value.strip() for key, value in pairs if key.strip()}
+
+
+def parse_block(text: str, name: str) -> str | None:
+    """A block's body, None when the reply has none (fail-soft: the person table's `<people>`)."""
+    try:
+        return _block(text, name)
+    except AnswerError:
+        return None
 
 
 def cut_off(text: str) -> bool:

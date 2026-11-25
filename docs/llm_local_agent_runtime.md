@@ -255,7 +255,7 @@ violation、提取到有界的最终文本。**不是**「字幕通过了业务 
 
 **harness 会话下「exchange 会记下完整应答」这个前提不成立**（2026-09-16）。上面「capsule
 不必留」的理由是 exchange 会记下完整应答；对 completion 传输成立，因为最终文本就是产物。tool
-session（以及会话宿主的 CLI）的最终文本**没有产物语义**（产物只经 `submit` 交付），于是一个
+session（以及会话宿主的 CLI）的最终文本**没有产物语义**（产物经 `submit` 交付；唯一的例外是没调过 `submit` 的单 task 会话留在正文里、过得了校验的答案，见 [`llm_agent_tool_protocol.md`「4. 完成与终止契约」](llm_agent_tool_protocol.md#4-完成与终止契约)），于是一个
 **没被 accept 就干净退出**的会话：transport 成功 → capsule 按上面的规则删除；harness 随后才判
 失败 → 失败轮不写 exchange。CLI 留下的一切两边都没有——实测 11.5k output token 零字节留存，
 「根本没写出答案」与「写了但没调 `submit`」无从区分，而两者修法相反。两处收口：
@@ -273,7 +273,8 @@ session（以及会话宿主的 CLI）的最终文本**没有产物语义**（�
   那条约束仍然成立。
 - **审计包只进最后一个 capsule**：tool session 在循环结束后对最后一个 result 写一次审计包。第一次
   premature stop 之后重试时，前一个 capsule 带标记留下，但里面**没有审计包**——只有事件流、stderr
-  与输入；它那一轮的拉取台账随 `reset_conversation` 清掉，只在最后一个审计包的 `resets` 里留痕。
+  与输入。续不上原对话的 driver 那一轮的拉取台账随 `reset_conversation` 清掉，只在最后一个审计包的 `resets` 里留痕；
+  续上原对话的（Claude Code）台账照旧，两轮的拉取都在最后一个审计包里。
 
 **谓词的含义是「CLI 可以走了」，不完全等于「工作被 accept 了」。** 单 task 会话两者重合；会话宿主
 （pseudo-conversational）的谓词有两处偏差，保留判断照读不误：

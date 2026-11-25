@@ -128,13 +128,18 @@ targets = [
 # agy's own Gemini is Hydrogen in every agy group, in 3.8 Flash's old place
 # (owner 2026-11-13: same tier and price; on agy it thinks a quarter to half as much
 # and was no worse in the comparison).
+# Neon follows Hydrogen in every agy group as the standby for Hydrogen's
+# failures -- a timeout, the model unavailable, a rate limit, any transient one
+# (owner 2026-11-23). It is not a quota standby: both spend the Gemini allowance,
+# and since agy's spent error says nothing FineSub reads, each fails once and one
+# probe runs before that allowance freezes.
 [model_groups.agy-capable]
 targets = [
     "gemini-free-4-hydrogen",
     "gemini-free-3_8-flash",
     "local-agy-sonnet-5_5",
     "local-agy-gemini-4-hydrogen",
-    "local-agy-gemini-4-argon",
+    "local-agy-gemini-4-neon",
 ]
 
 # Free 3.6 Flash replaced the deprecated free 3.5 Flash at the head (2026-10-11):
@@ -144,14 +149,14 @@ targets = [
     "gemini-free-3_6-flash",
     "local-agy-sonnet-5_5",
     "local-agy-gemini-4-hydrogen",
-    "local-agy-gemini-4-argon",
+    "local-agy-gemini-4-neon",
 ]
 
 # The `agy-fast` preset's efficiency cells (owner 2026-10-01): agy's Gemini
-# (Hydrogen) then Argon only, so a spent subscription stops the run instead of moving it to
-# an API.
+# (Hydrogen, Neon behind it) only, so a spent subscription stops the run instead of
+# moving it to an API.
 [model_groups.agy-only-fast]
-targets = ["local-agy-gemini-4-hydrogen", "local-agy-gemini-4-argon"]
+targets = ["local-agy-gemini-4-hydrogen", "local-agy-gemini-4-neon"]
 
 # The same two groups with the API head removed -- the `agy` preset's pair.
 #
@@ -164,20 +169,19 @@ targets = ["local-agy-gemini-4-hydrogen", "local-agy-gemini-4-argon"]
 #
 # Ordering carries over unchanged: Sonnet is text-only and leads on purpose, so
 # text windows prefer it and media windows fail its capability filter and land
-# on the Gemini agy fronts. Each Hydrogen target is followed by its Argon
-# standby.
+# on the Gemini agy fronts.
 [model_groups.agy-only-capable]
 targets = [
     "local-agy-sonnet-5_5",
     "local-agy-gemini-4-hydrogen",
-    "local-agy-gemini-4-argon",
+    "local-agy-gemini-4-neon",
 ]
 
 [model_groups.agy-only-basic]
 targets = [
     "local-agy-sonnet-5_5",
     "local-agy-gemini-4-hydrogen",
-    "local-agy-gemini-4-argon",
+    "local-agy-gemini-4-neon",
 ]
 
 # dsh serves the tool protocol only: `dsh --profile headless` has no input

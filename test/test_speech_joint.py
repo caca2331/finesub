@@ -37,6 +37,11 @@ def source(tmp_path, monkeypatch) -> Path:
     return path
 
 
+def silent(source: Path) -> mosspro.SpeechSpans:
+    """Silero spans for the fake `source`: none, so every cut stays at its nominal time."""
+    return mosspro.SpeechSpans(source, [])
+
+
 @pytest.fixture
 def ledger_path(tmp_path) -> Path:
     return tmp_path / "state"
@@ -319,10 +324,10 @@ def test_moss_paid_reads_the_config_file(ledger_path, tmp_path, monkeypatch):
         caller(tmp_path / "x.mp3", seconds=60)
 
 
-def test_moss_refusal_names_the_console(ledger_path, tmp_path):
+def test_moss_refusal_says_when_to_rerun(ledger_path, tmp_path):
     caller = mosspro.Caller(ledger=KeyLedger("m", "m", BEIJING, state_path=ledger_path), entries=entries("a"), paid=False)
     caller._once = lambda audio, key: None  # HTTP 402
-    with pytest.raises(QuotaExhausted, match="console"):
+    with pytest.raises(QuotaExhausted, match="free hours as used up.*Beijing midnight"):
         caller(tmp_path / "x.mp3", seconds=60)
 
 
@@ -654,13 +659,21 @@ def w(start, end, text, speaker="A"):
     return {"start": start, "end": end, "text": text, "speaker": speaker}
 
 
-def test_stitch_keeps_each_word_once_in_output_order_and_links_speakers():
-    # B's backchannel comes after A's later word, as 35t emits it; the order survives the seam
+def test_stitch_keeps_each_word_once_in_output_order_and_each_window_s_speakers_apart():
+    # B's backchannel comes after A's later word, as 35t emits it; the order survives the seam. X talks with A in
+    # the overlap, yet stays its own label: who is who across windows is the judge's (owner 2026-11-21)
     left = [w(0, 1, "a1"), w(5, 6, "a2"), w(2, 3, "b1", "B"), w(40, 41, "a3")]
     right = [w(40, 41, "a3", "X"), w(55, 56, "a4", "X")]
     out = stitch([(0, 50, left), (40, 60, right)], segments=False)
     assert [u["text"] for u in out] == ["a1", "a2", "b1", "a3", "a4"]
-    assert [u["speaker"] for u in out] == ["w0:A", "w0:A", "w0:B", "w0:A", "w0:A"]
+    assert [u["speaker"] for u in out] == ["w0:A", "w0:A", "w0:B", "w1:X", "w1:X"]
+
+
+def test_stitch_renames_the_label_a_segment_says_again_with_the_speakers():
+    left = [w(0, 1, "a1"), {**w(5, 6, "a2", "c1:B"), "twin": "A"}, w(40, 41, "a3")]
+    right = [w(40, 41, "a3", "X"), {**w(55, 56, "a4", "c1:Y"), "twin": "X"}]
+    out = stitch([(0, 50, left), (40, 60, right)], segments=False)
+    assert [u.get("twin") for u in out] == [None, "w0:A", None, "w1:X"]
 
 
 def test_segment_seams_keep_each_utterance_once_sorted_by_start():
@@ -695,8 +708,9 @@ def test_35t_bad_run_is_shifted_back():
     assert [(round(x["start"], 1), round(x["end"], 1)) for x in fixed] == [(10.0, 10.3), (10.3, 10.6), (10.6, 10.9), (11.0, 11.3)]
 
 
-def transcribe_35t(source, tmp_path, words_for, total):
-    """35t over `total` s where each window's answer is `words_for(start, end)` (absolute times)."""
+def transcribe_35t(source, tmp_path, words_for, total, spans=()):
+    """35t over `total` s where each window's answer is `words_for(start, end)` (absolute times); Silero hears
+    `spans` (none: every cut at its nominal time)."""
     calls = []
 
     def fetch(self, name, call):
@@ -710,7 +724,7 @@ def transcribe_35t(source, tmp_path, words_for, total):
     mp.setattr(CallCache, "fetch", fetch)
     try:
         t = gemini35t.transcribe(source, cache_root=tmp_path / "cloud", language="ja", caller=object(), duration=total,
-                                 repair="off")
+                                 repair="off", speech=mosspro.SpeechSpans(source, list(spans)))
     finally:
         mp.undo()
     return t, calls
@@ -756,6 +770,207 @@ def test_35t_degenerate_window_is_split_into_overlapping_halves(source, tmp_path
     assert calls == [(0.0, 540.0), (0.0, 300.0), (240.0, 540.0)]
     texts = [u.text for u in t.units()]
     assert len(texts) == len(set(texts)) and "w270" in texts
+
+
+def test_35t_windows_are_cut_at_silero_pauses(source, tmp_path):
+    # pauses at 520 s (in the REACH s before 540), 445 s (60-90 s before that end) and 970 s
+    spans = [(0.0, 444.5), (445.5, 519.0), (521.0, 969.5), (970.5, 1200.0)]
+    _, calls = transcribe_35t(source, tmp_path, speech_every_second, 1200.0, spans=spans)
+    assert calls == [(0.0, 520.0), (445.0, 970.0), (910.0, 1200.0)]
+
+
+#: Pauses at 520 s (a window's end), 435 s (1 s) and 450 s (0.4 s, 60-90 s before that end): the short one is taken
+#: only where the words before break there.
+SHORT_PAUSE_SPANS = [(0.0, 434.5), (435.5, 449.8), (450.2, 519.0), (521.0, 1200.0)]
+
+
+def marked_at(start, end, mark=True):
+    """A word a second; with `mark`, the one at 449 s ends a sentence (the break 449.5-450 s)."""
+    words, status = speech_every_second(start, end)
+    return [(a, b, f"{text}。" if mark and a == 449 else text, s) for a, b, text, s in words], status
+
+
+@pytest.mark.parametrize("mark, start", [(True, 450.0), (False, 435.0)])
+def test_35t_the_next_window_starts_at_a_pause_the_words_before_break_at(source, tmp_path, mark, start):
+    _, calls = transcribe_35t(source, tmp_path, lambda a, b: marked_at(a, b, mark), 1200.0, spans=SHORT_PAUSE_SPANS)
+    assert calls[:2] == [(0.0, 520.0), (start, start + 540.0)]
+
+
+@pytest.mark.parametrize("marked, start", [("whole", 435.0), ("half", 450.0)])
+def test_35t_after_a_split_the_next_window_starts_by_the_second_halfs_words(source, tmp_path, marked, start):
+    def words_for(a, b):
+        words, _ = marked_at(a, b, mark=(a, b) == ((0.0, 520.0) if marked == "whole" else (230.0, 520.0)))
+        return words, "incomplete" if (a, b) == (0.0, 520.0) else "completed"  # the whole window: degenerate
+
+    _, calls = transcribe_35t(source, tmp_path, words_for, 1200.0, spans=SHORT_PAUSE_SPANS)
+    assert calls[:4] == [(0.0, 520.0), (0.0, 290.0), (230.0, 520.0), (start, start + 540.0)]
+
+
+def test_35t_answers_cached_at_the_fixed_cuts_replay_though_silero_hears_pauses(source, tmp_path):
+    cache = tmp_path / "cloud" / joint.GEMINI_35T
+    cache.mkdir(parents=True)
+    for a, b in [(0.0, 540.0), (480.0, 1020.0), (960.0, 1200.0)]:
+        words = [(x - a, x - a + 0.5, f"w{x}", "spk:0") for x in range(int(a) + 1, int(b) - 1)]
+        (cache / f"w-{a:.1f}-{b:.1f}.raw.json").write_text(json.dumps(answer(words)), encoding="utf-8")
+    t = gemini35t.transcribe(source, cache_root=tmp_path / "cloud", language="ja", duration=1200.0, repair="off",
+                             offline=True, speech=mosspro.SpeechSpans(source, [(0.0, 499.0), (501.0, 1200.0)]))
+    assert {f"w{x}" for x in (1, 500, 1197)} <= {u.text for u in t.units()}
+
+
+def test_35t_windows_cached_up_to_60_s_before_their_limit_replay(source, tmp_path):
+    # codex acceptance review: an end cut 40 s before the limit (by the 60 s reach before 2026-11-22) is found
+    # though the reach planned now is 30 s
+    cache = tmp_path / "cloud" / joint.GEMINI_35T
+    cache.mkdir(parents=True)
+    for a, b in [(0.0, 500.0), (440.0, 980.0), (920.0, 1200.0)]:
+        words = [(x - a, x - a + 0.5, f"w{x}", "spk:0") for x in range(int(a) + 1, int(b) - 1)]
+        (cache / f"w-{a:.1f}-{b:.1f}.raw.json").write_text(json.dumps(answer(words)), encoding="utf-8")
+    t = gemini35t.transcribe(source, cache_root=tmp_path / "cloud", language="ja", duration=1200.0, repair="off",
+                             offline=True, speech=mosspro.SpeechSpans(source, [(0.0, 499.0), (501.0, 1200.0)]))
+    assert {f"w{x}" for x in (1, 497, 1197)} <= {u.text for u in t.units()}
+
+
+def test_35t_continues_an_early_stop_at_a_pause_before_its_last_word():
+    assert gemini35t._continued(300.0, 120.0, [(285.0, 1.0), (292.0, 0.5), (275.0, 3.0)]) == ((280.0, 290.0), 285.0)
+    # the floor is later: a pause just after it
+    assert gemini35t._continued(59.5, 120.0, [(125.0, 0.4)]) == ((120.0, 130.0), 125.0)
+    assert gemini35t._continued(59.5, 120.0, []) == ((120.0, 130.0), 120.0)
+
+
+def test_35t_splits_a_degenerate_window_at_pauses_near_its_middle():
+    pauses = [(280.0, 1.0), (305.0, 2.0), (215.0, 1.5), (233.0, 0.3)]  # 280, 215: further in or out than allowed
+    assert gemini35t._split(0.0, 540.0, pauses, []) == [(0.0, 305.0), (233.0, 540.0)]
+    assert gemini35t._split(0.0, 540.0, [], []) == [(0.0, 300.0), (240.0, 540.0)]
+    # halves cached at the fixed middle are found
+    assert gemini35t._split(0.0, 540.0, pauses, [(0.0, 300.0), (240.0, 540.0)]) == [(0.0, 300.0), (240.0, 540.0)]
+
+
+def test_35t_short_window_halves_cut_at_fixed_times_replay():
+    assert gemini35t._split(0.0, 64.0, [], []) == [(0.0, 62.0), (2.0, 64.0)]  # as fixed halves were cut
+    assert gemini35t._split(0.0, 64.0, [(62.6, 1.0), (1.4, 1.0)], [(0.0, 62.0), (2.0, 64.0)]) == [(0.0, 62.0),
+                                                                                                (2.0, 64.0)]
+
+
+@pytest.mark.parametrize("length", [3.0, 30.0, 45.0, 61.0, 64.0, 90.0, 120.0])
+def test_35t_halves_of_a_short_window_are_each_shorter_than_it(length):
+    pauses = [(0.5, 2.0), (length - 0.5, 2.0), (length / 2, 2.0)]  # pauses at its very edges and middle
+    for pauses_heard in (pauses, []):
+        (a, b), (c, d) = gemini35t._split(0.0, length, pauses_heard, [])
+        assert a == 0.0 and d == length and b < length and c > 0.0 and b - c > 0  # shorter, and overlapping
+    assert gemini35t._split(0.0, 90.0, [], []) == [(0.0, 75.0), (15.0, 90.0)]  # as fixed halves were cut
+
+
+def test_35t_speakerless_halves_are_at_most_reask_half_and_replay_their_fixed_cuts():
+    assert gemini35t._split(0.0, 400.0, [], [], gemini35t.REASK_HALF) == [(0.0, 300.0), (100.0, 400.0)]
+    pauses = [(296.0, 1.0), (104.0, 1.0), (305.0, 3.0)]  # 305: past REASK_HALF
+    assert gemini35t._split(0.0, 400.0, pauses, [], gemini35t.REASK_HALF) == [(0.0, 296.0), (104.0, 400.0)]
+    fixed = [(0.0, 300.0), (100.0, 400.0)]
+    assert gemini35t._split(0.0, 400.0, pauses, fixed, gemini35t.REASK_HALF) == fixed
+
+
+def test_35t_reask_of_gaps_merged_to_the_old_limit_replays_its_fixed_pads():
+    # two gaps 515 s end to end were one re-ask [a - REASK_PAD, b + REASK_PAD] before the cuts moved to pauses
+    assert gemini35t._padded(100.0, 615.0, 2000.0, [(88.0, 1.0), (627.0, 1.0)], [(90.0, 625.0)]) == (90.0, 625.0)
+    lo, hi = gemini35t._padded(100.0, 615.0, 2000.0, [(88.0, 1.0), (627.0, 1.0)], [])
+    assert hi - lo <= gemini35t.WINDOW and lo <= 90.0 and hi >= 625.0
+
+
+def put_35t(cache, a, b, words, status="completed"):
+    (cache / f"w-{a:.1f}-{b:.1f}.raw.json").write_text(
+        json.dumps(answer([(x - a, y - a, text, "spk:0") for x, y, text in words], status)), encoding="utf-8")
+
+
+def test_35t_a_tail_cached_a_name_apart_from_a_read_half_is_taken(source, tmp_path):
+    cache = tmp_path / "cloud" / joint.GEMINI_35T
+    cache.mkdir(parents=True)
+    put_35t(cache, 0.0, 540.0, [(x * 0.2, x * 0.2 + 0.1, "あ") for x in range(1, 40)])  # degenerate
+    put_35t(cache, 0.0, 300.0, [(x, x + 0.5, f"w{x}") for x in range(1, 245)])
+    put_35t(cache, 240.0, 540.0, [(x, x + 0.5, f"w{x}") for x in range(241, 250)] + [(249.6, 250.1, "w250")])
+    put_35t(cache, 240.1, 540.0, [(x, x + 0.5, f"w{x}") for x in range(251, 539)])  # the tail: last word - 10 s
+    # a pause at 235 s, in the tail's range: taking it would ask a window never cached
+    t = gemini35t.transcribe(source, cache_root=tmp_path / "cloud", language="ja", duration=540.0, repair="off",
+                             offline=True, speech=mosspro.SpeechSpans(source, [(0.0, 234.5), (235.5, 540.0)]))
+    assert "w530" in {u.text for u in t.units()}
+
+
+def test_35t_a_tail_that_is_a_read_half_still_splits_it_when_that_half_degenerated(source, tmp_path):
+    cache = tmp_path / "cloud" / joint.GEMINI_35T
+    cache.mkdir(parents=True)
+    put_35t(cache, 0.0, 540.0, [(x * 0.2, x * 0.2 + 0.1, "あ") for x in range(1, 40)])  # degenerate
+    put_35t(cache, 0.0, 300.0, [(x, x + 0.5, f"w{x}") for x in range(1, 245)])
+    # the half repeats from 241 s and stops at 250 s; its own halves hear it right
+    put_35t(cache, 240.0, 540.0, [(x, x + 0.5, "また") for x in range(241, 250)] + [(249.5, 250.0, "w250")],
+            status="incomplete")
+    put_35t(cache, 240.0, 420.0, [(x, x + 0.5, f"w{x}") for x in range(241, 419)])
+    put_35t(cache, 360.0, 540.0, [(x, x + 0.5, f"w{x}") for x in range(361, 539)])
+    t = gemini35t.transcribe(source, cache_root=tmp_path / "cloud", language="ja", duration=540.0, repair="off",
+                             offline=True, speech=mosspro.SpeechSpans(source, [(0.0, 540.0)]))
+    texts = [u.text for u in t.units()]
+    assert "また" not in texts and {"w241", "w245", "w530"} <= set(texts)  # the split half is replaced, not kept
+    assert len(texts) == len(set(texts))
+    assert [e["split"] for e in t.log if "split" in e] == [[0.0, 540.0], [240.0, 540.0]]  # the half, as before
+
+
+def test_35t_a_tail_that_would_be_a_read_half_again_is_not_asked(source, tmp_path):
+    cache = tmp_path / "cloud" / joint.GEMINI_35T
+    cache.mkdir(parents=True)
+    put_35t(cache, 0.0, 540.0, [(x * 0.2, x * 0.2 + 0.1, "あ") for x in range(1, 40)])  # degenerate
+    put_35t(cache, 0.0, 300.0, [(x, x + 0.5, f"w{x}") for x in range(1, 245)])
+    put_35t(cache, 240.0, 540.0, [(x, x + 0.5, f"w{x}") for x in range(241, 250)] + [(249.5, 250.0, "w250")])
+    t = gemini35t.transcribe(source, cache_root=tmp_path / "cloud", language="ja", duration=540.0, repair="off",
+                             offline=True, speech=mosspro.SpeechSpans(source, [(0.0, 540.0)]))
+    assert {"tail_read_already": [240.0, 540.0]} in t.log
+
+
+def test_35t_tail_after_a_split_window_is_not_its_cached_half_again(source, tmp_path):
+    cache = tmp_path / "cloud" / joint.GEMINI_35T
+    cache.mkdir(parents=True)
+
+    def put(a, b, words, status="completed"):
+        (cache / f"w-{a:.1f}-{b:.1f}.raw.json").write_text(
+            json.dumps(answer([(x - a, y - a, text, "spk:0") for x, y, text in words], status)), encoding="utf-8")
+
+    put(0.0, 540.0, [(x * 0.2, x * 0.2 + 0.1, "あ") for x in range(1, 40)])  # degenerate
+    put(0.0, 300.0, [(x, x + 0.5, f"w{x}") for x in range(1, 255)])
+    put(240.0, 540.0, [(x, x + 0.5, f"w{x}") for x in range(241, 260)])  # both stop by 259.5 s
+    put(249.5, 540.0, [(x, x + 0.5, f"w{x}") for x in range(251, 539)])  # the tail, from the last word - 10 s
+    t = gemini35t.transcribe(source, cache_root=tmp_path / "cloud", language="ja", duration=540.0, repair="off",
+                             offline=True, speech=mosspro.SpeechSpans(source, [(0.0, 245.5), (246.5, 540.0)]))
+    assert {"tail": [259.5, 540.0]} in t.log and "w530" in {u.text for u in t.units()}
+
+
+def test_mai2_windows_are_cut_at_silero_pauses(source, tmp_path):
+    def fetch(self, name, call):
+        return {"words": []}
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(CallCache, "fetch", fetch)
+    try:
+        t = mai2.transcribe(source, cache_root=tmp_path, language="en", via="openrouter", repair="off", caller=object(),
+                            duration=9000.0, speech=mosspro.SpeechSpans(source, [(0.0, 7119.0), (7121.0, 9000.0)]))
+    finally:
+        mp.undo()
+    assert t.log == [{"windows": [[0.0, 7120.0], [7060.0, 9000.0]]}]
+
+
+@pytest.mark.parametrize("mark, start", [(True, 7045.0), (False, 7035.0)])
+def test_mai2_the_next_window_starts_at_a_pause_the_words_before_break_at(source, tmp_path, mark, start):
+    def fetch(self, name, call):
+        a = float(name.split("-")[1])
+        words = [{"start": x - a, "end": x - a + 0.5, "word": "w" if x != 7044 or not mark else "w.", "speaker": 1}
+                 for x in range(int(a) + 1, int(a) + 7139)]
+        return {"words": words}
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(CallCache, "fetch", fetch)
+    try:
+        # pauses at 7120 s (the end), 7035 s (1 s) and 7045 s (0.4 s, after the word ending a sentence at 7044.5 s)
+        spans = [(0.0, 7034.5), (7035.5, 7044.8), (7045.2, 7119.0), (7121.0, 9000.0)]
+        t = mai2.transcribe(source, cache_root=tmp_path, language="en", via="openrouter", repair="off", caller=object(),
+                            duration=9000.0, speech=mosspro.SpeechSpans(source, spans))
+    finally:
+        mp.undo()
+    assert t.log == [{"windows": [[0.0, 7120.0], [start, 9000.0]]}]
 
 
 # --- MOSS Pro -----------------------------------------------------------------------------------------------
@@ -860,6 +1075,61 @@ def test_moss_gap_after_a_stalled_continuation_is_asked_again_for_real(source, t
         assert [u.text for u in t.units()] == ["前半", "後半"]
 
 
+@pytest.mark.parametrize("name", ["s-99.7-200.3", "s-100.0-200.0"], ids=["out-to-pauses", "old-name"])
+def test_moss_gap_edges_go_out_to_the_pauses_they_lie_in_and_an_old_call_replays(source, tmp_path, name):
+    answers = {"s-0.0-600.0": moss_answer([(0, 100, "一", "S01"), (200, 600, "三", "S01")]),
+               name: moss_answer([(10, 90, "二", "S02")])}
+    voiced = [(0.0, 99.0), (100.4, 150.0), (160.0, 199.6), (201.0, 600.0)]  # the gap's edges in pauses at 99.7, 200.3
+    t, calls = transcribe_moss(source, tmp_path, answers, 600.0, voiced=voiced)
+    assert calls == ["s-0.0-600.0", name] and [u.text for u in t.units()] == ["一", "二", "三"]
+
+
+def test_moss_gap_cached_at_its_own_edges_reads_from_them_unrounded(source, tmp_path):
+    # codex acceptance review: the old call s-100.0-200.0 was asked from 100.04 s; read from 100.0 s, what it
+    # recovered overlapped "一" by 0.04 s and was dropped
+    answers = {"s-0.0-600.0": moss_answer([(0, 100.04, "一", "S01"), (200, 600, "三", "S01")]),
+               "s-100.0-200.0": moss_answer([(0, 90, "二", "S02")])}
+    t, calls = transcribe_moss(source, tmp_path, answers, 600.0, voiced=[(0.0, 600.0)])
+    assert calls == ["s-0.0-600.0", "s-100.0-200.0"] and [u.text for u in t.units()] == ["一", "二", "三"]
+
+
+def test_moss_gap_call_lookup_stays_inside_the_piece(source, tmp_path):
+    # codex acceptance review: the tail gap 1140-1200 s of the piece ending at 1200 s must not read the next
+    # piece's main call s-1140.0-1200.1 (inside the names' 0.1 s) for its own s-1140.0-1200.0
+    answers = {"s-0.0-1200.0": moss_answer([(0, 1140, "一", "S01")]),
+               "s-1140.0-1200.0": moss_answer([(1, 50, "二", "S01")]),
+               "s-1140.0-1200.1": moss_answer([(1, 50, "二", "S01")])}
+    t, calls = transcribe_moss(source, tmp_path, answers, 1200.1, voiced=[(0.0, 1200.1)])
+    assert calls[:2] == ["s-0.0-1200.0", "s-1140.0-1200.0"]
+
+
+@pytest.mark.parametrize("gap", ["s-6.0-600.0", "s-5.0-600.0-again"], ids=["old-name", "new"])
+def test_moss_gap_edges_stay_in_the_piece_and_never_find_its_own_main_call(source, tmp_path, gap):
+    # the capped first piece's rest [5, 600] has a gap 6-600 s whose left edge lies in a pause (3-6.5 s) with its
+    # middle before the piece: it stops at 5 s, the piece's own start, so the span is the main call's again
+    answers = {"s-0.0-600.0": moss_answer([(0, 5, "前半", "S01"), (300, 0, "壊 れ た", "S02")], tokens=16384),
+               "s-5.0-600.0": moss_answer([(0, 1, "続き", "S01")]), gap: moss_answer([(10, 20, "後半", "S01")])}
+    t, calls = transcribe_moss(source, tmp_path, answers, 600.0, voiced=[(0.0, 3.0), (6.5, 600.0)])
+    assert calls == ["s-0.0-600.0", "s-5.0-600.0", gap]
+
+
+@pytest.mark.parametrize("first, start", [([(0, 1129.9, "一", "S01"), (1130.3, 1199, "一の続き", "S01")], 1130.0),
+                                          ([(0, 1199, "一", "S01")], 1115.0)], ids=["breaks", "no-break"])
+def test_moss_next_piece_starts_at_a_pause_the_previous_pieces_segments_break_at(source, tmp_path, ledger_path,
+                                                                                monkeypatch, first, start):
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a", "b")
+    ledger.record(keys[0], ROOM - 1200)
+    ledger.record(keys[1], ROOM - 2000)
+    script = {(0.0, 1200.0): [moss_answer(first)], (start, 2800.0): [moss_answer([(0, 2800 - start, "二", "S01")])]}
+    server = ScriptServer(monkeypatch, script)
+    # pauses at 1115 s (1 s) and 1130 s (0.4 s), both 60-90 s before the cut at 1200 s
+    speech = mosspro.SpeechSpans(source, [(0.0, 1114.5), (1115.5, 1129.8), (1130.2, 2800.0)], voices(2800.0, []))
+    mosspro.transcribe(source, cache_root=tmp_path / "cloud", language="ja", duration=2800.0, speech=speech,
+                       caller=fill_caller(ledger, keys, server, paid=False), voiceprints=FakeVoiceprints(available=False))
+    assert server.calls == [(0.0, 1200.0, "key-a"), (start, 2800.0, "key-b")]
+
+
 def test_moss_gap_is_rerequested_only_when_silero_hears_speech(source, tmp_path):
     answers = {"s-0.0-600.0": moss_answer([(0, 100, "あ", "S01"), (200, 590, "い", "S01")]),
                "s-100.0-200.0": moss_answer([(10, 20, "拾った", "S02")])}
@@ -883,15 +1153,67 @@ def test_moss_speakers_after_a_capped_answer_are_merged_by_voice(source, tmp_pat
     assert {"merge": [["w1:S01", "w0:S02", 1.0]]} in t.log
 
 
-def test_moss_gap_speakers_are_merged_and_too_little_speech_is_a_new_person(source, tmp_path):
+def test_moss_gap_speakers_are_merged_and_too_little_voice_is_unknown(source, tmp_path):
     answers = {"s-0.0-600.0": moss_answer([(0, 100, "あ", "S01"), (200, 590, "い", "S02")]),
                "s-100.0-200.0": moss_answer([(10, 50, "う", "S01"), (60, 62, "え", "S02")])}
     pcm = voices(600, [(0, 100, 1), (110, 150, 2), (160, 162, 1), (200, 590, 2)])
     t, _ = transcribe_moss(source, tmp_path, answers, 600.0, voiced=[(110, 150)], pcm=pcm,
                            voiceprints=FakeVoiceprints())
-    # 2 s of S02 in the gap: not enough to match, though it is person 1's voice
-    assert [u.speaker for u in t.units()] == ["S01", "S02", "c1:S02", "S02"]
-    assert {"merge": [["c1:S01", "S02", 1.0]]} in t.log
+    # 2 s of S02 in the gap: too little to tell who it is, though it is person 1's voice
+    assert [u.speaker for u in t.units()] == ["S01", "S02", None, "S02"]
+    assert {"merge": [["c1:S01", "S02", 1.0]]} in t.log and {"unknown": [["c1:S02", 2.0]]} in t.log
+
+
+def test_a_re_requests_label_under_rescue_min_of_voice_is_unknown_and_only_it():
+    from finesub.speech.joint import relink
+
+    segs = [{"start": 0.0, "end": 40.0, "speaker": "S01"}, {"start": 40.0, "end": 44.0, "speaker": "S02"},
+            {"start": 50.0, "end": 54.5, "speaker": "c1:S01"},  # 4.5 s: unknown
+            {"start": 60.0, "end": 66.0, "speaker": "w1:c2:S01"}]  # 6 s (behind a part's prefix): merged
+    pcm = voices(80, [(0, 40, 1), (40, 44, 2), (50, 54.5, 1), (60, 66, 1)])
+    merges, unknown = relink.merge_by_voice(segs, lambda: pcm, FakeVoiceprints(), "test")
+    assert unknown == [("c1:S01", 4.5)] and merges == [("w1:c2:S01", "S01", 1.0)]
+    assert [s["speaker"] for s in segs] == ["S01", "S02", None, "S01"]  # S02, 4 s of the main call: kept
+
+
+@pytest.mark.parametrize("cos, merged", [(0.88, False), (0.92, True)])
+def test_the_moss_voice_merge_takes_only_pairs_from_0_9(cos, merged):
+    """`relink.MERGE_THETA` (owner 2026-11-21): below 0.9 about one merge in ten joined two people, so those pairs
+    are left to the speaker judge, shown as 高."""
+    from types import SimpleNamespace
+
+    from finesub.speech.joint import relink
+
+    vec = {1: np.array([1.0, 0.0]), 2: np.array([cos, (1 - cos * cos) ** 0.5])}
+    prints = SimpleNamespace(error=None, embed=lambda: lambda piece, mask: vec[int(round(float(np.median(piece)) * 32.768))])
+    segs = [{"start": 0.0, "end": 10.0, "speaker": "S01"}, {"start": 20.0, "end": 30.0, "speaker": "w1:S01"}]
+    merges, _ = relink.merge_by_voice(segs, lambda: voices(40, [(0, 10, 1), (20, 30, 2)]), prints, "test")
+    assert bool(merges) == merged and len({s["speaker"] for s in segs}) == (1 if merged else 2)
+
+
+def test_a_short_re_requests_line_that_says_a_replaced_segment_again_takes_its_label():
+    from finesub.speech.joint import relink
+
+    segs = [{"start": 0.0, "end": 40.0, "speaker": "S01"}, {"start": 40.0, "end": 44.0, "speaker": "S02"},
+            {"start": 50.0, "end": 52.0, "speaker": "c1:S01", relink.TWIN: "S02"},  # says S02's line again
+            {"start": 52.0, "end": 54.0, "speaker": "c1:S01"},  # in the gap: nothing to say again
+            {"start": 60.0, "end": 62.0, "speaker": "c2:S01", relink.TWIN: "c1:S01"},  # its twin is short too
+            {"start": 70.0, "end": 72.0, "speaker": "c3:S01", relink.TWIN: "c9:S02"}]  # its twin was replaced away
+    pcm = voices(80, [(0, 40, 1), (40, 44, 2), (50, 52, 2), (52, 54, 1), (60, 62, 1), (70, 72, 1)])
+    _, unknown = relink.merge_by_voice(segs, lambda: pcm, FakeVoiceprints(), "test")
+    assert unknown == [("c1:S01", 4.0), ("c2:S01", 2.0), ("c3:S01", 2.0)]
+    assert [s["speaker"] for s in segs] == ["S01", "S02", "S02", None, None, None]
+
+
+def test_a_merge_that_fails_keeps_the_labels_already_made_unknown(monkeypatch):
+    from finesub.speech.joint import relink
+
+    monkeypatch.setattr(relink, "merge_labels", lambda *a: (_ for _ in ()).throw(RuntimeError("broken")))
+    monkeypatch.setattr(relink, "current_reporter", lambda: type("R", (), {"warning": lambda self, *a: None})())
+    segs = [{"start": 0.0, "end": 40.0, "speaker": "S01"}, {"start": 50.0, "end": 52.0, "speaker": "c1:S01"}]
+    pcm = voices(60, [(0, 40, 1), (50, 52, 1)])
+    assert relink.merge_by_voice(segs, lambda: pcm, FakeVoiceprints(), "test") == ([], [("c1:S01", 2.0)])
+    assert segs[1]["speaker"] is None
 
 
 def test_moss_labels_one_call_split_a_person_into_are_merged(source, tmp_path):
@@ -922,7 +1244,7 @@ def test_voiceprint_model_failure_is_said_once_per_transcript(monkeypatch):
     prints = relink.Voiceprints()
     for _ in range(2):  # two transcripts
         segs = [{"start": 0.0, "end": 5.0, "speaker": "S01"}, {"start": 6.0, "end": 9.0, "speaker": "c1:S01"}]
-        assert relink.merge_by_voice(segs, lambda: None, prints, "MOSS Pro") == []
+        assert relink.merge_by_voice(segs, lambda: None, prints, "MOSS Pro") == ([], [])
     assert len(loads) == 1 and len(warned) == 2 and "offline" in warned[0][1]
 
 
@@ -975,7 +1297,8 @@ def test_the_voice_merge_holds_no_model_once_it_is_released(monkeypatch):
     monkeypatch.setattr(relink, "_wespeaker", wespeaker)
     prints = relink.Voiceprints("cuda")
     segs = [{"start": 0.0, "end": 5.0, "speaker": "S01"}, {"start": 6.0, "end": 11.0, "speaker": "S02"}]
-    assert relink.merge_by_voice(segs, lambda: np.zeros(16000 * 30, np.int16), prints, "test") == [("S02", "S01", 1.0)]
+    merged = relink.merge_by_voice(segs, lambda: np.zeros(16000 * 30, np.int16), prints, "test")
+    assert merged == ([("S02", "S01", 1.0)], [])
     prints.release()
     gc.collect()
     assert models[0]() is None
@@ -1033,10 +1356,10 @@ def test_mai2_an_answer_cached_on_one_route_replays_on_the_other(source, tmp_pat
 def test_mai2_routes_share_every_window_of_a_long_source(source, tmp_path, other):
     azure = {"phrases": [{"speaker": 0, "words": [{"text": "hi", "offsetMilliseconds": 1000, "durationMilliseconds": 200}]}]}
     asked = mai2.transcribe(source, cache_root=tmp_path, language="en", via="vercel", repair="off",
-                            caller=lambda clip, locale: azure, duration=10000.0)
+                            caller=lambda clip, locale: azure, duration=10000.0, speech=silent(source))
     assert len(list((tmp_path / joint.MAI2).glob("w-*.raw.json"))) == 2
     replayed = mai2.transcribe(source, cache_root=tmp_path, language="en", via=other, repair="off", offline=True,
-                               duration=10000.0)
+                               duration=10000.0, speech=silent(source))
     assert [(u.start, u.text) for u in replayed.units()] == [(u.start, u.text) for u in asked.units()]
 
 
@@ -1045,14 +1368,14 @@ def test_mai2_keeps_the_window_its_cached_answers_were_cut_with(source, tmp_path
     azure = {"phrases": [{"speaker": 0, "words": [{"text": "hi", "offsetMilliseconds": 1000, "durationMilliseconds": 200}]}]}
     monkeypatch.setattr(mai2, "WINDOW", 1800.0)
     asked = mai2.transcribe(source, cache_root=tmp_path, language="en", via="openrouter", repair="off",
-                            caller=lambda clip, locale: azure, duration=4000.0)
+                            caller=lambda clip, locale: azure, duration=4000.0, speech=silent(source))
     monkeypatch.undo()
 
     def refuse(clip, locale):
         raise AssertionError("asked again")
 
     again = mai2.transcribe(source, cache_root=tmp_path, language="en", via="vercel", repair="off", caller=refuse,
-                            duration=4000.0)
+                            duration=4000.0, speech=silent(source))
     assert again.log == asked.log == [{"windows": [[0.0, 1800.0], [1740.0, 3540.0], [3480.0, 4000.0]]}]
     assert [(u.start, u.text) for u in again.units()] == [(u.start, u.text) for u in asked.units()]
 
@@ -1068,7 +1391,7 @@ def test_mai2_long_source_is_windowed_and_stitched(source, tmp_path):
     mp.setattr(CallCache, "fetch", fetch)
     try:
         t = mai2.transcribe(source, cache_root=tmp_path, language="en", via="openrouter", repair="off", caller=object(),
-                            duration=9000.0)
+                            duration=9000.0, speech=silent(source))
     finally:
         mp.undo()
     texts = [u.text for u in t.units()]

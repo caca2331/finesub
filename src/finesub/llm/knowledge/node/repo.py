@@ -335,11 +335,15 @@ class KnowledgeRepo:
             marks=line_marks(self.store, subject_id, rev),
         )
 
-    def entry_injection_text(self, subject_id: str, rev: int | None = None) -> str:
+    def entry_injection_text(
+        self, subject_id: str, rev: int | None = None, *, correct_only: bool = False, trust_marks: bool = False
+    ) -> str:
         """PROMPT projection without handles: bare grammar lines, exactly what
-        model injection paths have always carried (no bullets, no @k noise)."""
+        model injection paths have always carried (no bullets, no @k noise).
+        ``correct_only`` / ``trust_marks``: as `render_subject`."""
 
-        return render_subject(self.store, subject_id, rev=rev, mode="prompt")
+        return render_subject(self.store, subject_id, rev=rev, mode="prompt", correct_only=correct_only,
+                              trust_marks=trust_marks)
 
     def entry_prompt_text(
         self, subject_id: str, handles: HandleMap, rev: int | None = None, *, alias_row_handle: bool = True
@@ -350,7 +354,10 @@ class KnowledgeRepo:
             alias_row_handle=alias_row_handle,
         )
 
-    def load_entry_texts(self, names: Iterable[str], rev: int | None = None) -> tuple[dict[str, str], list[str]]:
+    def load_entry_texts(
+        self, names: Iterable[str], rev: int | None = None, *, correct_only: bool = False,
+        trust_marks: bool = False,
+    ) -> tuple[dict[str, str], list[str]]:
         """Model-facing bulk read (research / search / correction injection):
         the PROMPT projection. Human faces read ``entry_text`` instead."""
 
@@ -362,7 +369,9 @@ class KnowledgeRepo:
                 missing.append(name)
                 continue
             if resolved.key not in found:
-                found[resolved.key] = self.entry_injection_text(resolved.subject_id, rev)
+                found[resolved.key] = self.entry_injection_text(
+                    resolved.subject_id, rev, correct_only=correct_only, trust_marks=trust_marks
+                )
         return found, missing
 
     # ---- derived markdown cache ------------------------------------------------------------

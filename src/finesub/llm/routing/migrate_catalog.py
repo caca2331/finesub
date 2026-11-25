@@ -139,9 +139,13 @@ RENAMED_TARGETS: Dict[str, str] = {
         for old, new in RENAMED_MODELS.items()
     },
     **{
-        f"local-agy-{infix}-gemini-{version}": f"local-agy-gemini-{version}"
+        f"local-agy-{infix}-gemini-3_8-flash": "local-agy-gemini-3_8-flash"
         for infix in ("media", "native")
-        for version in ("3_8-flash", "4-argon")
+    },
+    # Gemini 4 Argon was dropped (2026-11-23); Neon is the stronger agy Gemini left.
+    **{
+        f"local-agy-{infix}gemini-4-argon": "local-agy-gemini-4-neon"
+        for infix in ("", "media-", "native-")
     },
     **{
         f"local-dsh-native-{model}": f"local-dsh-{model}"

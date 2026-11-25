@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from ...subtitles.metrics import weighted_char_count
-from .stitch import by_label, link
 
 #: `--asr-repair`: `on` repairs at no quota (35t through Live), `quota` also re-asks 35t on its daily requests.
 MODES = ("on", "quota", "off")
@@ -316,11 +315,8 @@ def blocks(units: Sequence[dict]) -> list[dict]:
     return sorted((b for b in out if b["end"] - b["start"] >= BLOCK), key=lambda b: b["start"])
 
 
-def relabel(known: Sequence[dict], new: Sequence[dict], lo: float, hi: float, voices) -> dict[str, str]:
-    """A re-ask of [lo, hi]'s labels (in `new`) onto the transcript's (`known`): by the seconds both talk in the
-    span (`stitch.link`), then by voice (`relink.Voices.match`); a label in neither is not in the map."""
-    mapping = {c: p for p, c in link(by_label(known, lo, hi), by_label(new, lo, hi))}
-    rest = {w["speaker"] for w in new if w["speaker"] is not None and w["speaker"] not in mapping}
-    if rest:
-        mapping.update(voices.match([b for b in blocks(new) if b["speaker"] in rest]))
-    return mapping
+def relabel(new: Sequence[dict], voices) -> dict[str, str]:
+    """A re-ask's labels (in `new`) onto the transcript's by voice (`relink.Voices.match`); a label it does not
+    match is not in the map. Not by the seconds both talk in the padding: the same link across windows was dropped
+    (`stitch`), and one call's labels mix people (owner 2026-11-21)."""
+    return voices.match(blocks(new))

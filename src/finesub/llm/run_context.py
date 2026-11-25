@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import threading
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 from finesub.reporting import Reporter, bind_reporter, current_reporter
 
@@ -304,7 +304,7 @@ class LlmWorkerContext:
     """
 
     reporter: Reporter
-    pins: Mapping[str, int]
+    knowledge: Any  # knowledge.base.KnowledgeRun: the pinned revisions and the task's reading
     registry: Any
     account: "TaskSlotAccount | None" = None
     _leased: list[int] = field(default_factory=list)
@@ -336,7 +336,7 @@ def llm_worker_context() -> LlmWorkerContext:
     """
 
     from .agent.agent_session_host import current_registry
-    from .knowledge.base import active_generation_pins
+    from .knowledge.base import active_knowledge_run
 
     registry = current_registry()
     account = current_task_account()
@@ -357,7 +357,7 @@ def llm_worker_context() -> LlmWorkerContext:
             )
     return LlmWorkerContext(
         reporter=current_reporter(),
-        pins=active_generation_pins(),
+        knowledge=active_knowledge_run(),
         registry=registry,
         account=current_task_account(),
     )
@@ -373,10 +373,10 @@ def bind_llm_worker(context: LlmWorkerContext) -> None:
     """
 
     from .agent.agent_session_host import bind_agent_session_registry
-    from .knowledge.base import bind_generation_pins
+    from .knowledge.base import bind_knowledge_run
 
     bind_reporter(context.reporter)
-    bind_generation_pins(context.pins)
+    bind_knowledge_run(context.knowledge)
     bind_agent_session_registry(context.registry)
     _TASK_ACCOUNT.set(context.account)
     if context.registry is not None:

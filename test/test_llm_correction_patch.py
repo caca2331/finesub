@@ -307,3 +307,41 @@ def test_a_placeholder_answer_is_rewritten_not_patched() -> None:
     window = _window()
     _result, base = _base(_answer([f"sub|{index}|text|text|high|" for index in range(1, 7)]), window)
     assert base is None
+
+
+def test_a_capsule_s_repair_input_shows_the_split_guidance_once_in_either_round(tmp_path) -> None:
+    """What a capsule's model reads (its stdin): the error list and the round's instruction. A patch round's
+    instruction holds the guidance and its list does not; a whole-answer round lists it under the stock wording."""
+
+    import json
+
+    from finesub.llm.agent.local_agent import AgentCapsuleManager
+    from finesub.llm.stages.correction.attempts import _Repair
+
+    window = _window(4)
+    text = _answer([_sub("1,2", "啊" * 40), _sub("3"), _sub("4")])
+    result, base = _base(text, window)
+    assert base is not None
+    head = "上面越过绝对门槛的合并行要拆开"
+    manager = AgentCapsuleManager(tmp_path / "runtime")
+    for round_base in (base, None):
+        repair = _Repair(text, result.repair_messages(guidance=False), round_base, guidance=result.split_guidance)
+        _capsule, stdin = manager.create(
+            manager.resolve_location(), [{"role": "user", "content": "hi"}], task="correction",
+            native_search=False, profile_id="test", max_result_bytes=1024, timeout_seconds=900,
+            previous_output=text, validation_errors=repair.all_errors, repair_instruction=repair.instruction(),
+        )
+        payload = json.loads(stdin)
+        shown = "\n".join([*payload["validation_errors"], payload["repair_instruction"]])
+        assert shown.count(head) == 1
+        assert ("<patch>" in payload["repair_instruction"]) is (round_base is not None)
+
+
+def test_a_long_merge_round_is_still_a_patch_and_its_instruction_carries_the_split_guidance_once() -> None:
+    window = _window(4)
+    text = _answer([_sub("1,2", "啊" * 40), _sub("3"), _sub("4")])
+    result, base = _base(text, window)
+    assert result.split_guidance and base is not None and base.pending == ("1", "2")
+    instruction = patch_instruction(base, result.repair_messages())
+    assert instruction.count("上面越过绝对门槛的合并行要拆开") == 1
+    assert instruction.index("absolute limit") < instruction.index("上面越过绝对门槛的合并行要拆开")

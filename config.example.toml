@@ -18,19 +18,25 @@ tavily = true
 # proxy = "http://127.0.0.1:7890"
 
 [asr]
-# 谁来转写:local(本机 GPU 上的 Whisper,默认)、云端的 mai2 / gemini-35t(gemini) / moss-pro(moss),
-# 或本机 GPU 上的开源 MOSS moss-local(计算能力 8.0 以上的 NVIDIA 卡)。
+# 谁来转写:local(本机 GPU 上的 Whisper,默认)、云端的 mai2 / scribe / gemini-35t(gemini) / moss-pro(moss),
+# 或本机 GPU 上的开源 MOSS moss-local(8 GB 以上的 RTX 30 系列以上 N 卡),
+# 或两者的组合 moss-diarization-aligner(配下面的 rows)。
 # 云端转写会把音频发给提供方,见 docs/manual/asr-backend-choice.md。任务已有的产物记着哪个后端就用哪个。
 # backend = "local"
-# MOSS Pro 与 moss-local 的长段用本机的强制对齐模型(Qwen3-ForcedAligner,要 [asr] 依赖,用 GPU)对时间:
-# auto(只给 moss-local)/ on(moss-pro、moss-local 与 gemini-35t 的修补)/ off(都用 Silero)。
+# moss-local、moss-pro 的超长段与 gemini-35t 修补补回的文字,用本机的强制对齐模型(Qwen3-ForcedAligner,要 [asr] 依赖)对时间:
+# auto(有 GPU 时在卡上、并由 Whisper 再修 MOSS 两家没把握的切点,英语不修;没有时在 CPU 上)/ on(英语也修)/ off(都用 Silero)。
 # aligner = "auto"
-# 补云端漏转的话与失控的复读(mai2、gemini-35t):on / quota(gemini-35t 也花每天的请求数)/ off。
+# 补云端漏转的话与失控的复读(mai2、gemini-35t;scribe 是时间被挤坏的那段再转一次):
+# on(mai2 的补问约多 6% 费用)/ quota(gemini-35t 也花每天的请求数)/ off。
 # repair = "on"
-# MAI2 里同一个人被拆开的说话人标签按声纹合并:auto(不合并)/ on / off。MOSS 两家总是合并。
-# speaker_merge = "auto"
 # MOSS Pro 池里最后一把 key 在一次调用放不进前面几把剩下的免费额度时照常调用,超出部分扣它的预付余额;false 时免费额度用完就停。
 # moss_pro_paid = true
+# --asr moss-diarization-aligner(文字用云端一家、说话人由本机的开源 MOSS 定)的文字从哪家来:mai2 / scribe / gemini-35t。
+# 只给这个后端用;写在这里不会让别的后端报错。
+# rows = "mai2"
+# 同一个后端:同一个人被别人插话切开的几行合成一条字幕、插话与它同时显示。
+# overlap_cue = true
+# 它的 --asr-transcript 每个源一份,没有对应的键:写在命令行,或 manifest 那一行的 asr_transcript。
 
 [llm]
 # 本机 agent（Codex / Claude Code / Antigravity）怎么用：**换预设，不是换档位**。

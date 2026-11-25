@@ -84,20 +84,6 @@ capability = "medium"
 quota_pool = "AGY_GEMINI"
 note = "agy 上唯一的 3.x Flash：3.7 Flash 2026-10-12 从 agy 的模型表下线，3.6 Flash 2026-10-23 前后下线（owner 2026-10-24：只留 3.8）。2026-11-13 起出厂 agy 组里 agy 的 Gemini 换成 Hydrogen，它不在出厂组里。"
 
-[models.local-agy-gemini-4-argon]
-provider_tier = "LOCAL_AGY"
-display_name = "Gemini 4 Argon via agy"
-api_model_id = "gemini-4-argon"
-max_input_tokens = 1048576
-context_window = 1048576
-supports_audio = true
-supports_video = true
-video_high_resolution_only = true
-thinking = ["medium", "medium", "low"]
-capability = "high"
-quota_pool = "AGY_ARGON"
-note = "Pro 订阅上只有周额度、单独一个池（AGY_ARGON，2026-10-18）。每个出厂 agy 组都把它排在 agy 的 Gemini 4 Hydrogen 后面当替补（owner 2026-10-18 定替补，当时排在 3.8 Flash 后面）：池不同，Gemini 那份额度用完它还在。"
-
 [models.local-agy-gemini-4-hydrogen]
 provider_tier = "LOCAL_AGY"
 display_name = "Gemini 4 Hydrogen via agy"
@@ -115,6 +101,25 @@ note = """
 所以记在 Gemini 那份（AGY_GEMINI，与 3.8 Flash 同池，没用请求核实过）。窗口与媒体能力照 3.8 Flash 填，没单独核实；
 思考映射与 3.8 Flash 相同，同档比较。出厂 agy 组里 agy 的 Gemini 就是它（owner 2026-11-13，代替 3.8 Flash：同定位、同价，
 在 agy 上同样的纠错思考约是 3.8 的四分之一到一半，读者判质量分不出高低）。
+"""
+
+[models.local-agy-gemini-4-neon]
+provider_tier = "LOCAL_AGY"
+display_name = "Gemini 4 Neon via agy"
+api_model_id = "gemini-4-neon"
+max_input_tokens = 1048576
+context_window = 1048576
+supports_audio = true
+supports_video = true
+video_high_resolution_only = true
+thinking = ["medium", "medium", "low"]
+capability = "high"
+quota_pool = "AGY_GEMINI"
+note = """
+2026-11-23 接线，比 Hydrogen 强的 agy Gemini。每个出厂 agy 组里紧跟 Hydrogen，当它的故障替补（超时、
+不可用、限速与其他临时失败；owner 2026-11-23），不是额度替补：同一份额度，用完时 agy 的报错不明说，
+两个通常各失败一次、探一次后一起冻结。也可以 `--llm-model` 点名。
+窗口与媒体能力照 Hydrogen 填，没单独核实；thinking 映射与 Hydrogen 相同，封在 medium（owner 2026-11-23）。
 """
 
 [models.local-agy-opus-5_5]

@@ -44,9 +44,18 @@
 | `python -m pytest -q cli/tests` | 薄 CLI 的独立套件，根 `pytest -q` 收集不到 |
 | `ruff check` | 静态检查，在仓库根跑（不到一秒）：只开 pyflakes 的 F 规则（未定义的名字、没用的 import 与变量、被覆盖的定义），范围 `src/` `test/` `cli/`，`tools/` 与 `explore/` 不查，配置在 `pyproject.toml` 的 `[tool.ruff]`。版本钉在 `[dev]` extra 里，CI 的 ubuntu 主作业跑同一个版本；`ruff check --fix` 自动删掉没用的 import，删之前先 `git grep` 一下那个名字是不是别处从这个模块 import 的或测试 monkeypatch 的目标 |
 | `python -m pytest tools/session_replay -n 0` | 重打工具的测试，不进默认套件 |
+| `python -m pytest tools/game_glossary -n 0` | 游戏专名列表构建规则（`derive`、`risk_tags`、`apply_rules`、`retag.py`）的测试，不进默认套件；要 `kb-phonetic` extra，没装整份跳过 |
 | `python -m pytest tools/bench` | 离线探针的测试，不进默认套件；依赖在 `[bench]` extra（`pip install -e ".[asr,bench]"`），标准的 `[asr,harness,dev]` 会 `ImportError` |
 
 ⚠ PowerShell 不展开 `test/test_llm_*.py` 这样的 glob：用显式文件列表或 `-m llm`。
+
+## 在 worktree 里跑
+
+开发环境的 editable 安装是从主 checkout 装的（`.pth` 指向主 checkout 的 `src`），所以在 linked worktree 里：
+
+- 经 pytest 跑的测试 import worktree 自己的 `src`（`pyproject.toml` 的 `pythonpath = ["src"]`），不用另设。
+- 不经 pytest 的 `python -m` / `python -c` 静默 import 主 checkout 的代码，跑出来的是旧代码的产物。先把 `PYTHONPATH` 设成 worktree 的 `src`（Git Bash 里写 `/c/…` 形式、冒号分隔），再用 `python -c "import finesub; print(finesub.__file__)"` 确认路径落在 worktree 里。
+- 子进程（例如 `python -m finesub_bootstrap.model_ensure`）不继承父进程里 `sys.path.insert` 加的路径，要用环境变量 `PYTHONPATH`；否则 worktree 新加的东西在子进程里找不到（例如新 manifest 条目报 `unknown model id`）。
 
 ## CI 跑不到、只能本机跑的
 

@@ -7,7 +7,10 @@ providing ``--refined-srt`` switches from the ``artifacts_only`` prompt to the
 ``refined_aligned`` one (which alone sees the refined subtitles, and alone
 may propose into the run's style entry).
 
-Multi-chunk tasks (CSV text over the 100k budget) apply sequentially: each
+The stage opens with the name check (`name_check_step.py`): the 未核 Chinese names this task's searches recorded
+are checked and landed before any proposal. A correct-only task runs that step alone.
+
+Multi-chunk tasks (window material over the chunk budget, `_plan_chunks`) apply sequentially: each
 chunk's proposals land in the knowledge base before the next chunk's entry
 excerpt is rendered, and an apply ledger (``knowledge-update-chunks.jsonl``
 in the task artifact dir) makes reruns skip already-applied chunks instead of
@@ -22,6 +25,7 @@ from contextlib import ExitStack
 import json
 from pathlib import Path
 import sys
+import uuid
 from typing import Any, Callable, Collection, Dict, List, Mapping, Sequence
 
 from finesub import jsonl
@@ -52,12 +56,14 @@ from .base import (
     worktree_blocks_knowledge_write,
 )
 from .entries import (
+    ENTRY_EXCERPT_BLOCK_MAX_TOKENS,
     EntrySelection,
     pin_style_entries,
     render_kb_entry_excerpt,
     select_kb_entries,
 )
 from .style import resolve_style_keys
+from .name_check_step import run_name_check_step
 from .node.proposals import (
     CAS_DROPPED_REASON,
     HIDDEN_LABEL_HELD,
@@ -73,6 +79,7 @@ from .materials import (
     KnowledgeMaterials,
     MODE_REFINED_ALIGNED,
     build_knowledge_materials,
+    plan_knowledge_chunks,
 )
 from ..length_tier import TIER_HELD, tier_line_gate
 from ..prompt_compose import PROMPT_VERSION, load_prompt_template
@@ -367,6 +374,7 @@ def repair_knowledge_proposals(
     line_gate: LineGate | None = None,
     retries: int | None = None,
     avoid_models: Collection[str] = (),
+    write_id: str = "",
 ) -> Dict[str, Any] | None:
     """One repair round for the proposals that did not land: those a concurrent
     writer displaced (B') and those the apply layer rejected.
@@ -385,7 +393,9 @@ def repair_knowledge_proposals(
     where a run without it would have been, so every failure here is a warning.
     One round only: what it gets rejected stays in its report. An answer that does not read is asked again
     with the reason, up to ``retries`` times (`_parse_retries`), as the main round is. ``line_gate``: the
-    main round's hold on some lines (`_style_line_gate`), applied to this round too.
+    main round's hold on some lines (`_style_line_gate`), applied to this round too. ``write_id``: the chunk
+    intent's (`_revision_of_write`), on this round's revision too: a chunk whose main round landed nothing and whose
+    repair did is recognized on a resume as well.
     """
 
     conflicts = conflicted_entries(report)
@@ -498,7 +508,7 @@ def repair_knowledge_proposals(
             knowledge_read_rev=current_rev,
             handles=handles,
             assignment_id=f"{source}:repair",
-            proposal_text_hash=_sha256(result.content),
+            write_id=write_id,
             line_gate=line_gate,
             invalid_ops="reject",  # what it gets rejected stays in its report: one round only
         ).to_dict()
@@ -541,7 +551,7 @@ def _task_fingerprint(
     mode: str,
     task_summary: str,
     refined_text: str,
-    csv_token_budget: int,
+    chunk_token_budget: int,
     difficulty: str = "quality",
     execution_identity_override: Mapping[str, Any] | None = None,
 ) -> str:
@@ -559,7 +569,7 @@ def _task_fingerprint(
             "mode": mode,
             "task_summary": task_summary,
             "refined_sha": _sha256(refined_text) if refined_text else "",
-            "csv_token_budget": csv_token_budget,
+            "chunk_token_budget": chunk_token_budget,
             # Kept for provenance only; it is not an invalidation key.
             "difficulty": difficulty,
             "execution_identity": dict(
@@ -658,34 +668,69 @@ def _chunk_material_hashes(
     before styles existed keeps its hash and stays recognized.
     """
 
-    hashes: List[str] = []
-    for window in chunk.windows:
-        payload: dict[str, Any] = {
-            "mode": materials.mode,
-            "window": window.pack_text(),
-            "general_context": materials.general_context,
-            "research_feedback": materials.feedback.research_slice_text(),
-        }
-        if style_keys:
-            payload["style"] = list(style_keys)
-        hashes.append(_sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True)))
-    return hashes
+    return [_window_material_hash(window, materials, style_keys) for window in chunk.windows]
 
 
-def _revision_with_proposal(
-    knowledge_root: str | Path, proposal_text_hash: str, *, after: int
-) -> int | None:
-    """The revision (> ``after``) that applied the proposal with this raw-text
-    hash, or ``None``. Backs crash recovery between store commit and ledger."""
+def _window_material_hash(window: Any, materials: KnowledgeMaterials, style_keys: Sequence[str] = ()) -> str:
+    """One window's identity (`_chunk_material_hashes`)."""
 
-    if not proposal_text_hash:
+    payload: dict[str, Any] = {
+        "mode": materials.mode,
+        "window": window.pack_text(),
+        "general_context": materials.general_context,
+        "research_feedback": materials.feedback.research_slice_text(),
+    }
+    if style_keys:
+        payload["style"] = list(style_keys)
+    return _sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _revision_of_write(knowledge_root: str | Path, write_id: str, *, after: int) -> int | None:
+    """The last revision (> ``after``) of the write a chunk ledger intent announced (``write_id``, recorded as the
+    revision's note: the main round's and its repair's), or ``None``. Backs crash recovery between store commit and ledger; the id is fresh per
+    intent, so no other task's revision -- not one of the same task id from another directory, not one of the same
+    proposal text -- passes for this one."""
+
+    if not write_id:
         return None
     store = KnowledgeRepo.open(knowledge_root).store
     row = store.conn.execute(
-        "SELECT rev FROM revisions WHERE rev > ? AND note = ? ORDER BY rev LIMIT 1",
-        (after, f"proposal_text:{proposal_text_hash}"),
+        "SELECT MAX(rev) AS rev FROM revisions WHERE rev > ? AND note = ?", (after, f"write:{write_id}"),
     ).fetchone()
-    return int(row["rev"]) if row else None
+    return int(row["rev"]) if row and row["rev"] is not None else None
+
+
+def _landed_intents(ledger_path: Path, knowledge_root: str | Path) -> list[tuple[str, Dict[str, Any], int]]:
+    """The chunk ledger's pending intents whose write landed, with its last revision: a crash between the store
+    commit and the ledger write, recognized by the write id the revision carries (plan §2.5)."""
+
+    landed = []
+    for input_hash, intent in _load_pending_chunk_intents(ledger_path).items():
+        rev = _revision_of_write(knowledge_root, str(intent.get("write_id") or ""),
+                                 after=int(intent.get("rev_before") or 0))
+        if rev is not None:
+            landed.append((input_hash, intent, rev))
+    return landed
+
+
+def _record_recovered(ledger_path: Path, ledger: Dict[str, Dict[str, Any]],
+                      landed: Sequence[tuple[str, Dict[str, Any], int]], *, task_fingerprint: str) -> None:
+    """Write each landed intent's ``recovered_after_commit`` record (`_landed_intents`), into ``ledger`` too."""
+
+    for input_hash, intent, rev in landed:
+        recovered = {
+            "status": "recovered_after_commit",
+            "task_fingerprint": task_fingerprint,
+            "chunk_index": intent.get("chunk_index"),
+            "window_ids": list(intent.get("window_ids") or ()),
+            "input_hash": input_hash,
+            "material_hashes": list(intent.get("material_hashes") or ()),
+            "rev_after": rev,
+            "knowledge_report": None,
+            "applied_entries": [],
+        }
+        _append_chunk_ledger(ledger_path, recovered)
+        ledger[input_hash] = recovered
 
 
 def _applied_entry_pairs(report: Dict[str, Any]) -> List[List[str]]:
@@ -718,13 +763,73 @@ def _chunk_window_range(chunk: KnowledgeChunk) -> str:
     return f"{ids[0]}–{ids[-1]}"
 
 
+def _task_start_rev(ledger_path: Path | None, knowledge_root: str | Path) -> int:
+    """The revision this task's update started from: the earliest a chunk of it was asked at (the chunk ledger's
+    intents), else the store's current one."""
+
+    revs = [int(record["rev_before"]) for record in (jsonl.iter_records(ledger_path) if ledger_path else ())
+            if isinstance(record.get("rev_before"), int)]
+    return min(revs) if revs else KnowledgeRepo.open(knowledge_root).rev
+
+
+def _plan_chunks(
+    materials: KnowledgeMaterials, limits: Any, counter: TokenCounter, *, knowledge_root: str | Path, refined: bool,
+    task_summary: str, aggregated_feedback: str, style_keys: Sequence[str], ledger_path: Path | None,
+    applied: Collection[str] = (),
+) -> tuple[List[KnowledgeChunk], int, List[str]]:
+    """The chunks (`materials.plan_knowledge_chunks`) and what a chunk's windows may carry: the group's cap
+    (`knowledge_chunk_tokens`), or what the input limit leaves beside the rest of the prompt and the entries at their
+    budget cap (`ENTRY_EXCERPT_BLOCK_MAX_TOKENS`), whichever is smaller; an input limit too small to set that cap
+    aside whole gives the windows half of what the rest of the prompt leaves. The rest -- the prompt with no windows and
+    no entries -- is read at the revision the task started from (``ledger_path``: the chunk ledger of a resumed
+    run), so the boundaries are the same before and after an earlier chunk lands, on a resume too. An entry given
+    whole past its cap is the assembled-prompt check's to split.
+
+    ``applied``: the material hashes of windows an earlier run of this task landed (`_window_material_hash`). Those
+    windows are left out before the chunks are cut, so a resume whose boundaries moved (a new rule, a chunk the
+    assembled-prompt check split) sends no landed window again beside a new one; their ids are the third value."""
+
+    start_rev = _task_start_rev(ledger_path, knowledge_root)
+    rest = build_knowledge_update_messages(
+        refined=refined, task_summary=task_summary, window_packs="", general_context=materials.general_context,
+        research_feedback=materials.feedback.research_slice_text(), aggregated_feedback=aggregated_feedback,
+        knowledge_indexes=load_index_texts(knowledge_root, rev=start_rev), multi_chunk=True,
+        style_marks_section=_style_marks_target(knowledge_root, style_keys if refined else [], start_rev)[1],
+        heard=any(window.heard for window in materials.windows))
+    left = limits.prompt_input_limit - counter.count_texts(str(message.get("content", "")) for message in rest)
+    # an input limit too small to set the entries' whole cap aside halves what is left between the entries and the
+    # windows, rather than leaving the windows next to nothing (a window a chunk)
+    budget = min(limits.knowledge_chunk_tokens, max(left - ENTRY_EXCERPT_BLOCK_MAX_TOKENS, left // 2))
+    landed = {window.chunk_id for window in materials.windows
+              if _window_material_hash(window, materials, style_keys) in applied}
+    unlanded = [window for window in materials.windows if window.chunk_id not in landed]
+    chunks = plan_knowledge_chunks(unlanded, count_tokens=counter.count_text, token_budget=budget) if unlanded else []
+    return chunks, budget, [window.chunk_id for window in materials.windows if window.chunk_id in landed]
+
+
 def _split_chunk(chunk: KnowledgeChunk) -> List[KnowledgeChunk]:
     half = len(chunk.windows) // 2
     first, second = chunk.windows[:half], chunk.windows[half:]
     return [
-        KnowledgeChunk(index=chunk.index, windows=first, csv_tokens=0),
-        KnowledgeChunk(index=chunk.index, windows=second, csv_tokens=0),
+        KnowledgeChunk(index=chunk.index, windows=first, material_tokens=0),
+        KnowledgeChunk(index=chunk.index, windows=second, material_tokens=0),
     ]
+
+
+def _name_check_first(*, knowledge_root: Any, artifact_dir: Path, task_id: str, client: Any, execute: bool,
+                      apply: bool, retries: int, resume: bool, correct_only: bool | None) -> tuple[Any, bool]:
+    """The stage's first step: the 未核 names this task's searches recorded, checked and landed before any proposal
+    (`name_check_step.py`), so the update reads the lines as checked; and whether the stage stops there (a
+    correct-only task; None: as the task recorded it, said once since no task said it)."""
+
+    name_check = run_name_check_step(knowledge_root=knowledge_root, artifact_dir=artifact_dir, task_id=task_id,
+                                     client=client, apply=apply, retries=retries, resume=resume) if execute else None
+    if correct_only is None:
+        recorded = recorded_choice(artifact_dir)
+        correct_only = recorded is not None and recorded.correct_only
+        if correct_only:
+            current_reporter().note("knowledge-correct-only", "中文素材只纠错的任务：知识更新只跑中文定名核查，不出提案")
+    return name_check, correct_only
 
 
 def run_knowledge_update(**kwargs: Any) -> Dict[str, Any]:
@@ -741,6 +846,13 @@ def run_knowledge_update(**kwargs: Any) -> Dict[str, Any]:
 
     with default_task_slots(test_profile=bool(kwargs.get("test_profile"))):
         return _run_knowledge_update(**kwargs)
+
+
+def _skipped_report(reason: str, *, warnings: Sequence[str] = (), name_check: Any = None) -> Dict[str, Any]:
+    """The report of a stage that proposed nothing (``skipped``: why)."""
+
+    return {"mode": "", "task_fingerprint": "", "chunks": [], "warnings": list(warnings), "ledger_path": "",
+            "skipped": reason, **({"name_check": name_check} if name_check is not None else {})}
 
 
 def _writable_style_keys(knowledge_root: str | Path, style_names: Sequence[str], *, refined: bool) -> list[str]:
@@ -798,6 +910,7 @@ def _run_knowledge_update(
     #: the update change a style's `[字幕长度]` (`length_tier.tier_line_gate`).
     user_summary: bool = False,
     parse_retries: int | None = None,  # re-asks for an answer that does not read (`_parse_retries`)
+    correct_only: bool | None = None,  # the stage is the name check alone; None: as the task recorded it
 ) -> Dict[str, Any]:
     """Run the unified knowledge update for one finished correction task.
 
@@ -816,14 +929,7 @@ def _run_knowledge_update(
             "确需更新请设 FINESUB_KNOWLEDGE_WRITE=1 后重跑（ledger 未推进）。"
         )
         current_reporter().warning("knowledge-worktree-skipped", message)
-        return {
-            "mode": "",
-            "task_fingerprint": "",
-            "chunks": [],
-            "warnings": [f"Warning: {message}"],
-            "ledger_path": "",
-            "skipped": "worktree_readonly",
-        }
+        return _skipped_report("worktree_readonly", warnings=[f"Warning: {message}"])
 
     paths = derive_task_paths(final_srt)
     stable_json = Path(stable_json).expanduser() if stable_json else paths["stable_json"]
@@ -835,14 +941,19 @@ def _run_knowledge_update(
         if artifact_dir
         else paths["artifact_dir"]
     )
-    recorded = recorded_choice(artifact_path)
-    if recorded is not None and recorded.correct_only:
-        # A Chinese task only corrected and keeps nothing in the base (owner 2026-11-06): the task itself runs
-        # with `--knowledge none`; this stops the module CLI and the reference ingest, which come here directly.
-        message = "这个任务是中文素材只纠错，不更新知识库（中文任务的知识库还没设计）"
-        current_reporter().warning("knowledge-correct-only-skipped", message)
-        return {"mode": "", "task_fingerprint": "", "chunks": [], "warnings": [f"Warning: {message}"],
-                "ledger_path": "", "skipped": "correct_only"}
+    llm_client = client
+    if execute and llm_client is None:
+        # Post-task update uses GENERAL_CAPABLE (3.5 → 3.6 → 3.5-lite).
+        # Create it before the resume fingerprint so identity comes from the
+        # client that will actually execute, but keep prompt-only mode offline.
+        llm_client = RoleClient(test_profile=False)
+    name_check, correct_only = _name_check_first(
+        knowledge_root=knowledge_root, artifact_dir=artifact_path, task_id=task_id or "manual", client=llm_client,
+        execute=execute, apply=apply, retries=parse_retries, resume=resume, correct_only=correct_only)
+    if correct_only:
+        # A Chinese task writes only the name check (owner 2026-11-20): what else a Chinese task should keep in
+        # the base is not designed yet (owner 2026-11-06).
+        return _skipped_report("correct_only", name_check=name_check)
     research_context = (
         Path(research_context).expanduser()
         if research_context
@@ -852,12 +963,6 @@ def _run_knowledge_update(
             run_dir=paths["final_srt"].parent,
         )
     )
-    llm_client = client
-    if execute and llm_client is None:
-        # Post-task update uses GENERAL_CAPABLE (3.5 → 3.6 → 3.5-lite).
-        # Create it before the resume fingerprint so identity comes from the
-        # client that will actually execute, but keep prompt-only mode offline.
-        llm_client = RoleClient(test_profile=False)
     counter = token_counter or default_token_counter(
         execution_settings=getattr(llm_client, "execution_settings", None)
     )
@@ -865,9 +970,8 @@ def _run_knowledge_update(
     # ceiling (2026-08-12): a chunk built at 194k for a group whose smallest
     # member holds 32k passes here and is then skipped at dispatch as
     # ``input_limit`` -- the model the user bound never answers, and a
-    # single-member group fails outright. The CSV cap is the group's too.
+    # single-member group fails outright. The chunk cap is the group's too.
     knowledge_limits = planning_limits_for("knowledge", difficulty)
-    csv_token_budget = knowledge_limits.knowledge_csv_tokens
 
     materials = build_knowledge_materials(
         stable_json=stable_json,
@@ -876,8 +980,6 @@ def _run_knowledge_update(
         research_context=research_context,
         artifact_dirs=[artifact_path],
         refined_srt=refined_srt,
-        count_tokens=counter.count_text,
-        csv_token_budget=csv_token_budget,
     )
     for warning in materials.warnings:
         current_reporter().warning("knowledge-update-material", warning)
@@ -888,28 +990,19 @@ def _run_knowledge_update(
     )
     if refined and execute and apply:
         _book_refined_alignment_evidence(knowledge_root, materials, task_id)
-    task_fingerprint = _task_fingerprint(
-        mode=materials.mode,
-        task_summary=task_summary,
-        refined_text=refined_text,
-        csv_token_budget=csv_token_budget,
-        difficulty=difficulty,
-        execution_identity_override=getattr(
-            llm_client, "execution_identity", None
-        ),
-    )
     writable_style_keys = _writable_style_keys(knowledge_root, style_names, refined=refined)
     ledger_path = artifact_path / CHUNK_LEDGER_FILENAME
     ledger = _load_chunk_ledger(ledger_path) if resume else {}
-    pending_intents = (
-        _load_pending_chunk_intents(ledger_path) if resume else {}
-    )
     applied_material_hashes = {
         str(material_hash)
         for record in ledger.values()
         for material_hash in (record.get("material_hashes") or [])
         if isinstance(material_hash, str) and material_hash
     }
+    # settled before the chunks are cut, so their windows are left out even when the resume's boundaries moved
+    landed_intents = _landed_intents(ledger_path, knowledge_root) if resume else []
+    applied_material_hashes.update(str(h) for _, intent, _ in landed_intents
+                                   for h in intent.get("material_hashes") or () if isinstance(h, str) and h)
     knowledge_repo_prepared = False
 
     research_hints = (
@@ -918,6 +1011,21 @@ def _run_knowledge_update(
         else []
     )
     aggregated_feedback = _aggregated_feedback_text(materials)
+    pending, chunk_token_budget, landed_window_ids = _plan_chunks(
+        materials, knowledge_limits, counter, knowledge_root=knowledge_root, refined=refined, task_summary=task_summary,
+        aggregated_feedback=aggregated_feedback, style_keys=writable_style_keys,
+        ledger_path=ledger_path if resume else None, applied=applied_material_hashes)
+    task_fingerprint = _task_fingerprint(
+        mode=materials.mode,
+        task_summary=task_summary,
+        refined_text=refined_text,
+        chunk_token_budget=chunk_token_budget,
+        difficulty=difficulty,
+        execution_identity_override=getattr(
+            llm_client, "execution_identity", None
+        ),
+    )
+    _record_recovered(ledger_path, ledger, landed_intents, task_fingerprint=task_fingerprint)
     # (category, key) pairs already written by earlier chunks of this task —
     # annotated in later chunks' entry excerpts so the model does not rewrite
     # the same section every chunk.
@@ -930,9 +1038,11 @@ def _run_knowledge_update(
         artifact_path if execute else None
     )
     prompt_dir_path = Path(prompt_dir).expanduser().resolve() if prompt_dir else None
-    results: List[Dict[str, Any]] = []
-    pending: List[KnowledgeChunk] = list(materials.chunks)
-    multi_chunk = len(pending) > 1
+    # the windows an earlier run landed, left out of the chunks: reported once, first
+    results: List[Dict[str, Any]] = (
+        [{"chunk": 0, "window_ids": landed_window_ids, "skipped": "already_applied", "knowledge_report": None}]
+        if landed_window_ids else [])
+    multi_chunk = len(pending) > 1 or bool(landed_window_ids)
     position = 0
     # Taken once, on the first chunk that actually applies, and held until the
     # run finishes: the knowledge base is one embedded git repository that the
@@ -959,31 +1069,6 @@ def _run_knowledge_update(
                 material_hash in applied_material_hashes
                 for material_hash in material_hashes
             )
-            pending_intent = pending_intents.get(input_hash)
-            if cached is None and pending_intent is not None:
-                # Crash between the store commit and the ledger write: the
-                # revision table remembers every applied proposal hash, so a
-                # revision after the intent's rev carrying ours means the chunk
-                # landed (plan §2.5).
-                rev_before = int(pending_intent.get("rev_before") or 0)
-                proposal_hash = str(pending_intent.get("proposal_hash") or "")
-                landed_rev = _revision_with_proposal(knowledge_root, proposal_hash, after=rev_before)
-                if proposal_hash and landed_rev is not None:
-                    recovered = {
-                        "status": "recovered_after_commit",
-                        "task_fingerprint": task_fingerprint,
-                        "chunk_index": chunk_no,
-                        "window_ids": list(chunk.window_ids),
-                        "input_hash": input_hash,
-                        "material_hashes": material_hashes,
-                        "rev_after": landed_rev,
-                        "knowledge_report": None,
-                        "applied_entries": [],
-                    }
-                    _append_chunk_ledger(ledger_path, recovered)
-                    ledger[input_hash] = recovered
-                    applied_material_hashes.update(material_hashes)
-                    cached = recovered
             if cached is not None or covered_by_prior_chunks:
                 results.append(
                     {
@@ -1264,7 +1349,7 @@ def _run_knowledge_update(
                 apply_task_id = f"{task_id or 'manual'}#chunk{chunk_no}" if multi_chunk else (
                     task_id or "manual"
                 )
-                proposal_hash = _sha256(result.content)
+                write_id = uuid.uuid4().hex
                 _append_chunk_ledger(
                     ledger_path,
                     {
@@ -1275,14 +1360,14 @@ def _run_knowledge_update(
                         "input_hash": input_hash,
                         "material_hashes": material_hashes,
                         "rev_before": working_rev,
-                        "proposal_hash": proposal_hash,
+                        "write_id": write_id,
                     },
                 )
                 # One store transaction per chunk (plan §2.5): handles bind the
                 # model's references to the versions it saw at working_rev, and
                 # the apply engine CAS-checks each entity once. The revision
-                # records the *raw proposal text* hash so a crash between this
-                # commit and the ledger write is recoverable (see above).
+                # records the intent's write id so a crash between this commit
+                # and the ledger write is recoverable (see above).
                 knowledge_report = apply_model_proposals(
                     result.content,
                     repo=KnowledgeRepo.open(knowledge_root),
@@ -1290,7 +1375,7 @@ def _run_knowledge_update(
                     knowledge_read_rev=working_rev,
                     handles=kb_handles,
                     assignment_id=source,
-                    proposal_text_hash=proposal_hash,
+                    write_id=write_id,
                     line_gate=line_gate, invalid_ops="reject",  # a batch-breaking proposal is fed back below
                 ).to_dict()
                 if knowledge_report.get("rolled_back"):
@@ -1339,6 +1424,7 @@ def _run_knowledge_update(
                         line_gate=line_gate,
                         retries=parse_retries,
                         avoid_models=avoided,
+                        write_id=write_id,
                     )
                     if repair_report is not None:
                         chunk_result["knowledge_repair_report"] = repair_report
@@ -1390,6 +1476,7 @@ def _run_knowledge_update(
         "chunks": results,
         "warnings": list(materials.warnings),
         "ledger_path": str(ledger_path),
+        "name_check": name_check,
     }
 
 
@@ -1410,8 +1497,7 @@ def _book_refined_alignment_evidence(
             KnowledgeRepo.open(knowledge_root).store,
             (
                 (window.chunk_id, window.raw_text, window.product_text, window.refined_csv)
-                for chunk in materials.chunks
-                for window in chunk.windows
+                for window in materials.windows
             ),
             task_id=task_id or "knowledge-update",
         )
@@ -1563,6 +1649,11 @@ def main() -> int:
 
     install_runtime_routing(args)
     task_id = args.task_id or Path(args.final_srt).stem
+    if args.execute and args.apply:
+        # like a correction run: a person's pending rendered/ edits go in before this task writes the base
+        from .node.edit import harvest_rendered_edits_at_run_start
+
+        harvest_rendered_edits_at_run_start(args.knowledge_root)
     try:
         report = run_knowledge_update(
             final_srt=args.final_srt,
@@ -1598,6 +1689,7 @@ def main() -> int:
                         for chunk in report["chunks"]
                     ],
                     "warnings": report["warnings"],
+                    **({"name_check": report["name_check"]} if report.get("name_check") is not None else {}),
                 },
                 ensure_ascii=False,
                 indent=2,

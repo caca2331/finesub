@@ -706,7 +706,7 @@ def test_a_line_that_is_already_a_bullet_does_not_get_a_second(tmp_path) -> None
 
     A real archive whose sections were written as markdown lists rendered 291
     lines as `- - …` across 23 of 27 entries (2026-09-01). Not adding a second
-    bullet costs the leading dash on the way back in, because `_strip_bullet`
+    bullet costs the leading dash on the way back in, because `edit._bare_line`
     removes exactly one: accepted deliberately over escaping it, which would
     put an escape character in front of a human reader. The archive
     projection carries no bullets and is unaffected.

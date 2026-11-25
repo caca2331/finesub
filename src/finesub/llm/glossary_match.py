@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -56,6 +57,18 @@ def _latin(ch: str) -> bool:
     return ch.isascii() and ch.isalnum()
 
 
+# a half-width run with the full-width kana before it: a half-width ﾞ / ﾟ composes with that kana (トハﾟ is トパ),
+# and so does a combining voiced / semi-voiced mark (U+3099 / U+309A) inside or after the run (ﾋ゙ is ビ)
+_HALF_KANA = re.compile(r"[ぁ-ゖァ-ヺ]?[｡-ﾟ゙゚]+")
+
+
+def widen_kana(text: str) -> str:
+    """Half-width ｶﾀｶﾅ written as full-width (NFKC on those runs alone, so a full-width ！ in a name stays): a name
+    half in each width is then found whole and masks the shorter names inside it. Both verbatim paths read it."""
+
+    return _HALF_KANA.sub(lambda m: unicodedata.normalize("NFKC", m.group()), text)
+
+
 def verbatim(text: str, forms: Sequence[str]) -> set[str]:
     """The ``forms`` written in ``text``; ``forms`` must be sorted longest first (``by_length``)."""
 
@@ -66,6 +79,56 @@ def verbatim(text: str, forms: Sequence[str]) -> set[str]:
             for i in reversed(starts):
                 text = text[:i] + "\0" + text[i + len(form):]
     return found
+
+
+FOLD_MIN = 3  # kana: a shorter name written in hiragana is mostly part of a word (のい in のいず)
+_HIRAGANA_CH = re.compile(r"[ぁ-ゖ]")
+_KANA_CH = re.compile(r"[ぁ-ゖァ-ヺー]")
+# what may follow a name written in hiragana inside a longer hiragana run: a particle or an honorific (ろーえんが)
+FOLD_AFTER = ("って", "さん", "ちゃん", "くん", "さま", "たち", "が", "は", "を", "に", "の", "と", "も", "へ", "や", "で")
+
+
+def kana_verbatim(text: str, forms: Sequence[str], names: Sequence[str]) -> set[str]:
+    """The katakana ``forms`` written in ``text`` in either kana, half-width ｶﾀｶﾅ widened first (``widen_kana``): ろーえん for ローエン.
+    For the names the glossary marks ``fold``, matched only as written but no everyday word, whose hiragana or
+    half-width spelling is still the name. A hiragana spelling must be a word of its own: it starts a kana run (no
+    kana before it) and either ends it or is followed by a particle or honorific (``FOLD_AFTER``: ろーえんが), so
+    これいじょう is not コレイ and ありすぎる is not アリス. A katakana neighbour on either side is never allowed.
+
+    ``names``: every name form of the glossary, ``forms`` included, longest first (``by_length``). As in ``verbatim``,
+    a longer name masks the forms inside it, in either kana: ローエンハイム and ろーえんはいむ are not ローエン.
+    A particle that starts a word passes the edge (これいがい, これ以外, reads as コレイ + が): a known cost."""
+
+    norm = widen_kana(text)
+    wanted = set(forms)
+    found = verbatim(norm, names) & wanted
+    kata = _kata(norm)
+    longer = [(i, i + len(n)) for n in names if len(n) > FOLD_MIN and (k := _kata_name(n)) in kata
+              for i in _starts(kata, k)]
+    for form in forms:
+        if form in found or len(form) < FOLD_MIN:
+            continue
+        for i in _starts(kata, form):
+            j = i + len(form)
+            if (_HIRAGANA_CH.search(norm[i:j]) and not (i and _KANA_CH.fullmatch(norm[i - 1]))
+                    and (j == len(norm) or not _KANA_CH.fullmatch(norm[j])
+                         or (_HIRAGANA_CH.fullmatch(norm[j]) and norm.startswith(FOLD_AFTER, j)))
+                    and not any(a <= i and j <= b and b - a > j - i for a, b in longer)):
+                found.add(form)
+                break
+    return found
+
+
+@lru_cache(maxsize=None)
+def _kata_name(name: str) -> str:
+    return _kata(name)
+
+
+def _starts(text: str, sub: str):
+    i = text.find(sub)
+    while i >= 0:
+        yield i
+        i = text.find(sub, i + 1)
 
 
 def by_length(forms: Iterable[str]) -> tuple[str, ...]:

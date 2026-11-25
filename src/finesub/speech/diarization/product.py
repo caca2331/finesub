@@ -114,6 +114,13 @@ def product(segments: Sequence[Mapping[str, Any]], judgments: Judgments | None) 
             lines.append(Line({"id": key + INSERTED_SUFFIX, "start": start, "end": end, "text": insert.text},
                               key, INSERTED, heard=True))
             judged[key + INSERTED_SUFFIX] = decided(insert.track, UNLABELLED)
+    if judgments.merged:  # every line on a merged track, moved or not, reads as the track it merged into
+        for line in lines:
+            speaker = judged.get(line.id) or _own_speaker(line.row)
+            if speaker.track in judgments.merged:
+                judged[line.id] = decided(judgments.merged[speaker.track], speaker)
+        deferred = {key: decided(judgments.merged.get(speaker.track, speaker.track), speaker)
+                    for key, speaker in deferred.items()}
     return Product(tuple(lines), judged, tuple(segments), deferred)
 
 

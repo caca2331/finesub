@@ -38,7 +38,7 @@
 | `segmentation_gold/` | 31 | `docs/segmentation-gold.md`（**人工标注不可再生**） |
 | `wt_refine_port/` | 31 | `AGENTS.md`、`docs/architecture.md`、`docs/ct2-distribution.md`（CT2 补丁基线与 CI 构建脚本）、`.github/workflows/build-ct2.yml` |
 | `kb_phonetic_eval/` | 6（2026-10-23 数） | `docs/knowledge.md`（「精修字幕怎么读」的词条瘦身一段）与 `llm/kb_phonetic_hints.py` 的注释：音近提示的离线重放与评估，`FINESUB_KB_SLIM` 翻默认要看的读数 |
-| `game_glossary/` | 2（2026-11-13 数） | `docs/knowledge.md`「游戏专名列表」：维护者构建、审读、发布游戏专名列表文件，步骤在 [`game_glossary/README.md`](game_glossary/README.md)，输入文件的格式在 `build.py` 开头 |
+| `game_glossary/` | 11（2026-11-20 数） | `docs/knowledge.md`「游戏专名列表」：维护者抽取（`extract.py`）、定日期（`dates.py`）、闭卷探针（`famous.py`）、剧情信号（`signals.py`）、核对（`textmap_check.py`）、构建（`build.py`）、重跑规则（`retag.py`）、比两次构建（`compare.py`）、规则的测试（`test_build.py`，不进默认套件）、审读、发布游戏专名列表文件，步骤在 [`game_glossary/README.md`](game_glossary/README.md)，输入文件的格式在 `build.py` 开头 |
 | `hw_acceptance/` | 4 | `docs/manual/resources.md`、`docs/asr-backends.md`（社区验收套件） |
 | `diarizen_export/` | 33 | [`diarizen_export/README.md`](diarizen_export/README.md)、`docs/diarization-findings.md`：DiariZen 后端的 TorchScript 产出方式与分层校验器（`check_s1`–`s4`、`check_port`、`noise_arm`，⚠ **只报不判**：换产物形态是 A 类，要刻画抖动而不是消除它）；测量床（单人证据、角色命名 `roles_bed`+`roles_run`、人数上限、跨集声纹、轨身份、原生边界、行内换人 `turn_shape_bed` / `turn_signal_bed` / `turn_llm_bed` / `turn_cut_bed` / 判官 `turn_output_judge`），各自的结论在 findings 对应节；`cut_samples` 按需把生产选好的试听段切成音频；⭐ `verify_guards` 把每个守卫声称能防的 bug 注回去，确认它真的红 |
 | `sortformer_export/` | 2 | `docs/architecture.md`（`speech/diarization/` 一行）：说话人模型三个 TorchScript 件的产出方式。⚠ 里面有两份 NeMo 方法的逐字拷贝（TorchScript 拒绝原样编译），**只住在这里、管线看不到**；拷贝烤进去的假设都在导出前断言 |

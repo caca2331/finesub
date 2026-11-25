@@ -126,7 +126,7 @@ endpoint，cn 路由下就是第三方镜像，而那常常是有写权限的 to
 `model-manifest.json` 记录 repo、revision、必需相对路径、大小和 SHA-256。可选的模型也登记在里面、
 同样校验，只是默认运行不预取：`whisper-ja`（显式 `--model`）、`moss-transcribe-diarize`
 （`--asr moss-local`，`listedOnly`：只取 `from_pretrained` 打开的文件，`trust_remote_code` 执行的三个
-`.py` 也在其中、逐个校验）、`qwen-aligner`（`--asr-aligner`，本地 MOSS 默认开）与 `sentence-boundary`（MAI2、35t、Scribe 分句用，`listedOnly`：仓库里另有一个 1.1 GB 的 `.nemo` 用不上）。
+`.py` 也在其中、逐个校验）、`qwen-aligner`（`--asr-aligner`，MOSS 两家与 35t 的修补默认开；有 GPU 时它之后的 Whisper 那一步用本机转写的同一份 Whisper 权重，由 `ensure_asr_weights` 取）与 `sentence-boundary`（五家一体转写后端分句用，`listedOnly`：仓库里另有一个 1.1 GB 的 `.nemo` 用不上）。
 
 ⚠ **非 LFS 的小文件不逐个钉哈希**（2026-11 全仓审计提出，判了不做）：`config.json`、tokenizer 与
 preprocessor 的配置这类文件跟着 revision 下载，逐文件的 SHA-256 只有 LFS 权重与 `listedOnly` 条目列出的文件。

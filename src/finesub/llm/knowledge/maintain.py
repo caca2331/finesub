@@ -315,29 +315,57 @@ def _cmd_candidates(args: argparse.Namespace) -> _Lines:
 
 
 def _cmd_verify(args: argparse.Namespace) -> _Lines:
-    from ..client import OutputCutOff
+    """Two objects, each with its own session: the term lines the name check is owed (`name_check.py`, which
+    checks and corrects the whole line, its Chinese name first) and the profile facts (`verify.py`,
+    ``payload:core``), each at most ``--limit``. A session that fails costs only its own object: the other's result
+    is still printed and booked, then the command exits 1."""
+
     from .verify import (
         book_verify_results,
         render_verify_prompt,
         run_verify_session,
         unverified_claims,
     )
+    from .name_check import build_claims, due_lines, render_name_check_prompt
 
+    if args.execute and args.apply:
+        # a person's pending rendered/ edits go in first: the landing refreshes rendered/, and a later harvest of a
+        # file edited before it would read the lines the check corrected as the person's edits back to the old text
+        from .node.edit import harvest_rendered_edits_at_run_start
+
+        harvest_rendered_edits_at_run_start(args.root)
     repo = _repo(args)
     claims = unverified_claims(repo.store, limit=args.limit)
-    lines: _Lines = [f"{len(claims)} unverified externally-checkable claim(s)"]
+    names = build_claims(repo.store, due_lines(repo.store, limit=args.limit))
+    lines: _Lines = [f"{len(claims)} unverified fact sentence(s)（没核过的事实句）"]
     for claim in claims:
         lines.append(f"  {claim['claim_id']} [{claim['kind']}] {claim['line']}")
-    if not claims:
+    lines.append(f"{len(names)} term line(s) owed a check（术语行核查，中文定名为主）")
+    for name in names:
+        lines.append(f"  {name.claim_id} 「{name.subject}」{name.surface}|{name.zh}"
+                     + (f"（带着 {name.derived_from} 的定名）" if name.derived_from else ""))
+    if not claims and not names:
         return lines
     if not args.execute:
-        prompt = render_verify_prompt(claims)
-        lines.append(f"dry-run: verify prompt rendered ({len(prompt)} chars); --execute 跑校验会话")
+        if claims:
+            lines.append(f"dry-run: verify prompt rendered ({len(render_verify_prompt(claims))} chars)")
+        if names:
+            lines.append(f"dry-run: name-check prompt rendered ({len(render_name_check_prompt(names))} chars)")
+        lines.append("--execute 跑校验会话")
         return lines
-    try:
-        rows = run_verify_session(claims, client=_role_client(args.llm_model))
-    except OutputCutOff as exc:
-        raise SystemExit(f"error: {exc}") from exc
+    client = _role_client(args.llm_model)
+    rows: list = []
+    checked: list | None = None
+    errors: list[str] = []
+    if claims:
+        try:
+            rows = run_verify_session(claims, client=client)
+        except Exception as exc:  # either session's failure (a provider's own error type included) spares the other
+            errors.append(f"error: {exc}")
+    if names:
+        checked, failed = _run_name_check(names, client, repo.store)
+        if failed:
+            errors.append(f"error: name check（中文定名核查）: {failed}")
     for row in rows:
         lines.append(f"  {row['claim_id']} -> {row['verdict']}" + (f" ({row['url']})" if row["url"] else ""))
         # The evidence table stores verdict + source, not the reasoning, so a
@@ -348,10 +376,70 @@ def _cmd_verify(args: argparse.Namespace) -> _Lines:
         if row["verdict"] != "confirmed":
             lines.append(f"       line: {row['line']}")
     if args.apply:
-        booked = book_verify_results(repo.store, rows, task_id=args.task_id)
-        lines.append(f"booked {booked} evidence row(s)")
+        if rows:
+            booked = book_verify_results(repo.store, rows, task_id=args.task_id)
+            lines.append(f"booked {booked} evidence row(s)")
+        if checked is not None:
+            lines.extend(_book_name_check(repo, checked, names, task_id=args.task_id, root=args.root))
     else:
-        lines.append("not booked (--apply to record the evidence rows)")
+        if checked is not None:
+            from .name_check import change_text
+
+            by_id = {name.claim_id: name for name in names}
+            for row in checked:
+                name = by_id[row["claim_id"]]
+                said = change_text({**row, "line": f"{name.surface}|{name.zh}"}) if row.get("set") else ""
+                lines.append(f"  {row['claim_id']} -> {row['verdict']}" + (f" {said}" if said else "")
+                             + (f" ({row['url']})" if row.get("url") else ""))
+        lines.append("not booked (--apply to record the evidence rows and land the corrections)")
+    if errors:
+        raise SystemExit("\n".join([*lines, *errors]))
+    return lines
+
+
+def _run_name_check(names, client, store):  # type: ignore[no-untyped-def]
+    """The rows of the check's batches (the route's batch size, `name_check_step.plan_batches`) and why it stopped
+    short, or "": a batch that fails (a provider's own error type included) keeps the rows of the batches before
+    it. Each batch is checked against the base as it goes (`name_check_step.still_sendable`): the fact-sentence
+    session runs first, and a line may change or move out of reach meanwhile."""
+
+    from .name_check import name_check_route, run_name_check_session
+    from .name_check_step import LOCAL_BATCH_LINES, NATIVE_BATCH_LINES, plan_batches, still_sendable
+
+    route, why = name_check_route(client)
+    if route is None:
+        return None, why
+    rows: list = []
+    for planned in plan_batches(names, NATIVE_BATCH_LINES if route.kind == "native" else LOCAL_BATCH_LINES):
+        batch = still_sendable(store, planned)
+        if not batch:
+            continue
+        try:
+            rows += run_name_check_session(batch, client=client, route=route).rows
+        except Exception as exc:
+            return rows or None, str(exc)
+    return rows, ""
+
+
+def _book_name_check(repo: KnowledgeRepo, checked, names, *, task_id: str, root) -> _Lines:  # type: ignore[no-untyped-def]
+    """Land the name check as a harness revision, not the user's: a user revision would book `user` evidence on
+    every name it set, making each one 人定, never to be checked or corrected again. Each run its own task id, so
+    a second check a week later is a second piece of evidence."""
+
+    from datetime import datetime, timezone
+
+    from .name_check import book_name_checks, landing_lines, pending_edits_hold
+
+    run_id = f"{task_id}-zh-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    with knowledge_write_lock(knowledge_root_path(root)) as acquired:
+        report = book_name_checks(repo.store, checked, names, task_id=run_id, write=acquired,
+                                  hold=pending_edits_hold(repo))
+        if acquired:
+            repo.refresh_rendered()  # the check notes of rendered/ follow the evidence, not only a revision
+    lines = [f"中文定名核查（{run_id}）："]
+    lines.extend(f"  {line}" for line in landing_lines(report.to_dict()))
+    if not acquired:
+        lines.append("  知识库正被另一个进程写，修正没落库；证据已记")
     return lines
 
 
@@ -556,7 +644,8 @@ def _cmd_glossary_fetch(args: argparse.Namespace) -> _Lines:
         glossary = glossary_store.fetch(args.root, args.game)
     except glossary_store.GlossaryError as exc:
         raise SystemExit(f"error: {exc}") from exc
-    return [f"installed {glossary_store.QUALIFIER}{glossary.game}: {len(glossary.terms)} names, built {glossary.built}"]
+    return [f"installed {glossary_store.QUALIFIER}{glossary.game}: {sum(t.matched for t in glossary.terms)} names"
+            f" ({sum(t.rare and not t.skip for t in glossary.terms)} less common ones kept unused), built {glossary.built}"]
 
 
 # ``verify`` is deliberately NOT here: it only inserts evidence rows, which
@@ -654,12 +743,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     verify = sub.add_parser(
         "verify",
-        help="§11.4 verification task: web-check unevidenced term/note claims (dry-run by default)",
+        help="§11.4 verification task: web-check unevidenced term/note claims and unchecked Chinese names"
+             " (dry-run by default)",
     )
     verify.add_argument("--limit", type=int, default=20)
     verify.add_argument("--execute", action="store_true", help="run the native-search session (spends quota)")
     add_routing_arguments(verify)
-    verify.add_argument("--apply", action="store_true", help="book the session's evidence rows")
+    verify.add_argument("--apply", action="store_true",
+                        help="book the sessions' evidence rows and land the name check's corrections")
     verify.add_argument("--task-id", default="kb-verify")
     verify.set_defaults(func=_cmd_verify)
 

@@ -457,7 +457,7 @@ def test_a_plan_is_the_bound_group_gated_by_the_policy() -> None:
     agent_only = [
         "local-agy-sonnet-5_5",
         "local-agy-gemini-4-hydrogen",
-        "local-agy-gemini-4-argon",
+        "local-agy-gemini-4-neon",
     ]
     assert [
         item.target_id

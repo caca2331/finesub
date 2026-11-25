@@ -225,47 +225,55 @@ READ_SPILL_DEFINITION: dict[str, Any] = {
 #: that is never approved. `read_spill` stays out too: a part already fills a
 #: reply, so two together would spill again.
 BATCH_MEMBERS = ("kb_index", "kb_search", "kb_read", "kb_read_node", "kb_validate", "web_search", "web_fetch")
+
+
 # Exposed only to a CLI whose model cannot call tools in parallel (Codex runs
 # GPT-6 without parallel calls): independent lookups in one round.
-BATCH_DEFINITION: dict[str, Any] = {
-    "name": "batch",
-    "description": (
-        "Run several independent lookups in one call: "
-        + ", ".join(BATCH_MEMBERS)
-        + ". Use it whenever you would otherwise make two or more of these "
-        "calls in a row. The calls run in order and none sees another's "
-        "result, so a call that needs an earlier result goes in a later "
-        "round. Returns one result or error per call, in order."
-    ),
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "calls": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "tool": {"type": "string", "enum": list(BATCH_MEMBERS)},
-                        "arguments": {"type": "object"},
+def batch_definition(members: Sequence[str]) -> dict[str, Any]:
+    """The batch tool over ``members``: the lookups this session is really offered. A member listed but not
+    registered drew a model to it -- a native round's GPT-6 called the batch's `web_search` instead of Codex's own
+    and gave up on `Unknown tool` (2026-11-21)."""
+
+    return {
+        "name": "batch",
+        "description": (
+            "Run several independent lookups in one call: "
+            + ", ".join(members)
+            + ". Use it whenever you would otherwise make two or more of these "
+            "calls in a row. The calls run in order and none sees another's "
+            "result, so a call that needs an earlier result goes in a later "
+            "round. Returns one result or error per call, in order."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "calls": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "enum": list(members)},
+                            "arguments": {"type": "object"},
+                        },
+                        "required": ["tool"],
+                        "additionalProperties": False,
                     },
-                    "required": ["tool"],
-                    "additionalProperties": False,
-                },
-            }
+                }
+            },
+            "required": ["calls"],
+            "additionalProperties": False,
         },
-        "required": ["calls"],
-        "additionalProperties": False,
-    },
-    "annotations": {
-        "title": "Batch lookups",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        # `web_search` / `web_fetch` are members.
-        "openWorldHint": True,
-    },
-}
+        "annotations": {
+            "title": "Batch lookups",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            # `web_search` / `web_fetch` may be members.
+            "openWorldHint": True,
+        },
+    }
+
 
 # Exposed only when the task's retrieval mode is `local`: the harness's own
 # retrieval chain (docs/llm_harness_research.md), metered by the runtime's
@@ -412,7 +420,7 @@ KB_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in KB_TOOL_DEFINITI
 #: outside it is no tool at all -- the driver's event check reads such a call
 #: as a malformed one, not as reaching for a tool the call was not given.
 SERVER_TOOL_NAMES: frozenset[str] = frozenset(
-    (*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES, READ_SPILL_DEFINITION["name"], BATCH_DEFINITION["name"])
+    (*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES, READ_SPILL_DEFINITION["name"], "batch")
 )
 KB_READ_PROPOSE_NOTE = (
     " With a propose grant, the [别名] row carries an @a handle for "
@@ -430,7 +438,6 @@ KB_ENTITLEMENT_TOOLS: dict[str, tuple[str, ...]] = {
     "propose": KB_TOOL_NAMES,
     "style": ("kb_read",),
 }
-
 
 def kb_reply_chars(payload: Mapping[str, Any]) -> int:
     """What `KB_REPLY_MAX_CHARS` is measured on: the reply as canonical JSON."""
@@ -641,7 +648,7 @@ class HarnessToolServer:
         self._kb_entitlement = ""  # "read" / "propose" / "style", set by _kb_context
         self._kb_handles: Any = None
         self._kb_task_id = ""
-        self._kb_search_cache: tuple[int, Any] | None = None
+        self._kb_search_cache: tuple[tuple[int, bool], Any] | None = None  # keyed (rev, correct-only)
         # Transport replays: the same JSON-RPC id asked again gets the same
         # answer, and nothing -- the repair count included -- moves twice.
         self._replies: dict[str, dict[str, Any]] = {}  # request_id -> {fingerprint, reply}
@@ -661,6 +668,13 @@ class HarnessToolServer:
                 return True
         return False
 
+    def _batch_members(self) -> tuple[str, ...]:
+        """The `BATCH_MEMBERS` this session is offered: the web tools on a harness-retrieving task, the knowledge
+        tools its grant names."""
+
+        offered = {*(WEB_TOOL_NAMES if self._web_tools else ()), *self._kb_tool_names}
+        return tuple(name for name in BATCH_MEMBERS if name in offered)
+
     @property
     def tool_definitions(self) -> list[dict[str, Any]]:
         tools = [dict(tool) for tool in TOOL_DEFINITIONS]
@@ -678,8 +692,8 @@ class HarnessToolServer:
             tools.append(tool)
         if self.channel.reads_spills_by_tool:
             tools.append(dict(READ_SPILL_DEFINITION))
-        if self.channel.batch_tool:
-            tools.append(dict(BATCH_DEFINITION))
+        if self.channel.batch_tool and self._batch_members():
+            tools.append(batch_definition(self._batch_members()))
         if self.channel.result_size_meta:
             # Claude Code saves a text result past 50,000 characters to a file
             # the worker may not read, unless the tool declares a larger size
@@ -1143,11 +1157,11 @@ class HarnessToolServer:
         for index, call in enumerate(calls, start=1):
             call = call if isinstance(call, Mapping) else {}
             tool = str(call.get("tool") or "")
-            if tool not in BATCH_MEMBERS:
+            if tool not in self._batch_members():
                 results.append({
                     "tool": tool,
                     "error": f"{tool!r} cannot run in a batch; it takes one of "
-                    + ", ".join(BATCH_MEMBERS),
+                    + ", ".join(self._batch_members()),
                 })
                 continue
             sub_arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
@@ -1317,10 +1331,17 @@ class HarnessToolServer:
         query = str(arguments.get("query") or "").strip()
         if not query:
             raise _ToolError("query is required")
-        from ..knowledge.node.matching import ExactIndex
+        from ..knowledge.node.matching import CORRECT_ONLY_NODE_KINDS, ExactIndex
 
-        if self._kb_search_cache is None or self._kb_search_cache[0] != rev:
-            self._kb_search_cache = (rev, ExactIndex.build(repo.store, rev))
+        # A correct-only task searches by what a Chinese source says: the
+        # canonical names are keys too (the index is cached per reading -- a
+        # pseudo session may serve both kinds of task).
+        correct_only = self._kb_correct_only()
+        if self._kb_search_cache is None or self._kb_search_cache[0] != (rev, correct_only):
+            self._kb_search_cache = (
+                (rev, correct_only),
+                ExactIndex.build(repo.store, rev, zh_names=correct_only),
+            )
         keys = self._kb_search_cache[1].search(query)
         entry_filter = str(arguments.get("entry") or "").strip()
         if entry_filter:
@@ -1337,6 +1358,8 @@ class HarnessToolServer:
             node = repo.store.node(key.node_id, rev)
             if subject is None or node is None:
                 continue
+            if correct_only and node.kind not in CORRECT_ONLY_NODE_KINDS:
+                continue  # a free sentence does not exist for this task (see `_kb_read_node`)
             rows.append(
                 {
                     "entry": subject.payload.get("surface", ""),
@@ -1418,6 +1441,8 @@ class HarnessToolServer:
             repo.store, resolved.subject_id, rev=rev, mode="prompt", handles=self._kb_handles,
             sections=sections,
             preview="full" if self._kb_entitlement == "propose" else "partial",
+            correct_only=self._kb_correct_only(),
+            trust_marks=self._kb_trust_marks(),
         )
         _task, manifest = self._require_task()
         asks_to_compress = str((manifest.get("metadata") or {}).get("kb_size_notice") or "") != "off"
@@ -1491,12 +1516,32 @@ class HarnessToolServer:
                 repo.store, subject_id, rev=rev, mode="prompt", handles=self._kb_handles,
                 sections=[name],
                 preview="full" if self._kb_entitlement == "propose" else "partial",
+                correct_only=self._kb_correct_only(),
+                trust_marks=self._kb_trust_marks(),
             )
             rows.append(f"{name} ({len(rendered)} chars)")
         listing = "; ".join(rows)
         if len(listing) > 8_000:
             listing = listing[:8_000] + " ..."
         return f"read it in parts with sections=[...]; its sections: {listing}"
+
+    def _kb_correct_only(self) -> bool:
+        """Whether this task reads the base as a correct-only task (the
+        harness's ``kb_correct_only``, written where it wrote the revision):
+        entries come in the correct-only projection, `kb_search` matches the
+        canonical Chinese names, a free sentence is not served. Never for a
+        writer -- a ``propose`` task reads the full preview it writes into."""
+
+        _task, manifest = self._require_task()
+        return bool((manifest.get("metadata") or {}).get("kb_correct_only")) and self._kb_entitlement != "propose"
+
+    def _kb_trust_marks(self) -> bool:
+        """Whether this task's kb tools show the 未核 marks (the harness's ``kb_trust_marks``): a correction
+        task's, never a writer's, which reads the full preview."""
+
+        _task, manifest = self._require_task()
+        metadata = manifest.get("metadata") or {}
+        return (bool(metadata.get("kb_trust_marks")) or self._kb_correct_only()) and self._kb_entitlement != "propose"
 
     def _kb_signals_booked(self) -> bool:
         """Whether this task's ``exposed`` events may be booked. The harness
@@ -1532,17 +1577,27 @@ class HarnessToolServer:
             raise _ToolError(
                 f"unknown handle {handle!r}; handles come from this session's kb_read/kb_search replies"
             )
-        from ..knowledge.node.render import format_line, node_aliases
+        from ..knowledge.node.matching import CORRECT_ONLY_NODE_KINDS
+        from ..knowledge.node.render import model_line
 
         node = repo.store.node(bound[0], rev)
         if node is None:
             raise _ToolError(f"{handle} is not live at rev {rev}")
+        correct_only = self._kb_correct_only()
+        if correct_only and node.kind not in CORRECT_ONLY_NODE_KINDS:
+            # The projection leaves the free sentences out of every reply, so
+            # no handle of this task names one; a carried-over or guessed
+            # handle gets the answer an unknown one does.
+            raise _ToolError(
+                f"unknown handle {handle!r}; handles come from this session's kb_read/kb_search replies"
+            )
         payload = self._kb_finish(
             {
                 "knowledge_read_rev": rev,
                 "handle": handle,
                 "kind": node.kind,
-                "text": format_line(node, aliases=node_aliases(repo.store, node, rev)),
+                # the line as `kb_read` shows it, trust mark included
+                "text": model_line(repo.store, node, rev, trust_marks=self._kb_trust_marks()),
             }
         )
         try:

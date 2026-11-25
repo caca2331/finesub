@@ -401,6 +401,42 @@ def test_run_knowledge_update_recovers_commit_before_ledger_crash(tmp_path) -> N
     assert "recovered_after_commit" in ledger_path.read_text(encoding="utf-8")
 
 
+def test_a_crashed_intent_is_not_settled_by_another_tasks_revision_of_the_same_text(tmp_path, monkeypatch) -> None:
+    """Two inputs of the same name in two directories share a task id and a knowledge base: A crashes after its intent,
+    before its commit; B then lands the very same proposal text. A's resume must still ask again."""
+
+    knowledge_root = tmp_path / "knowledge"
+    real_apply = update_module.apply_model_proposals
+    crash = {"left": 1}
+
+    def crash_once(*args, **kwargs):
+        if crash["left"]:
+            crash["left"] -= 1
+            raise KeyboardInterrupt("crashed between intent and commit")
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(update_module, "apply_model_proposals", crash_once)
+    a_srt, a_paths, _ = _write_task_outputs(_mkdir(tmp_path / "a"))
+    b_srt, _, _ = _write_task_outputs(_mkdir(tmp_path / "b"))
+    common = dict(task_id="x", task_summary="测试任务", knowledge_root=knowledge_root, token_counter=FakeTokenCounter())
+    a_client = FakeClient(_proposal_response())
+    with pytest.raises(KeyboardInterrupt):
+        run_knowledge_update(final_srt=a_srt, client=a_client, **common)
+    run_knowledge_update(final_srt=b_srt, client=FakeClient(_proposal_response()), **common)
+
+    report = run_knowledge_update(final_srt=a_srt, client=a_client, **common)
+
+    assert len(a_client.calls) == 2, "asked again: nothing of A's landed"
+    ledger_text = (a_paths["artifact_dir"] / CHUNK_LEDGER_FILENAME).read_text(encoding="utf-8")
+    assert "recovered_after_commit" not in ledger_text
+    assert report["chunks"][0].get("skipped") != "already_applied"
+
+
+def _mkdir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def test_run_knowledge_update_refined_mode_reads_the_refined_material(tmp_path) -> None:
     """What the refined variant is FOR: the refined lines reach the prompt.
 
@@ -549,7 +585,7 @@ def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) ->
     class TinyLimits:
         prompt_input_limit = 100  # forces the two-window chunk to split
         output_limit = 65_536
-        knowledge_csv_tokens = 100_000
+        knowledge_chunk_tokens = 100_000
 
     monkeypatch.setattr(
         "finesub.llm.knowledge.update.planning_limits_for",
@@ -581,7 +617,7 @@ def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) ->
     class LargeLimits:
         prompt_input_limit = 1_000_000
         output_limit = 65_536
-        knowledge_csv_tokens = 100_000
+        knowledge_chunk_tokens = 100_000
 
     monkeypatch.setattr(
         "finesub.llm.knowledge.update.planning_limits_for",
@@ -599,6 +635,45 @@ def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) ->
 
     assert len(client.calls) == 2
     assert resumed["chunks"][0]["skipped"] == "already_applied"
+
+    # Only the first half landed before the run stopped: the resume's one chunk would hold a landed window and a new
+    # one; the landed window is left out before chunking, so it is not sent again.
+    ledger_path = paths["artifact_dir"] / CHUNK_LEDGER_FILENAME
+    kept = [line for line in ledger_path.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("window_ids") == ["0001"]]
+    ledger_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    partial = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-1",
+        task_summary="换模型后分块边界改变",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=WordCounter(),
+        client=client,
+        difficulty="intermediate",
+    )
+    assert len(client.calls) == 3
+    assert partial["chunks"][0] == {"chunk": 0, "window_ids": ["0001"], "skipped": "already_applied",
+                                    "knowledge_report": None}
+    assert [chunk["window_ids"] for chunk in partial["chunks"][1:]] == [["0002"]]
+
+    # The same, but the first half's applied record never got written (a crash between the store commit and the
+    # ledger write): its intent is settled against the revisions before the chunks are cut.
+    intents = [line for line in ledger_path.read_text(encoding="utf-8").splitlines()
+               if json.loads(line).get("status") == "intent" and json.loads(line).get("window_ids") == ["0001"]]
+    ledger_path.write_text(intents[0] + "\n", encoding="utf-8")
+    crashed = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-1",
+        task_summary="换模型后分块边界改变",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=WordCounter(),
+        client=client,
+        difficulty="intermediate",
+    )
+    assert len(client.calls) == 4
+    assert crashed["chunks"][0]["window_ids"] == ["0001"] and crashed["chunks"][0]["skipped"] == "already_applied"
+    assert [chunk["window_ids"] for chunk in crashed["chunks"][1:]] == [["0002"]]
+    assert "recovered_after_commit" in ledger_path.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +978,38 @@ def test_a_rejected_op_is_fed_back_for_a_patch(tmp_path, monkeypatch) -> None:
     assert repair["rejected_entries"] == [["common", "游戏B"]] and repair["conflicted_entries"] == []
 
 
+def test_a_chunk_only_its_repair_round_landed_is_recognized_on_a_resume(tmp_path, monkeypatch) -> None:
+    """The main round's proposals all rejected, the repair's landed, then a crash before the applied record: the
+    repair's revision carries the intent's write id, so the resume asks nothing again."""
+
+    final_srt, paths, _ = _write_task_outputs(tmp_path)
+    bad = json.dumps({"op": "frobnicate", "category": "common", "entry": "游戏B", "reason": "写错了 op"},
+                     ensure_ascii=False)
+    main = f"<reasoning>x</reasoning>\n<knowledge_proposals>\n{bad}\n</knowledge_proposals>"
+    real_append = update_module._append_chunk_ledger
+
+    def crash_on_applied(path, record):
+        if record.get("status") == "applied":
+            raise KeyboardInterrupt("crashed between commit and ledger")
+        real_append(path, record)
+
+    monkeypatch.setattr(update_module, "_append_chunk_ledger", crash_on_applied)
+    common = dict(final_srt=final_srt, task_id="task-1", task_summary="测试任务", knowledge_root=tmp_path / "knowledge",
+                  token_counter=FakeTokenCounter())
+    first = SequenceFakeClient([main, _proposal_response()])
+    with pytest.raises(KeyboardInterrupt):
+        run_knowledge_update(client=first, **common)
+    assert len(first.calls) == 2, "the repair round ran and landed before the crash"
+    monkeypatch.setattr(update_module, "_append_chunk_ledger", real_append)
+    again = FakeClient(_proposal_response())
+
+    report = run_knowledge_update(client=again, **common)
+
+    assert again.calls == [], "the repair's commit was recognized"
+    assert report["chunks"][0]["skipped"] == "already_applied"
+    assert "recovered_after_commit" in (paths["artifact_dir"] / CHUNK_LEDGER_FILENAME).read_text(encoding="utf-8")
+
+
 def test_a_conflict_is_fed_back_with_the_winner_s_version(tmp_path, monkeypatch) -> None:
     """B' (plan §4.2): the dropped lines are re-decided against what the winner
     wrote, at the new revision and with the handles of that revision."""
@@ -1131,3 +1238,56 @@ def test_an_empty_reply_is_not_sent_back_as_a_turn() -> None:
     assert retry == messages and blind is True
     retry, blind = update_module._next_attempt(messages, "reply", "bad", room=10_000, counter=FakeTokenCounter())
     assert retry[1] == {"role": "assistant", "content": "reply"} and blind is False
+
+
+# ---------------------------------------------------------------------------
+# chunk metering
+
+
+class _CharCounter:
+    def count_text(self, text: str) -> int:
+        return len(text or "")
+
+    def count_texts(self, texts) -> int:  # type: ignore[no-untyped-def]
+        return sum(len(text or "") for text in texts)
+
+
+def _rest_materials(general: str = ""):  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    return SimpleNamespace(general_context=general, windows=(),
+                           feedback=SimpleNamespace(research_slice_text=lambda: ""))
+
+
+def _budget(tmp_path, materials, limit: int, ledger=None) -> int:  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    limits = SimpleNamespace(knowledge_chunk_tokens=110_000, prompt_input_limit=limit)
+    return update_module._plan_chunks(
+        materials, limits, _CharCounter(), knowledge_root=tmp_path / "knowledge", refined=False, task_summary="t",
+        aggregated_feedback="", style_keys=[], ledger_path=ledger)[1]
+
+
+def test_a_chunk_takes_the_cap_or_what_the_rest_of_the_prompt_leaves(tmp_path) -> None:
+    assert _budget(tmp_path, _rest_materials(), 10_000_000) == 110_000
+    short, longer = (_budget(tmp_path, _rest_materials("■" * size), 150_000) for size in (10, 1010))
+    assert short < 110_000 and short - longer == 1000, "the rest grows, the chunk shrinks by as much"
+    rest = 150_000 - 60_000 - short
+    small = _budget(tmp_path, _rest_materials("■" * 10), 100_000)
+    assert small == (100_000 - rest) // 2 > 100_000 - rest - 60_000, \
+        "too small an input limit to set the entries' cap aside halves what is left, not near nothing"
+
+
+def test_the_rest_of_the_prompt_is_read_at_the_revision_the_task_started_from(tmp_path, monkeypatch) -> None:
+    from finesub.llm.knowledge.node.repo import KnowledgeRepo
+
+    read: list = []
+    monkeypatch.setattr(update_module, "load_index_texts", lambda root, rev: read.append(rev) or {})
+    ledger = tmp_path / "art" / update_module.CHUNK_LEDGER_FILENAME
+    ledger.parent.mkdir()
+    ledger.write_text("\n".join(json.dumps(record) for record in (
+        {"status": "intent", "input_hash": "a", "rev_before": 7}, {"status": "applied", "input_hash": "a"},
+        {"status": "intent", "input_hash": "b", "rev_before": 9})) + "\n", encoding="utf-8")
+    _budget(tmp_path, _rest_materials(), 10_000_000, ledger=ledger)
+    _budget(tmp_path, _rest_materials(), 10_000_000)
+    assert read == [7, KnowledgeRepo.open(tmp_path / "knowledge").rev], "a resume reads where the task began"

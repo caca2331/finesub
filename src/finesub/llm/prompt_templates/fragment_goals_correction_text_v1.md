@@ -1,4 +1,4 @@
 纠错目标：
 1. 输入来自上游 ASR，已渲染为类 CSV；请以其中的源序号和时间信息作为主要时间依据。
 2. 修正明显的 ${goals_text_fix}。
-3. ASR 可能把专有名词识别成音似的${asr_name_forms}；没有音频佐证时，只有当$verify_basis能给出较高把握时才改写，否则保守保留原文措辞，并把疑点写进 note 列。
+3. ASR 可能把专有名词识别成音似的${asr_name_forms}；没有音频佐证时，只有当$verify_basis能给出较高把握时才改写，否则保守保留原文措辞，并把疑点写进 note 列。$name_source_rule

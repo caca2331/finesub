@@ -155,7 +155,7 @@ gemini_free = true
 | `[providers]` | 哪几家供应商可用（Gemini 免费/付费、Exa、Tavily） | [`env.md`](env.md) |
 | `[pools]` | 同一家配多把 key 时的池子 | [`env.md`](env.md) |
 | `[api]` | `proxy`：远程 API 请求（LLM 层与云端转写）走的代理 | [`model-routing.md`](model-routing.md) |
-| `[asr]` | `backend`：本机转写还是哪家一体转写；`aligner`：MOSS 的长段用本机对齐模型对时间（默认只给本地 MOSS）；`repair`：云端漏转与复读的补法；`speaker_merge`：MAI2 按声纹合并说话人标签；`moss_pro_paid`：MOSS Pro 池里最后一把 key 超出免费额度后付费 | [`asr-backend-choice.md`](asr-backend-choice.md) |
+| `[asr]` | `backend`：本机转写还是哪家一体转写；`aligner`：MOSS 的长段与 35t 补回的文字用本机对齐模型对时间（默认开，有 GPU 时 MOSS 两家再由 Whisper 修一遍）；`repair`：云端漏转与复读的补法；`rows`、`overlap_cue`：`moss-diarization-aligner` 的行从哪家来、插话切开的行合不合成一条；`moss_pro_paid`：MOSS Pro 池里最后一把 key 超出免费额度后付费 | [`asr-backend-choice.md`](asr-backend-choice.md) |
 | `[llm]` | 预设、优先模型、思考档位、风格默认值、本机 agent 的几项 | [`model-routing.md`](model-routing.md)、[`agent.md`](agent.md)、[`knowledge.md`](knowledge.md) |
 | `[chunking]` | 准备任务分块、纠错窗口的字幕上限 | [接自己的模型「三个质量上限」](custom-models.md#三个质量上限) |
 | `[segmentation]` | `length_scale`：字幕长短偏好 | [`tuning.md`](tuning.md) |

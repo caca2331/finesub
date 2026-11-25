@@ -16,7 +16,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 LOCKS = sorted((REPOSITORY_ROOT / "src" / "finesub_bootstrap").glob("pylock.*.toml"))
 
 #: Every environment marker the locks may carry: each is true on the platform
-#: the locks target (64-bit CPython on Windows). The quick check does not
+#: the locks target (64-bit CPython 3.12 on Windows; the version bound comes
+#: from nagisa's `DyNet38; python_version < "3.15"`). The quick check does not
 #: evaluate markers -- it is stdlib-only -- so a marker false on that platform
 #: would read as a package gone missing, and the rebuild could never install
 #: it: every run would stop at the runtime check.
@@ -26,6 +27,8 @@ MARKERS_TRUE_ON_THE_TARGET = {
     "platform_machine == 'AMD64' or platform_machine == 'aarch64' or "
     "platform_machine == 'amd64' or platform_machine == 'arm64' or "
     "platform_machine == 'x86_64'",
+    "python_full_version < '3.15'",
+    "python_full_version < '3.15' or sys_platform == 'win32'",
 }
 
 

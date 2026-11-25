@@ -26,14 +26,16 @@ finesub input.mp4 --asr moss-local --language zh --stage final-srt
   `--split-length-scale`、点名风格的档位与 `config.toml` 定（见[调参](tuning.md#字幕太长--太短)）。
 - **说话人**：开了 LLM 说话人裁判（`--diarize judge-text` / `judge-audio`）时和翻译的任务一样：`intermediate` 在纠错的同一次调用里顺带认人（[一步纠错兼认人](diarization.md#一步纠错兼认人)），`quality` 走三个 pass。一步认人在量过的中文素材上不如三个 pass（会议素材上有的模型比不开说话人裁判还差），开跑时提示一行；要更稳用 `--llm-difficulty quality`：出厂设置下这两档纠错用的模型与思考档相同，中文素材两档都不校对，只差走几个 pass。
 - **不校对**：`--llm-proofread auto` 不跑成品后的校对；写 `on` 照跑，但校对的说明是按翻译写的，效果没测过。
-- **不用知识库**：知识库的词条是按翻译写的，中文任务这次不读也不写（`--knowledge` 按 `none`，给了 `read` / `update` 或 `--refined-srt` 会提示一行）。风格照用，见上。
+- **读知识库**：词条照常读（`--knowledge read`，默认），用的是每条术语的中文定名和条目的档案，帮着把人名、作品里的专名写对；词条里讲译法与口吻的句子不给它看。
+  没有对着中文资料核实过的定名只当作机器的猜测：能联网搜的话，准备阶段与纠错要照库写这类名字之前会先搜一次，搜到有出处、读音相近的另一个中文写法就照它写；核实过的、你自己写的定名照库写（[知识库「中文定名怎么被核实」](knowledge.md#中文定名怎么被核实)）。
+- **任务结束后**：`--knowledge read`（默认）不改库。`--knowledge update` 时不做翻译任务那种知识更新（`--refined-srt` 不用，提示一行），只把这次先搜过的那些没核实的定名连同搜到的写法交给中文定名的核查：查到官方写法就改库（你写过的定名只列出来），结果列在任务报告（`task-report.md`）里。不想读库就写 `--knowledge none`。
 
 ## 产物
 
 - 文件与阶段名都不变（[运行产物](outputs.md)）：`-corrected.srt` 是忠实转写，`-translated.srt` 与成品 `.srt` 是润色版；
   `-annotated.csv` 的 `corrected` 列是忠实转写、`translation` 列是润色版（整行垫词的行这一格是空的）。
 - **简体**：Whisper 转中文时会成段写成繁体（大陆的素材也有 2–12% 的行），识别阶段最后一步统一转成简体，停在 `raw-srt` 也一样。
-  本地 MOSS 与云端三家本来就出简体。不提供繁体输出。
+  一体转写也走这一步；量过的 MAI2、35t、MOSS Pro 与本地 MOSS 本来就出简体。不提供繁体输出。
 
 ## 不在范围内的
 

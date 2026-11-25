@@ -69,6 +69,10 @@ encoder 引擎 12%、58–82 W。因此**绝对 ms 偏大**，而**比值类结�
 修法不是调参，是**用完归还**：见 `speech/diarization/{runner.py 的 close(), diarizen_runtime.py 的
 loaded_model(), nemotron3_backend.py 的 frame_activity()}`，每个后端各一处。
 
+## 别只为本机的卡调
+
+为本机显卡调性能时，项目支持的其他 NVIDIA 卡（CT2 那侧 sm_70–sm_120、≥4 GB 显存）不求每张最优，但不能太糟（owner 2026-11-03）。做法：参数按设备属性推（SM 数、共享内存上限、计算能力），不写死本机的最优值；只有新架构才有的路径（bf16 tensor core、Triton）留一条通用回退，并能用开关强制走回退在本机验证；汇报写明别的卡没实测、靠什么推断不会太糟。
+
 ## 相关
 
 - [`bench-baselines.md`](bench-baselines.md)——本机基线与二十三节实验记录（编号从「二」起，

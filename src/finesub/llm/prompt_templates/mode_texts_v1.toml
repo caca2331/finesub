@@ -31,6 +31,8 @@ examples_note = ""
 goals_audio_fix = "ASR 误听、错字、错语言、专有名词、口语停顿和重复"
 goals_text_fix = "ASR 错字、断词、无意义重复和错误语言识别"
 asr_name_forms = "假名、汉字、英文或另一种语言"
+# goals item 3: the source spelling a correction writes needs a source; a window once back-formed ファージオ from 法洁欧
+name_source_rule = "${name_sources}写出了原文写法的，照着写；只知道它的中文名、不知道原文怎么写时，不要由中文名反推原文的拼写或读音：原文保留 ASR 的写法，译文照中文名写。"
 odd_string = "生僻假名串"
 prep_name_forms = "假名/汉字/英文"
 advice_terms = "术语/人名译法"
@@ -56,6 +58,14 @@ prep_focus = "理解和翻译"
 prep_style_duty = "按 system 的候选选定本次翻译风格"
 judge_next_step = "结合译文和用户要的翻译风格（它影响字幕长短）"
 kb_names_rule = "中文译文仍须遵守词条的固定译名"
+# after the line that introduces injected entries: how a translation reads the 未核 marks (`name_trust`)
+kb_term_lines_note = "\n条目里用竖线分开的行是术语行，四列依次是 `原文|中文定名|别名|描述`。描述以 `（未核）` 或 `（未核，查不到）` 开头的行，中文定名只是机器的猜测（后一种是查过、没查到出处的）：搜索结果里有来源的${settled_by}同一个名字的另一个中文写法，译文照那个写法；没有这样的写法时，仍照定名写。没有这两种标记的定名是定下来的，搜索结果里另有写法也照定名写。说话人用的是第三列的别名、或明显换了一个叫法（按意思起的名字、外号这类）时，照说的那个叫法译，不换成定名；第三列里只是这个名字的念法或外文写法的，照定名译。"
+# in the preparation task's rule on a name the library and the transcript give differently: a translation
+# takes the library's whatever was heard, but a sourced search result beats an unchecked name
+kb_conflict_spoken = "知识库那一行的描述以 `（未核）` 或 `（未核，查不到）` 开头（它的定名只是机器的猜测），而搜索结果里有来源的、同一个名字的另一个中文写法时，照那个写法；带标记的行没有这样的写法时，仍照知识库写。没有这两种标记的定名是定下来的：搜索结果里另有写法时仍照知识库写，在 `uncertainties` 记下两种写法。"
+# search an unchecked name before adopting it; only where the preparation task can search (`prepare_prompts`).
+# What it found goes to `name_checks` when the task collects feedback (`fragment_task_feedback_name_checks_v1.md`)
+kb_unchecked_search = "要照知识库把 `（未核）` 行的定名写进 `entities`、`terminology` 或窗口背景之前，先搜一次这个名字：用那一行第一列的原文加作品名去搜，原文是外语时（日文里的汉字词也算外语）再加「中文名」三个字（不加，搜索多半只回原文那种语言的页面），不带库里的写法（带了，搜索会偏向印证知识库）；只搜这次素材里真用到、要照写的名字，不扫整个条目；这类搜索至多用你搜索次数的一半，其余留给别的疑点。即使知识库条目或你自己的记忆看起来已经足以回答，这一步的搜索也要做。没有标记的行与 `（未核，查不到）` 的行（已经有人查过）不专门去搜；`（未核，查不到）` 的行在别的搜索里碰巧看到另一个写法，照样按上面那条规则写。"
 goals_first = "1. 将录音里说出的话（主播、嘉宾，以及游戏、视频里的台词）准确地翻译成简体中文。"
 # `goals_first` + `audio_fill_clause` (a media param: `goals_audio_fill` with audio, "" without) + `goals_first_tail`;
 # `goals_grain_empty` + `grain_empty_audio_clause` (`goals_grain_empty_audio` with audio) the same way
@@ -135,6 +145,7 @@ work_compact = "纠错"
 goals_audio_fix = "ASR 听错的字词、错语言与专有名词（说话人自己的停顿、重复与说法不算 ASR 的错，corrected_text 照录）"
 goals_text_fix = "ASR 错字、断词与错误语言识别（说话人自己的停顿、重复与说法不算 ASR 的错，corrected_text 照录）"
 asr_name_forms = "别的汉字、英文或另一种语言"
+name_source_rule = ""
 odd_string = "生僻字串"
 prep_name_forms = "汉字/英文"
 examples_note = "下面的示范是中文素材：polished 都是先照抄本行 corrected_text 再做局部编辑，两列相同的行就是没有可改的地方。"
@@ -153,6 +164,9 @@ feedback_style = "字幕风格"
 heard_text = "说出的话"
 keep_verb = "纠错"
 kb_names_rule = "专名写法仍须遵守词条的中文定名"
+kb_term_lines_note = "\n条目里用竖线分开的行是术语行，四列依次是 `原文|中文定名|别名|描述`，原文多是外语，只用来认出是哪个名字：字幕不照它写，说话人直接说出的外语照原样写。素材里说到这个名字、ASR 写成读音相同或相近的别的字时，照第二列的中文定名写（描述里另有写法条件的，按描述）。描述以 `（未核）` 或 `（未核，查不到）` 开头的行，定名只是机器的猜测（后一种是查过、没查到出处的）：搜索结果里有来源的${settled_by}另一个中文写法，读音与素材相同或相近时，照那个写法；没有这样的写法时，仍照定名写。没有这两种标记的定名是定下来的，搜索结果里另有写法也照定名写。说话人用的是第三列的中文别名，或是读音与定名明显对不上的另一个叫法（按意思起的名字、外号这类；同一个外语名字换了一两个字的写法不算）时，有没有标记都照说的写，不换成定名。"
+kb_conflict_spoken = "知识库与转写或搜索结果说法不一时，下面两种情形不按知识库写。一是知识库那一行的描述以 `（未核）` 或 `（未核，查不到）` 开头（它的定名只是机器的猜测），而搜索结果里有来源、读音与转写相同或相近的另一个中文写法：照那个写法；带标记的行没有这样的写法时，仍照知识库写。二是转写多处都是另一个叫法，读音与知识库的写法明显对不上（按意思起的名字、外号这类另一个叫法；同一个外语名字换了一两个字的写法不算）：是说话人没有用库里的叫法，有没有标记都照转写写，在 `uncertainties` 记下两种写法。转写用的是那一行第三列的中文别名时，不算说法不一，照转写写，不记进 `asr_risks` 与 `uncertainties`。没有这两种标记的定名是定下来的：搜索结果里另有写法时仍照知识库写，也在 `uncertainties` 记下两种写法。"
+kb_unchecked_search = "要照知识库把 `（未核）` 行的定名写进 `entities`、`terminology` 或窗口背景之前，先搜一次这个名字：用那一行第一列的原文加作品名去搜，原文是外语时（日文里的汉字词也算外语）再加「中文名」三个字（不加，搜索多半只回原文那种语言的页面），不带库里的写法（带了，搜索会偏向印证知识库）；只搜这次素材里真用到、要照写的名字，不扫整个条目；这类搜索至多用你搜索次数的一半，其余留给别的疑点。即使知识库条目或你自己的记忆看起来已经足以回答，这一步的搜索也要做。没有标记的行与 `（未核，查不到）` 的行（已经有人查过）不专门去搜；`（未核，查不到）` 的行在别的搜索里碰巧看到另一个写法，照样按上面那条规则写。"
 judge_next_step = "看纠错后的字幕长短"
 prep_role = "中文 ASR 字幕纠错"
 prep_consumer = "后续纠错调用"

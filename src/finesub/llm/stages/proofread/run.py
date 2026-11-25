@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ...client import extract_token_distribution
-from ...degeneration import pick_after_retry, thinking_of, zero_thinking_record
+from ...degeneration import Draw, pick_after_retry, redo_record, thinking_of
 from ...exchange_log import ExchangeLogger
 from ...exchange_metadata import llm_exchange_metadata
 from ...knowledge.base import append_task_artifact
@@ -34,11 +34,11 @@ from ...routing.config import LLMRole
 from ...routing.model_router import FailureKind, classify_failure
 from ...run_context import bind_llm_worker, llm_worker_context
 from ...token_books import append_call_error, call_trace
-from .answers import AnswerError, Change, answer_of, parse_changes
+from .answers import AnswerError, Change, answer_of, parse_changes, restored
 from .prompt import Line, Window, proofread_prompt, window_context_of
 
 #: Pass 3's own prompt version, recorded with each call.
-PROMPT_VERSION = "proofread-v10"
+PROMPT_VERSION = "proofread-v12"
 SIDECAR_NAME = "proofread.json"
 #: What every window was built from, in the task artifact dir: `tools/session_replay`'s `proofread` session
 #: rebuilds a window's prompt from it (docs/session_replay.md).
@@ -267,7 +267,9 @@ def _dump_inputs(artifact_dir: Path, lines: Sequence[Line], windows: Sequence[Wi
 
 def apply_changes(segments: Sequence[TranslatedCsvSegment], windows: Sequence[Window],
                   entries: Mapping[str, Mapping[str, Any]]) -> tuple[list[TranslatedCsvSegment], list[dict[str, Any]]]:
-    """The rows with each answered window's changes written in, and the changes that changed something."""
+    """The rows with each answered window's changes written in, and the changes that changed something. A text
+    the reply left as `answers.SAME` is the row's own -- in answers kept from before the prompt allowed it too: a
+    lone `=` never was a subtitle."""
     rows = list(segments)
     changes = []
     for window in windows:
@@ -277,7 +279,8 @@ def apply_changes(segments: Sequence[TranslatedCsvSegment], windows: Sequence[Wi
         for change in entry.get("changes") or ():
             index = window.rows[int(change["position"]) - 1]
             row = rows[index]
-            corrected, translation = str(change["corrected"]), str(change["translation"])
+            corrected = restored(str(change["corrected"]), row.corrected_text)
+            translation = restored(str(change["translation"]), row.translation)
             if corrected == row.corrected_text and translation == row.translation:
                 continue
             rows[index] = replace(row, corrected_text=corrected, translation=translation)
@@ -308,11 +311,11 @@ def _ask(session: "_Session", window: Window, system: str, user: str, digest: st
     spent = attempt = 0
     held: dict[str, Any] | None = None
 
-    def success(answer: dict[str, Any], thinking: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def success(answer: dict[str, Any], redo: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return {"status": "success", "input": digest, "model": answer["model"],
                 "prompt_version": PROMPT_VERSION, "changes": [_change_fields(change) for change in answer["changes"]],
                 **({"thought_stripped": answer["stripped"]} if answer["stripped"] else {}),
-                **({"thinking": dict(thinking)} if thinking is not None else {})}
+                **({"redo": dict(redo)} if redo is not None else {})}
 
     while spent <= session.retries or held is not None:
         name = f"proofread-{window.chunk_id}-attempt{attempt}"
@@ -322,13 +325,13 @@ def _ask(session: "_Session", window: Window, system: str, user: str, digest: st
                                   repairs=max(0, session.retries - spent), fresh=held is not None)
         except ProofreadStopped as stop:
             if held is not None:  # the answer it had stands; the stop goes on up
-                raise ProofreadStopped(str(stop), kept=success(held, zero_thinking_record(
-                    held["thinking"], None, "original", error=f"stopped: {stop}"))) from stop
+                raise ProofreadStopped(str(stop), kept=success(held, redo_record(
+                    Draw(held["thinking"]), None, "original", error=f"stopped: {stop}"))) from stop
             raise
         except Exception as failure:  # noqa: BLE001 - a transient error: try again
             if held is not None:
-                return success(held, zero_thinking_record(held["thinking"], None, "original",
-                                                          error=f"{type(failure).__name__}: {failure}"))
+                return success(held, redo_record(Draw(held["thinking"]), None, "original",
+                                                 error=f"{type(failure).__name__}: {failure}"))
             error = f"{type(failure).__name__}: {failure}"
             spent += 1
             continue
@@ -339,7 +342,7 @@ def _ask(session: "_Session", window: Window, system: str, user: str, digest: st
             changes = parse_changes(text, len(window.rows))
         except AnswerError as refused:
             if held is not None:
-                return success(held, zero_thinking_record(held["thinking"], thinking_of(result), "original"))
+                return success(held, redo_record(Draw(held["thinking"]), Draw(thinking_of(result)), "original"))
             error = str(refused)
             # An empty reply (thoughts only, or blocked) is not sent back as a turn: the re-ask goes blind.
             messages = [*messages[:2], {"role": "assistant", "content": reply},
@@ -350,9 +353,9 @@ def _ask(session: "_Session", window: Window, system: str, user: str, digest: st
         answer = {"model": result.model, "changes": changes, "stripped": len(reply) - len(text),
                   "thinking": thinking_of(result)}
         if held is not None:
-            chosen = pick_after_retry(0, answer["thinking"], 0)
+            chosen = pick_after_retry(Draw(held["thinking"]), Draw(answer["thinking"]), True)
             return success(answer if chosen == "retry" else held,
-                           zero_thinking_record(held["thinking"], answer["thinking"], chosen))
+                           redo_record(Draw(held["thinking"]), Draw(answer["thinking"]), chosen))
         if answer["thinking"].skipped:
             held = answer
             continue

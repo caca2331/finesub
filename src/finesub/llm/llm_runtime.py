@@ -137,7 +137,7 @@ def _thinking_config(
 
     generation = re.search(r"gemini-(\d+)", model)
     if generation is not None and int(generation.group(1)) >= 3:
-        # Gemini 3 and later (3.x Flash, 4 Hydrogen / Argon) take thinkingLevel.
+        # Gemini 3 and later (3.x Flash, 4 Hydrogen / Neon) take thinkingLevel.
         if level:
             return thinking({"thinkingLevel": level})
         if budget is None:

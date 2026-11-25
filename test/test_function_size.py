@@ -87,10 +87,10 @@ _ALLOWED: dict[str, int] = {
     # (`_proofread`, `--llm-proofread-inline`), and the window validator asks a tool session for it.
     # 705 not 703 since 2026-11-19: the window's blocked model rides on the block error and its avoided set on
     # the ladder (content-filter model switch, owner 2026-11-19).
-    "finesub/llm/stages/correction/attempts.py:run_window_attempts": 705,
+    "finesub/llm/stages/correction/attempts.py:run_window_attempts": 684,
     # 624 not 619 since 2026-11-19: the chunk's avoided-model set, handed to its calls, ladder and proposal
     # repair, and the blocked model on the block error (content-filter model switch, owner 2026-11-19).
-    "finesub/llm/knowledge/update.py:_run_knowledge_update": 624,
+    "finesub/llm/knowledge/update.py:_run_knowledge_update": 599,
     # 562 not 636 since 2026-10-31: the chain after the decode moved out into
     # `finish_decoded`, which the collapse ladder's window decodes call too.
     # 566 not 562 since 2026-11-10: `separated_from`, and the one call that hands it with the still-loaded referee to
@@ -167,7 +167,11 @@ _ALLOWED: dict[str, int] = {
     # note saying why the check sits ahead of separation instead of inside the first resolver to see the string.
     # 447 not 444 since 2026-11-16: `--asr-speaker-merge`'s parameter with its one-line comment, and its pass-down
     # to `_run_joint_aligned` (the call took a third line).
-    "finesub/stages.py:run_pipeline": 447,
+    # 452 not 446 since 2026-11-24: `moss-diarization-aligner`'s `--asr-rows`, `--asr-transcript` and
+    # `--asr-overlap-cue` -- three parameters, the comment saying what None means, and their pass-down; the check
+    # refusing them to other backends went to `_refuse_rows_options`.
+    # 450 not 452 since 2026-11-25: `--asr-speaker-merge` deleted (MAI2's voice merge went to the speaker judge).
+    "finesub/stages.py:run_pipeline": 450,
     # 429 not 414 since 2026-09-03: `--separate/--no-separate`. This function is
     # a flat list of `add_argument` calls, so every new user-facing option costs
     # it a block and no split makes it smaller -- splitting by topic would just
@@ -204,7 +208,10 @@ _ALLOWED: dict[str, int] = {
     # 509 not 514 since 2026-11-07: `--llm-correct-translate` deleted (audit Q-17).
     # 518 not 509 since 2026-11-11: `--llm-proofread-inline`.
     # 527 not 518 since 2026-11-16: `--asr-speaker-merge`. Nine lines, three of them the help text.
-    "finesub/pipeline.py:build_parser": 527,
+    # 528 not 527 since 2026-11-20: `--asr-aligner`'s help says the CPU fallback and the Whisper step.
+    # 484 not 525 since 2026-11-24: `--asr` and the joint-ASR backends' options went to
+    # `_add_joint_asr_arguments` (73 lines) when `moss-diarization-aligner` added three more.
+    "finesub/pipeline.py:build_parser": 484,
     # 395 not 403 since 2026-09-16: naming every failed call and keeping calls
     # that bill nobody out of the provider table would have made this +21. The
     # booking and the bullet went out to `_book_provider_call` and
@@ -214,7 +221,7 @@ _ALLOWED: dict[str, int] = {
     "finesub/llm/task_report.py:render_task_report": 357,
     # 324 not 385 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
     # 333 not 324 since 2026-11-10: capableC-tracked's `spk` column (the check itself is `SpkCheck`).
-    "finesub/llm/output_protocol.py:validate_translated_csv_text": 332,
+    "finesub/llm/output_protocol.py:validate_translated_csv_text": 329,
     # 375 not 377 since 2026-11-07: each block trims by the padding it read, so the merge no longer takes the pad.
     # 377 not 375 since 2026-11-13: the separator's real placement is read back off the wrapper after the build
     # (Intel GPU support, PR #16), and a run that lands on the CPU asks the block plan for one worker -- two lines

@@ -66,8 +66,10 @@ class ModelLimits:
     # The preparation task's transcript (`id|text` lines) past which it runs in chunks of whole windows, one
     # task per chunk (owner 2026-11-08: 50k, about a dozen correction windows); 0 disables chunking.
     research_transcript_max_tokens: int = 50_000
-    # A knowledge-update chunk's three CSV blocks together (`knowledge.materials.plan_knowledge_chunks`).
-    knowledge_csv_tokens: int = 100_000
+    # What a knowledge-update chunk carries with its windows -- their CSVs, feedback and context slices
+    # (`knowledge.materials.plan_knowledge_chunks`; owner 2026-11-20: the 100k of CSV it used to count, plus about
+    # a tenth of feedback). The chunk takes less when the rest of the prompt leaves less (`update._plan_chunks`).
+    knowledge_chunk_tokens: int = 110_000
 
 
 @dataclass(frozen=True)
@@ -153,7 +155,7 @@ DEFAULT_LIMITS = ModelLimits()
 QUALITY_CAPS = {
     "prepare_chunk_tokens": ("research_transcript_max_tokens", ("research",)),
     "window_subtitle_tokens": ("max_window_subtitle_tokens", ("correction-mm", "correction-text")),
-    "knowledge_csv_tokens": ("knowledge_csv_tokens", ("knowledge",)),
+    "knowledge_chunk_tokens": ("knowledge_chunk_tokens", ("knowledge",)),
 }
 
 

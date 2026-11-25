@@ -1627,6 +1627,8 @@ class AgentTaskRuntime:
                               if key != "draft"},
                 "retirements": int(task.get("retirements", 0)),
                 "accepted_by": str(task.get("accepted_by") or ""),
+                # "session_text": the answer was the final chat text of a session that never submitted.
+                "accepted_via": (str(task.get("accepted_via") or "submit") if task.get("accepted_by") else ""),
                 **self._submit_budget(task),
             }
 
@@ -3263,9 +3265,78 @@ class AgentTaskRuntime:
                 input_hash=input_hash, result=result,
             )
 
+    def accept_session_text(
+        self,
+        *,
+        assignment_id: str,
+        task_id: str,
+        worker_id: str,
+        lease_generation: int,
+        request_id: str,
+        input_hash: str,
+        candidate: str,
+    ) -> dict[str, Any]:
+        """Judge the final chat text of a session that ended without ever submitting (docs §4).
+
+        The harness acts for the CLI that is gone, under the lease it left, and judges the text the way a
+        submit would be judged -- the same owed-block gate, the same validator over the same view. Under the
+        no-op `accept` validator any text passes, as any submit would: the caller's own parse is then the check
+        (the preparation task's, with its parse retries). A pass is
+        the session's answer: accepted (``accepted_via`` = "session_text"), or kept as the draft owing its
+        proofread turn when the validator asks for one. Anything else changes nothing -- no budget spent,
+        no draft kept -- and comes back as ``{"status": ..., "validation_errors": [...]}`` for the caller's
+        premature-stop path. A session that submitted is past this: its runtime state is the answer.
+        """
+
+        fingerprint = _sha256_text(_stable_json({
+            "task": task_id, "lease": int(lease_generation), "input_hash": input_hash,
+            "candidate": candidate, "via": "session_text",
+        }))
+        with self._locked():
+            self._recover_wal_locked()
+            state = self._load_state_locked()
+            self._assert_assignment(state, assignment_id)
+            task = self._validate_lease(
+                state, task_id=task_id, worker_id=worker_id, lease_generation=lease_generation
+            )
+            if task["spec"]["input_hash"] != input_hash:
+                raise StaleLeaseError("session text input_hash does not match the leased task")
+            if task.get("last_candidate") is not None or task.get("proofread"):
+                return {"status": "submitted", "validation_errors": []}
+            ledger = self._ledger_locked(state, task, worker_id=worker_id)
+            owed = self._owed_blocks(task, ledger)
+            if owed:
+                return {
+                    "status": "repairable",
+                    "validation_errors": [
+                        f"required block {block['kind']} ({block['digest']}) was never read in this context"
+                        for block in owed
+                    ],
+                }
+            validator = self._validators.get(task["spec"]["validator_id"])
+            if validator is None:
+                raise AgentTaskRuntimeError(f"Validator {task['spec']['validator_id']!r} is unavailable")
+            manifest = self._read_ref(task["manifest_ref"])
+            view = self.validator_view(json.loads(manifest), ledger)
+            result = validator(candidate, view).normalized()
+            if result.status != "accepted":
+                return {"status": result.status, "validation_errors": list(result.errors)}
+            task["judged_kb_reads"] = view["observed"]["kb_reads"]
+            opening = getattr(validator, "proofread_opening", None)
+            instruction = opening(result.artifact, json.loads(manifest)) if opening else None
+            if instruction:
+                return self._owe_proofread_locked(
+                    state, task, task_id=task_id, worker_id=worker_id, request_id=request_id,
+                    fingerprint=fingerprint, draft=result.artifact, instruction=instruction,
+                )
+            return self._accept_locked(
+                state, task_id=task_id, worker_id=worker_id, request_id=request_id, fingerprint=fingerprint,
+                input_hash=input_hash, result=result, via="session_text",
+            )
+
     def _accept_locked(
         self, state: dict[str, Any], *, task_id: str, worker_id: str, request_id: str, fingerprint: str,
-        input_hash: str, result: ValidationResult,
+        input_hash: str, result: ValidationResult, via: str = "",
     ) -> dict[str, Any]:
         """Accept ``result`` as the task's answer: its artifact written, the task closed, the next one leased."""
 
@@ -3289,6 +3360,8 @@ class AgentTaskRuntime:
         target_task["accepted_artifact_ref"] = artifact_ref
         # The lease goes with the accept; who did it stays for the record.
         target_task["accepted_by"] = worker_id
+        if via:
+            target_task["accepted_via"] = via
         self._prune_task_requests_locked(target, task_id)
         next_ready = self._first_ready_task(
             target, executor="agent", kind=self._worker_kind(target, worker_id)

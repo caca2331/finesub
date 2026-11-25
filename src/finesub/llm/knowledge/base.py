@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -314,24 +314,47 @@ def _repo(knowledge_root: str | Path | None):
 # their initializer (`finesub.llm.run_context.bind_llm_worker`), and anything
 # crossing a process boundary (the MCP server) gets the identity written down
 # instead of inferred from thread state (the spawn env / the task manifest).
-_GENERATION_PINS: ContextVar[Mapping[str, int] | None] = ContextVar(
-    "finesub_generation_pins", default=None
+#
+# The run's *reading* rides the same value (`KnowledgeRun.correct_only`): a
+# task that only corrects a Chinese source reads the base differently -- the
+# matchable entries come in the correct-only projection, a term's 中文定名 is a
+# match key, no entry signal is booked -- and every reader finds that out here,
+# where it finds the revision, so a new injection site cannot forget to ask.
+@dataclass(frozen=True)
+class KnowledgeRun:
+    """What one run's knowledge reads share: the pinned revision per resolved
+    root, and whether the task only corrects (no translation)."""
+
+    pins: Mapping[str, int] = field(default_factory=dict)
+    correct_only: bool = False
+    #: the task's prompts mark the 未核 中文定名 (`name_trust.trust_marks`): every correction task, translating or
+    #: correct-only; never a knowledge session, which reads the full preview it writes into
+    trust_marks: bool = False
+
+
+_KNOWLEDGE_RUN: ContextVar[KnowledgeRun | None] = ContextVar(
+    "finesub_knowledge_run", default=None
 )
 
 
 @contextmanager
-def pinned_generation_rev(knowledge_root: str | Path | None) -> Iterator[int]:
+def pinned_generation_rev(
+    knowledge_root: str | Path | None, *, correct_only: bool = False, trust_marks: bool = False
+) -> Iterator[int]:
     root_key = str(knowledge_root_path(knowledge_root))
     rev = _repo(knowledge_root).rev
-    pins = dict(_GENERATION_PINS.get() or {})
+    outer = active_knowledge_run()
+    pins = dict(outer.pins)
     pins[root_key] = rev
-    token = _GENERATION_PINS.set(pins)
+    # The reading is the task's: a pin opened inside a correct-only run keeps it.
+    token = _KNOWLEDGE_RUN.set(KnowledgeRun(
+        pins=pins, correct_only=correct_only or outer.correct_only, trust_marks=trust_marks or outer.trust_marks))
     try:
         yield rev
     finally:
-        # Token reset restores the outer mapping, so same-context nesting
+        # Token reset restores the outer value, so same-context nesting
         # unwinds stack-wise exactly as the old dict restore did.
-        _GENERATION_PINS.reset(token)
+        _KNOWLEDGE_RUN.reset(token)
 
 
 def repin_generation_rev(knowledge_root: str | Path | None) -> int | None:
@@ -347,19 +370,18 @@ def repin_generation_rev(knowledge_root: str | Path | None) -> int | None:
     exit — its token reset is unaffected by intermediate sets."""
 
     root_key = str(knowledge_root_path(knowledge_root))
-    pins = dict(_GENERATION_PINS.get() or {})
-    if root_key not in pins:
+    run = active_knowledge_run()
+    if root_key not in run.pins:
         return None
     rev = _repo(knowledge_root).rev
-    pins[root_key] = rev
-    _GENERATION_PINS.set(pins)
+    _KNOWLEDGE_RUN.set(replace(run, pins={**run.pins, root_key: rev}))
     return rev
 
 
 def _effective_rev(knowledge_root: str | Path | None, rev: int | None) -> int | None:
     if rev is not None:
         return rev
-    return (_GENERATION_PINS.get() or {}).get(str(knowledge_root_path(knowledge_root)))
+    return active_knowledge_run().pins.get(str(knowledge_root_path(knowledge_root)))
 
 
 def active_generation_pins() -> dict[str, int]:
@@ -372,13 +394,33 @@ def active_generation_pins() -> dict[str, int]:
     session host captures the pins on the thread that creates it.
     """
 
-    return dict(_GENERATION_PINS.get() or {})
+    return dict(active_knowledge_run().pins)
 
 
-def bind_generation_pins(pins: Mapping[str, int]) -> None:
-    """Rebind this thread to a run's pins (the pool-initializer channel)."""
+def active_knowledge_run() -> KnowledgeRun:
+    """This run's knowledge reading: pins and task mode, context-scoped like
+    the pins alone (an empty one outside a run, or with ``--knowledge none``)."""
 
-    _GENERATION_PINS.set(dict(pins))
+    return _KNOWLEDGE_RUN.get() or KnowledgeRun()
+
+
+def bind_knowledge_run(run: KnowledgeRun) -> None:
+    """Rebind this thread to a run's reading (the pool-initializer channel)."""
+
+    _KNOWLEDGE_RUN.set(run)
+
+
+def reads_correct_only() -> bool:
+    """Whether the run on this context reads the base as a correct-only task."""
+
+    return active_knowledge_run().correct_only
+
+
+def reads_trust_marks() -> bool:
+    """Whether the run on this context sees the 未核 marks on term lines (a correct-only run always does)."""
+
+    run = active_knowledge_run()
+    return run.trust_marks or run.correct_only
 
 
 def kb_index_block_text(knowledge_root: str | Path, rev: int | None = None) -> str:
@@ -464,9 +506,16 @@ def load_entry_texts(
     """Entry bodies (human projection) for primary keys or aliases.
 
     Returns ``(found: {primary_key: content}, missing: [name, ...])``.
+
+    The one in-process way a matchable entry's body reaches a prompt, so the
+    run's reading is applied here: a correct-only task gets the correct-only
+    projection (`render_subject`), whoever the caller is.
     """
 
-    return _repo(knowledge_root).load_entry_texts(names, _effective_rev(knowledge_root, rev))
+    return _repo(knowledge_root).load_entry_texts(
+        names, _effective_rev(knowledge_root, rev), correct_only=reads_correct_only(),
+        trust_marks=reads_trust_marks(),
+    )
 
 
 # Local keyword pre-injection: harness-side (not LLM-robust) matching of index
@@ -610,12 +659,13 @@ def _term_matches(
 ) -> list[TermMatch]:
     if not (text or "").strip():
         return []
-    from .node.matching import ExactIndex
-    from .node.render import format_line, node_aliases
+    from .node.matching import CORRECT_ONLY_NODE_KINDS, ExactIndex
+    from .node.render import model_line
 
     store = _repo(knowledge_root).store
     at = store.current_rev() if rev is None else rev
-    index = ExactIndex.build(store, at, include_tentative=False)
+    correct_only = reads_correct_only()
+    index = ExactIndex.build(store, at, include_tentative=False, zh_names=correct_only)
 
     hits: dict[str, dict[str, Any]] = {}
     for match in index.scan(text or ""):
@@ -623,12 +673,14 @@ def _term_matches(
         node = store.node(key.node_id, at)
         if node is None or node.kind == "subject":
             continue  # the entry level is `match_index_keywords`' job
+        if correct_only and node.kind not in CORRECT_ONLY_NODE_KINDS:
+            continue  # a free sentence's alias: the sentence is not this task's to read
         bucket = hits.setdefault(
             key.node_id,
             {"node": node, "subject": key.subject_id, "via": [], "hits": 0},
         )
         bucket["hits"] += 1
-        if key.kind != "surface" and key.raw:
+        if key.kind not in ("surface", "zh") and key.raw:
             bucket["via"].append(key.raw)
 
     out: list[TermMatch] = []
@@ -640,7 +692,8 @@ def _term_matches(
             TermMatch(
                 subject=str((subject.payload if subject else {}).get("surface") or ""),
                 section=str(parents[0].section if parents else ""),
-                line=format_line(node, node_aliases(store, node, at)),
+                # a correction task reads the line as its entry shows it, trust mark included
+                line=model_line(store, node, at, trust_marks=reads_trust_marks()),
                 via=tuple(dict.fromkeys(bucket["via"])),
                 hits=int(bucket["hits"]),
             )
@@ -806,6 +859,17 @@ def knowledge_signals_enabled(knowledge_root: str | Path | None) -> bool:
             "（FINESUB_KNOWLEDGE_WRITE=1 可放行）",
         )
     return False
+
+
+def entry_signals_enabled(knowledge_root: str | Path | None) -> bool:
+    """Whether this run books the entry signals (``matched`` / ``exposed`` /
+    ``landed``). A correct-only task books none, silently: ``landed`` means the
+    canonical name is in the corrected text and not in the raw transcript, and
+    a Chinese transcript often carries the name already, so its entries would
+    pile up as "exposed, never landed" in the report and the share counts.
+    Style signals keep the plain gate -- they never depended on the task mode."""
+
+    return not reads_correct_only() and knowledge_signals_enabled(knowledge_root)
 
 
 # The OS byte lock is exclusive per file *handle*, so a second thread of this

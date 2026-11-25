@@ -48,18 +48,21 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from ....speech.diarization import judgments as sidecar
+from ....speech.diarization.labels import speaker_of
 from ....subtitles.stable_rows import read_rows
 from ...chunking import SubtitleWindow
 from ...client import extract_token_distribution, is_likely_output_limited
 from ...correction_patch import PATCH_TAG, PatchMerge
-from ...degeneration import pick_after_retry, thinking_of, zero_thinking_record
+from ...degeneration import Draw, pick_after_retry, redo_record, thinking_of
 from ...routing.model_router import FailureKind, classify_failure
 from ...exchange_log import ExchangeLogger
 from ...exchange_metadata import llm_exchange_metadata
@@ -71,6 +74,7 @@ from ...routing.profiles import TranslationProfile
 from ...run_context import bind_llm_worker, llm_worker_context
 from ...token_books import append_call_error, call_trace
 from .answers import (
+    parse_block,
     AnswerError,
     Insert,
     Split,
@@ -92,19 +96,29 @@ from .answers import (
 from .prompt import (
     SAMPLE_GAP,
     Candidate,
+    PHRASES,
     Carried,
+    Row,
     audio_layout,
     cell_tracks,
+    label_source,
+    split_note,
     judge_prompt,
     profiles,
+    voice_hint,
+    voice_pairs,
+    no_one,
     rows_of,
+    stage_tracks,
 )
+from . import people_io
+from ....speech.diarization import track_people as people_table
 from .patch import RepairBase, apply_patch, patch_instruction, repair_base, whole_instruction
 from .windows import JudgeWindow, halves, split_windows
 
 #: The judge's own prompt version, apart from the correction's `PROMPT_VERSION`, recorded with each
 #: verdict; a bump re-judges nothing (owner 2026-10-09: a verdict that still matches its rows is reused).
-PROMPT_VERSION = "speaker-judge-v11"
+PROMPT_VERSION = "speaker-judge-v27"
 #: Calls per unit before it is recorded as failed (agy's malformed replies ran about one in five); repair
 #: rounds count, those a tool session ran inside one call included.
 MAX_ATTEMPTS = 4
@@ -163,6 +177,8 @@ class _Repair:
     errors: tuple[str, ...]
     base: RepairBase | None = None
     patch_errors: tuple[str, ...] = ()
+    #: the person table's instructions (a cloud task's)
+    people: bool = False
 
     @property
     def all_errors(self) -> tuple[str, ...]:
@@ -170,8 +186,8 @@ class _Repair:
 
     def instruction(self) -> str:
         if self.base is None:
-            return whole_instruction(self.all_errors)
-        return patch_instruction(self.base, self.all_errors)
+            return whole_instruction(self.all_errors, self.people)
+        return patch_instruction(self.base, self.all_errors, self.people)
 
 
 def _repair_of(text: str, errors: Sequence[str], ids: Sequence[str], tracks: Sequence[int]) -> _Repair | None:
@@ -201,12 +217,20 @@ class JudgeReport:
 @dataclass(frozen=True)
 class JudgeInputs:
     """What the judge is told besides the rows: the title, the candidates (empty when neither the
-    knowledge base nor the preparation task names anyone), and `summary`, the preparation task's summary
-    for a unit's rows by their ids (`summary_of`)."""
+    knowledge base nor the preparation task names anyone), `summary`, the preparation task's summary
+    for a unit's rows by their ids (`summary_of`), and on a cloud task how alike its labels sound
+    (`speech.joint.voices`; None: not compared)."""
 
     title: str
     pool: tuple[Candidate, ...] = ()
     summary: Callable[[Sequence[str]], str] = lambda ids: ""
+    voices: Mapping[str, Any] | None = None
+
+
+def prepared_notes(pool: Sequence[Candidate]) -> bool:
+    """Whether the person table shows each candidate the preparation task's description (`Candidate.note`, after
+    〔准备任务〕) and the prompt says what it is: a candidate carries one."""
+    return any(candidate.note for candidate in pool)
 
 
 def vocal_audio_for(stable_json: str | Path) -> Path | None:
@@ -319,7 +343,8 @@ def _dump_inputs(artifact_dir: Path, *, stable_json: Path, inputs: JudgeInputs, 
                  media: str, audio: Any, shape: str | None, profile: TranslationProfile, task_id: str) -> None:
     """`summaries`: each window's, by window id (a chunked preparation task's differ by window)."""
     payload = {"version": 2, "stable_json": str(stable_json), "title": inputs.title, "summaries": dict(summaries),
-               "pool": [{"name": candidate.name, "others": list(candidate.others)} for candidate in inputs.pool],
+               "pool": [{"name": candidate.name, "others": list(candidate.others),
+                         **({"note": candidate.note} if candidate.note else {})} for candidate in inputs.pool],
                "media": media, "audio": str(audio) if audio else "", "shape": shape, "marks": marks_shown(),
                "profile_id": profile.profile_id, "task_id": task_id}
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -384,6 +409,22 @@ def _halve(state: _Run, index: int, rows: Sequence[Any]) -> None:
         for half, (low, high) in enumerate(halves(rows, judged.low, judged.high))]})
 
 
+def relayed(segments: Sequence[Mapping[str, Any]], found: Sequence[sidecar.Unit], unit: sidecar.Unit, rows: list,
+            pool: Sequence[Candidate], serial: bool) -> dict[str, Any]:
+    """What `unit` is judged with besides its rows, as `_judge_unit`'s keywords: on a serial task the tracks the
+    units before it opened (`carried`) and, on a cloud one, the person table they built with its cuts, moves and
+    people (every track a person); its number among the units, from 1 (`segment`). The session replay rebuilds a
+    unit's prompt with it."""
+    table = people_before(segments, found, unit, pool) if serial and label_source(rows) == "cloud" else None
+    cuts = cuts_before(segments, found, unit, table) if table is not None else None
+    return {"carried": carried_tracks(segments, found, unit) if serial else [], "table": table, "cuts": cuts,
+            "moved": moved_out(segments, found, unit, cuts) if cuts is not None else {},
+            "kept": kept_rows(segments, found, unit, cuts) if cuts is not None else None,
+            "old": old_rows(segments, found, unit, cuts) if cuts is not None else None,
+            "people_keys": opened_people(segments, found, unit, table) if table is not None else {},
+            "segment": next(at for at, other in enumerate(found, 1) if other.id == unit.id)}
+
+
 def _judge_whole_window(state: _Run, index: int, session: "_Session", rows: list, inputs: JudgeInputs, *,
                         audio: Path | None, serial: bool, limits: Any, counter: Any,
                         write: Callable[[], None], warn: Callable[[str], None]) -> None:
@@ -396,14 +437,13 @@ def _judge_whole_window(state: _Run, index: int, session: "_Session", rows: list
             if not todo:
                 return
             unit = todo[0]
-            found = state.units()
-            carried = carried_tracks(state.segments, found, unit) if serial else []
+            relay = relayed(state.segments, state.units(), unit, rows, inputs.pool, serial)
         part = JudgeWindow(unit.id, str(state.entries[index].get("chunk")), unit.low, unit.high)
         whole = unit.id == str(state.entries[index].get("id"))
         try:
-            entry = _judge_unit(session, rows, part, inputs, tracks=state.tracks, carried=carried, audio=audio,
-                                limits=limits, counter=counter, may_halve=whole and part.size >= 2, shape=state.shape,
-                                segments=state.segments)
+            entry = _judge_unit(session, rows, part, inputs, tracks=state.tracks, audio=audio, limits=limits,
+                                counter=counter, may_halve=whole and part.size >= 2, shape=state.shape,
+                                segments=state.segments, **relay)
         except Cut:
             with state.lock:
                 _halve(state, index, rows)
@@ -434,7 +474,7 @@ def carried_tracks(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.
     before = next((other for other in found if other.high == unit.low), None)
     if before is None or not sidecar.holds(segments, before):
         return []
-    resolved = sidecar.resolve(segments, found)
+    resolved = sidecar.resolve(segments, found, merging=False)
     verdicts = {other.id: sidecar.verdict_of(other.entry) for other in found}
     used = [key for key in (_track_of(result, before.id, verdicts) for result in _answers(before.entry))
             if key is not None]
@@ -447,7 +487,219 @@ def carried_tracks(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.
             continue
         lines = tuple(sorted(position[row] for row, track in resolved.judgments.moved.items()
                              if track == number and position[row] < unit.low))
-        out.append(Carried(number, key[0], key[1], _name(earlier, key, number, verdicts), lines, verdicts[key[0]]))
+        name = _name(earlier, key, number, verdicts, resolved.opened, sidecar.largest_track(segments) + 1)
+        out.append(Carried(number, key[0], key[1], name, lines, verdicts[key[0]]))
+    return out
+
+
+def moved_out(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit, cuts: "CutState"
+              ) -> dict[int, tuple[int, int, list[tuple[int, int]]]]:
+    """Per transcription track of a cloud task: of the rows before this unit that it leads, how many the units that
+    hold moved to another track, and where (the track as the reader numbers it now, and how many), most first.
+    Splits, inserts and abstentions are not moves. A cut track (`cuts`) counts from its latest piece's first row, and
+    that piece is not a move; a move to a cut track's latest piece is said as that track, one to its earlier piece
+    goes to a number of its own (`CutState.aside`), said by that piece's name."""
+    base = sidecar.largest_track(segments) + 1
+    moves = sidecar.resolve(segments, found, merging=False).judgments.moved
+    ids = sidecar.segment_ids(segments)
+    rows: Counter = Counter()
+    where: dict[int, Counter] = {}
+    for index in range(min(unit.low, len(segments))):
+        track = sidecar.acoustic_main(speaker_of(segments[index]))
+        if not isinstance(track, int) or track >= base:
+            continue
+        if index < cuts.start.get(track, 0):
+            continue
+        rows[track] += 1
+        to = moves.get(ids[index])
+        if to is not None and to != track and to != cuts.number.get(track):
+            if to in (latest := {number: other for other, number in cuts.number.items()}):
+                to = latest[to]
+            elif to < base and cuts.pieces.get(to) \
+                    and (key := cuts.piece_at(to, index)) != cuts.pieces[to][-1][1]:
+                to = next((number for number, other in cuts.aside.items() if other == key),
+                          base + 1000 + len(cuts.aside))
+                cuts.aside[to] = key
+            where.setdefault(track, Counter())[to] += 1
+    return {track: (sum(c.values()), rows[track], sorted(c.items(), key=lambda kv: (-kv[1], kv[0])))
+            for track, c in where.items()}
+
+
+def kept_rows(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit, cuts: "CutState"
+              ) -> dict[int, list[int]]:
+    """Per transcription track: its own rows before this unit, from its latest piece's first row, that the
+    units before left on it (row indices; a row they moved to another track is gone, one a cut put on its latest
+    piece stays) -- the rows its latest piece's voiceprint is made of so far."""
+    base = sidecar.largest_track(segments) + 1
+    moves = sidecar.resolve(segments, found, merging=False).judgments.moved
+    ids = sidecar.segment_ids(segments)
+    out: dict[int, list[int]] = {}
+    for index in range(unit.low):
+        track = sidecar.acoustic_main(speaker_of(segments[index]))
+        if not isinstance(track, int) or track >= base or index < cuts.start.get(track, 0):
+            continue
+        if moves.get(ids[index]) in (None, track, cuts.number.get(track)):
+            out.setdefault(track, []).append(index)
+    return out
+
+
+def old_rows(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit, cuts: "CutState"
+             ) -> dict[str, list[int]]:
+    """Per earlier piece of a cut track (its person key: the track's own `t:<track>` for the first, a cut's for
+    the next): its own rows before this unit, from where it starts to where the next piece does, that the units
+    before left on it (row indices; a row moved to another track is gone, one moved onto it from elsewhere is not
+    its own) -- what its voiceprint is made of. The latest piece's are `kept_rows`."""
+    base = sidecar.largest_track(segments) + 1
+    moves = sidecar.resolve(segments, found, merging=False).judgments.moved
+    ids = sidecar.segment_ids(segments)
+    spans = {track: [(0, people_table.track_key(track)), *pieces] for track, pieces in cuts.pieces.items() if pieces}
+    out: dict[str, list[int]] = {}
+    for index in range(min(unit.low, len(segments))):
+        track = sidecar.acoustic_main(speaker_of(segments[index]))
+        if not isinstance(track, int) or track >= base or track not in spans:
+            continue
+        at = max(k for k, (start, _) in enumerate(spans[track]) if start <= index)
+        if at == len(spans[track]) - 1:
+            continue
+        key = spans[track][at][1]
+        if moves.get(ids[index]) in (None, track, cuts.numbers.get(key)):
+            out.setdefault(key, []).append(index)
+    return out
+
+
+def people_before(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit,
+                  cast: Sequence[Any]) -> people_table.Table:
+    """The person table as the units before this one left it: the candidates (`prompt.Candidate`, with their other
+    names and the preparation task's descriptions), then what each unit that holds wrote, in
+    order (`speech.diarization.track_people.replay`)."""
+    return people_table.replay([c.name for c in cast], [(other.id, other.entry) for other in found
+                                      if other.high <= unit.low and sidecar.holds(segments, other)],
+                               {c.name: c.others for c in cast},
+                               {c.name: c.note for c in cast if c.note} if prepared_notes(cast) else None)
+
+
+@dataclass(frozen=True)
+class CutState:
+    """The cuts the units before one make (`track_people.Table.cut`), for the tracks whose latest piece is a
+    cut's: where that piece starts (`start`: row index; `since`: segment and row id), the track number the reader
+    gives it (`number`), what an answer naming the track is written as (`carry`: opener, label, its verdict), and
+    per track the candidates its piece's rows were moved to (`guard`: tracks never cut included)."""
+
+    start: dict[int, int] = field(default_factory=dict)
+    since: dict[int, tuple[int, str]] = field(default_factory=dict)
+    number: dict[int, int] = field(default_factory=dict)
+    carry: dict[int, tuple[str, str, str]] = field(default_factory=dict)
+    guard: dict[int, set[str]] = field(default_factory=dict)
+    #: every cut track's pieces from where they start (row index, person key), oldest first
+    pieces: dict[int, list[tuple[int, str]]] = field(default_factory=dict)
+    #: the numbers `moved_out` gives an earlier piece a move went to (said by that piece's name) -> its person
+    aside: dict[int, str] = field(default_factory=dict)
+    #: every cut piece's person -> the track number the reader gives it (`number` is the latest piece's)
+    numbers: dict[str, int] = field(default_factory=dict)
+
+    def piece_at(self, track: int, index: int) -> str:
+        return ([key for at, key in self.pieces.get(track, ()) if at <= index] or [people_table.track_key(track)])[-1]
+
+
+def cuts_seen(cuts: CutState, table: people_table.Table) -> dict[str, str]:
+    """Each cut track's latest piece a unit is shown (`cuts`, from the relayed person table; the one its `sK`
+    means), with its cutting unit as it stood then (`track_people.people_of`): what the unit records, so that a cut
+    reaches its rows only when the unit saw that very cut. An earlier piece is left out: were the latest one's
+    cutter judged again, the unit's rows would otherwise fall to a piece it judged a different person."""
+    return {key: table.created.get(people_table.key_unit(key) or "", "")
+            for pieces in cuts.pieces.values() if pieces
+            for key in (pieces[-1][1],) if people_table.cut_of(key) is not None}
+
+
+def cuts_before(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit,
+                table: people_table.Table) -> CutState:
+    """What the cuts of the units before this one that hold mean for it (`CutState`)."""
+    ids = sidecar.segment_ids(segments)
+    position = {row: index for index, row in enumerate(ids)}
+    earlier = [other for other in found if other.high <= unit.low and sidecar.holds(segments, other)]
+    entries = {other.id: other.entry for other in earlier}
+    opened = sidecar.resolve(segments, found, merging=False).opened
+    state = CutState()
+    for track, pieces in table.pieces.items():
+        for key in pieces[1:]:
+            opener, cut = people_table.key_unit(key), people_table.cut_of(key)
+            if opener in entries and cut is not None and cut[1] in position:
+                state.pieces.setdefault(track, []).append((position[cut[1]], key))
+                if (opener, people_table.cut_label(track, cut[1])) in opened:
+                    state.numbers[key] = opened[(opener, people_table.cut_label(track, cut[1]))]
+        state.pieces[track] = sorted(state.pieces.get(track, []))
+        key = pieces[-1]
+        opener, cut = people_table.key_unit(key), people_table.cut_of(key)
+        if opener not in entries or cut is None or cut[1] not in position:
+            continue
+        label = people_table.cut_label(track, cut[1])
+        state.start[track] = position[cut[1]]
+        state.since[track] = (table.opened_in.get(key, 0), cut[1])
+        if (opener, label) in opened:
+            state.number[track] = opened[(opener, label)]
+        state.carry[track] = (opener, label, sidecar.verdict_of(entries[opener]))
+
+    def destination(result: Mapping[str, Any], other_id: str, index: int) -> str | None:
+        if result.get("label") is not None:
+            label = str(result["label"])
+            return (table.persons.get(other_id) or {}).get(f"@{label}") or people_table.opened_key(other_id, label)
+        carried = result.get("carried")
+        if isinstance(carried, Mapping):
+            window, label = str(carried.get("window")), str(carried.get("label"))
+            return (table.persons.get(window) or {}).get(f"@{label}") or people_table.opened_key(window, label)
+        track = result.get("track")
+        return state.piece_at(track, index) if isinstance(track, int) and not isinstance(track, bool) else None
+
+    for other in earlier:
+        for result in other.entry.get("results") or ():
+            track, index = result.get("from"), position.get(str(result.get("row")))
+            if not isinstance(track, int) or isinstance(track, bool) or index is None \
+                    or index < state.start.get(track, 0):
+                continue
+            key = destination(result, other.id, index)
+            if key is not None and key in table.people and people_table.candidate(end := table.land(key)):
+                state.guard.setdefault(track, set()).add(end)
+    return state
+
+
+def opened_people(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit,
+                  table: people_table.Table) -> dict[int, str]:
+    """The tracks the units before this one opened, as the file numbers them now -> their person: an `@label`
+    track's own, a `@pN` track's candidate; for the moves' destinations (`people_io.profile_names`)."""
+    opened = sidecar.resolve(segments, found, merging=False).opened
+    out: dict[int, str] = {}
+    for other in found:
+        if other.high > unit.low:
+            continue
+        labels = {label: people_table.opened_key(other.id, label) for label in other.entry.get("opened_people") or ()}
+        labels.update({people_table.cut_label(int(cut["track"]), str(cut["row"])):
+                       people_table.cut_key(other.id, int(cut["track"]), str(cut["row"]))
+                       for cut in other.entry.get("cuts") or ()})
+        for label, key in {**labels, **{at[1:]: key for at, key in (table.persons.get(other.id) or {}).items()}}.items():
+            track = opened.get((other.id, label))
+            if track is not None and key in table.people:
+                out[track] = key
+    return out
+
+
+def cut_results(found: list[dict[str, Any]], cuts: Sequence[Mapping[str, Any]],
+                position: Mapping[str, int]) -> list[dict[str, Any]]:
+    """A cutting unit's answers (its results, its splits' second halves or its inserts: each names a row and who)
+    with each naming a track it cut, from the cut's row on (`position`: row id -> index), put on the new piece
+    (`label`); the cut track's own rows are the reader's to move (`judgments.resolve`)."""
+    starts = {int(cut["track"]): str(cut["row"]) for cut in cuts}
+    out = []
+    for result in found:
+        track = result.get("track")
+        carried = result.get("carried")
+        if isinstance(carried, Mapping):  # a track an earlier unit cut, cut again here
+            cut = people_table.cut_of(people_table.opened_key(str(carried.get("window")), str(carried.get("label"))))
+            track = cut[0] if cut else None
+        start = starts.get(track) if isinstance(track, int) and not isinstance(track, bool) else None
+        if start is not None and position.get(str(result["row"]), -1) >= position.get(start, len(position)):
+            result = {key: value for key, value in result.items() if key not in ("track", "carried")}
+            result["label"] = people_table.cut_label(track, start)
+        out.append(result)
     return out
 
 
@@ -467,17 +719,30 @@ def _track_of(result: Mapping[str, Any], unit_id: str, verdicts: Mapping[str, st
     return None
 
 
-def _name(units: Sequence[sidecar.Unit], key: tuple[str, str], number: int, verdicts: Mapping[str, str]) -> str:
-    """Who the judge last said a new track is: `@label` in the unit that opened it, `s<number>` in the
-    units after it that still carry it (only those before the one being judged)."""
+def _name(units: Sequence[sidecar.Unit], key: tuple[str, str], number: int, verdicts: Mapping[str, str],
+          opened: Mapping[tuple[str, str], int], base: int) -> str:
+    """Who the judge last said a new track is: `@label` in the unit that opened it, its `sN` in the units
+    after it that still carry it (only those before the one being judged). Keys and links (`s2`, `@乙`)
+    are both read as the unit that wrote them meant them (`judgments.unit_track`: a resume may have
+    renumbered the new tracks since); a link is given as that track's number now, and one that no longer
+    resolves, or names the track itself, is no name."""
     name = ""
     for unit in units:
         names = unit.entry.get("names") or {}
         if unit.id == key[0]:
-            name = names.get(f"@{key[1]}", name)
-        elif f"s{number}" in names and any(_track_of(result, unit.id, verdicts) == key
-                                           for result in _answers(unit.entry)):
-            name = names[f"s{number}"]
+            said = names.get(f"@{key[1]}")
+        elif any(_track_of(result, unit.id, verdicts) == key for result in _answers(unit.entry)):
+            said = next((value for at, value in names.items()
+                         if sidecar.unit_track(unit, str(at), base, opened, verdicts) == number), None)
+        else:
+            continue
+        if said is None:
+            continue
+        link, note = split_note(said)
+        if link.startswith("@") or re.fullmatch(r"s\d+", link):
+            other = sidecar.unit_track(unit, link, base, opened, verdicts)
+            link = f"s{other}" if other is not None and other != number else ""
+        name = f"{link}（{note}）" if note else link
     return name
 
 
@@ -581,21 +846,232 @@ def _too_long(system: str, user: str, seconds: float, limits: Any, counter: Any)
     return tokens > INPUT_SHARE * limits.prompt_input_limit
 
 
+#: A track on stage whose rows here compare under this with its rows before (`kept_rows`) is said to sound unlike
+#: them (offline 2026-11-23, ten spans: one person's lowest 0.65; three of the target changes 0.48-0.56)
+VOICE_CHANGE = 0.6
+#: ... or whose rows here from some row on compare under this with its rows before that row (its kept rows and its
+#: rows here before it). Offline 2026-11-23 (ten spans, deduplicated): one person's lowest over the rows 0.587, none
+#: under 0.55 of 119; 35 of 62 changes under it, the lowest mostly at the change or a row or two off.
+VOICE_SPLIT = 0.55
+
+
+@dataclass(frozen=True)
+class VoiceHint:
+    """A track on stage whose voice changes here (`voice_split`): from the row at `at` (row index) on, and the
+    line the script's own cut measures it against again (`voice_guards`): `VOICE_CHANGE` when the whole unit
+    against before was under it, else `VOICE_SPLIT`; `like`, the track's earlier pieces (person keys, most
+    alike first) the rows from `at` on sound `high` like (`piece_voices`)."""
+
+    at: int
+    line: float
+    like: tuple[str, ...] = ()
+
+
+def piece_voices(rows: Sequence[Row], unit: JudgeWindow, voices: Mapping[str, Any] | None, on_stage: Sequence[int],
+                 off_stage: Sequence[int], cuts: CutState, kept: Mapping[int, Sequence[int]],
+                 old: Mapping[str, Sequence[int]] | None = None, table: people_table.Table | None = None
+                 ) -> tuple[dict[int | str, Any], dict[int | str, str], dict[int, VoiceHint]]:
+    """(Each cut track's voiceprint as its latest piece -- its kept rows, judged by the units before; this unit's
+    rows are not judged yet --, None when too short; how the voice section names that piece; the tracks on stage
+    whose rows here, from some row on, sound unlike their rows before it, and from which row). The other tracks
+    keep their label's print (`prompt.voice_pairs`). Each earlier piece (`old`, `old_rows`) long enough
+    to print is in the prints and names too, under its person key (named by `table`'s handle and where it ends);
+    a hinted cut track's hint says which of them its rows from the hinted row on sound like (`VoiceHint.like`). A
+    latest piece too short to print gives no hint and no pair with its own earlier pieces (rare: cut at the end of
+    the unit before; the cost is a link not made)."""
+    from ....speech.joint import voices as V
+
+    if not voices or voices.get("unavailable"):
+        return {}, {}, {}
+    here = {track: [index for index in range(unit.low, unit.high) if rows[index].tracks[:1] == [track]]
+            for track in on_stage}
+    prints: dict[int | str, Any] = {track: V.piece(voices, kept.get(track, ()))
+                                    for track in [*on_stage, *off_stage] if track in cuts.start}
+    names: dict[int | str, str] = {
+        track: PHRASES["piece_name"].format(track=track, segment=cuts.since[track][0], row=cuts.since[track][1])
+        for track in prints if track in cuts.since}
+    for key, indices in (old or {}).items():
+        if (vector := V.piece(voices, indices)) is None:
+            continue
+        prints[key] = vector
+        names[key] = old_piece_name(table, key) if table is not None else key
+    changed = {track: hint for track in on_stage
+               if (hint := voice_split(voices, here[track], kept.get(track, ()))) is not None}
+    for track, hint in changed.items():
+        after = V.piece(voices, [index for index in here[track] if index >= hint.at])
+        alike = sorted(((cos, key) for key, vector in prints.items()
+                        if isinstance(key, str) and people_table.piece_track(key) == track
+                        and (cos := V.cosine(after, vector)) is not None
+                        and V.tier({"cos": cos, "overlap": 0.0}, voices["tiers"]) == "high"), reverse=True)
+        if alike:
+            changed[track] = replace(hint, like=tuple(key for _, key in alike))
+    return prints, names, changed
+
+
+def old_piece_name(table: people_table.Table, key: str) -> str:
+    """How the voice section names a cut track's earlier piece: its handle (`s3-1`) and where it ends."""
+    pieces = table.pieces.get(people_table.piece_track(key), [])
+    after = pieces[pieces.index(key) + 1]
+    return PHRASES["old_piece_name"].format(handle=table.handle(key), segment=table.opened_in.get(after, 0),
+                                            row=people_table.cut_of(after)[1])
+
+
+def voice_change(voices: Mapping[str, Any] | None, here: Sequence[int], before: Sequence[int]) -> float | None:
+    """How alike a track's rows here and its kept rows before sound: their prints' cosine, None when either is
+    too short."""
+    from ....speech.joint import voices as V
+
+    return V.cosine(V.piece(voices, here), V.piece(voices, before))
+
+
+def voice_split(voices: Mapping[str, Any] | None, here: Sequence[int], before: Sequence[int]) -> VoiceHint | None:
+    """Where a track's voice changes in this unit, if it does: for each of its rows here (`here`, in order), its
+    rows from that one on against its rows before it (`before`, its kept rows, and its rows here before that one).
+    It changes when the first row's cosine is under `VOICE_CHANGE` or a later row's under
+    `VOICE_SPLIT`; it changes at the row with the lowest cosine (the earliest of equals), measured again later under
+    the line that fired (the first row's when both did). Without kept rows nothing
+    is compared (a track first heard here has no voice to change from); a side too short has no print."""
+    if not before:
+        return None
+    scores = [(cos, k) for k in range(len(here))
+              if (cos := voice_change(voices, here[k:], [*before, *here[:k]])) is not None]
+    if not any(cos < (VOICE_CHANGE if k == 0 else VOICE_SPLIT) for cos, k in scores):
+        return None
+    _, k = min(scores)
+    whole = any(k_ == 0 and cos < VOICE_CHANGE for cos, k_ in scores)
+    return VoiceHint(here[k], VOICE_CHANGE if whole else VOICE_SPLIT)
+
+
+def _stays(verdict: Verdict, row: Row) -> bool:
+    """Whether a judged row stays on its own track: kept, abstained, or answered the track it leads."""
+    return verdict.kind in ("keep", "abstain") or (verdict.kind == "track" and verdict.track == row.tracks[0])
+
+
+def voice_guards(rows: Sequence[Row], unit: JudgeWindow, voices: Mapping[str, Any] | None,
+                 hints: Mapping[int, VoiceHint], verdicts: Mapping[str, Verdict], cut: Collection[int],
+                 kept: Mapping[int, Sequence[int]]) -> dict[int, str]:
+    """The tracks the script cuts itself (track -> the row id it cuts at): a hinted track (`hints`) this unit did
+    not cut (`cut`: the cuts it wrote that stand, a forced one included), whose rows that stay on it once judged
+    still sound changed from the hinted row on -- against its kept rows and its rows here before that row that stay,
+    under the hint's own line. A track whose changed rows the judge moved away (none left, or too short to print)
+    is not cut. It is cut at its first row from the hinted one that stays."""
+    out: dict[int, str] = {}
+    for track, hint in hints.items():
+        if track in cut:
+            continue
+        stays = [index for index in range(unit.low, unit.high) if rows[index].tracks[:1] == [track]
+                 and _stays(verdicts[f"q{rows[index].id}"], rows[index])]
+        after = [index for index in stays if index >= hint.at]
+        if not after:
+            continue
+        cos = voice_change(voices, after, [*kept.get(track, ()), *(index for index in stays if index < hint.at)])
+        if cos is not None and cos < hint.line:
+            out[track] = rows[after[0]].id
+    return out
+
+
+@dataclass
+class UnitPrompt:
+    """One unit's prompt as `unit_prompt` builds it, and what reading its reply needs: on a cloud task the person
+    table (`table`, None on a local task) and its state, which replace the carried tracks (empty then)."""
+
+    system: str
+    user: str
+    ids: Sequence[str]
+    layout: Any
+    table: people_table.Table | None
+    shown: Sequence[int]
+    carried: Sequence[Carried]
+    tracks: Sequence[int]
+    on_stage: Sequence[int]
+    rows_on: Mapping[int, Sequence[str]] | None
+    cuts: CutState | None
+    changed: Mapping[int, Any]
+
+
+def unit_prompt(rows: list, unit: JudgeWindow, inputs: JudgeInputs, *, tracks: Sequence[int],
+                carried: Sequence[Carried], heard: bool, shape: bool, correct_only: bool,
+                moved: Mapping[int, tuple[int, int, Sequence[tuple[int, int]]]] | None = None,
+                table: people_table.Table | None = None, people_keys: Mapping[int, str] | None = None,
+                cuts: CutState | None = None, kept: Mapping[int, Sequence[int]] | None = None,
+                old: Mapping[str, Sequence[int]] | None = None, segment: int) -> UnitPrompt:
+    """The prompt `_judge_unit` sends for `unit` (`heard`: with the audio), and the dry run previews: a cloud task's
+    first unit with no `table` gets one seeded from the candidates (`people_before`), as the first unit judged."""
+    shown = stage_tracks(rows, unit, marks=marks_shown())
+    stage = None
+    if label_source(rows) == "cloud":
+        # A cloud task's profiles list only the tracks on stage, every one a person of the person table, which
+        # replaces the candidates, the example lines and the tracks' notes; the profile says whom it lands on. A row
+        # of someone off stage goes to a new track, and the table merges it (`judgments.merges`). A track off stage
+        # whose voice is close to one on stage is listed, its pairs shown.
+        if table is None:
+            table = people_before([], [], unit, inputs.pool)
+        on_stage = table.stage(track for track in shown if not no_one(rows, track))
+        earlier = [track for key in table.people
+                   if (track := people_table.key_track(key)) is not None and track not in on_stage]
+        cuts = cuts or CutState()
+        prints, piece_names, changed = piece_voices(rows, unit, inputs.voices, on_stage, earlier, cuts, kept or {},
+                                                    old, table)
+        voiced = sorted({b for _, b, _ in voice_pairs(rows, on_stage, inputs.voices, earlier, prints) if b not in on_stage})
+        table.voiced = {table.current(track) for track in voiced}  # a cut track is its latest piece
+        off_stage = {track: people_io.brief(table, table.current(track)) for track in voiced}
+        keys = {**{track: table.current(track) for key in table.people
+                    if (track := people_table.key_track(key)) is not None},
+                **(people_keys or {}), **(cuts.aside if cuts is not None else {})}
+        relayed = people_io.profile_names(table, keys)
+        stage, carried, tracks = shown, (), ()
+        # each track's ▶ rows here (what a cut may start at), and its rows before, here and after
+        rows_on = {track: [row.id for row in rows[unit.low:unit.high] if row.tracks[:1] == [track]]
+                   for track in on_stage}
+        spread = {track: (sum(1 for row in rows[cuts.start.get(track, 0):unit.low] if row.tracks[:1] == [track]),
+                          len(rows_on[track]),
+                          sum(1 for row in rows[unit.high:] if row.tracks[:1] == [track]),
+                          cuts.since.get(track))
+                  for track in on_stage}
+    else:
+        table, off_stage, rows_on, spread, prints, piece_names, changed = None, None, None, None, None, None, {}
+        relayed = None
+    profile = profiles(rows, unit, carried, inputs.voices, merging=True, relayed=relayed, moved=moved, stage=stage,
+                       people=table is not None, off_stage=off_stage, spread=spread, prints=prints,
+                       piece_names=piece_names,
+                       changed={track: voice_hint(track, rows[hint.at].id, [table.handle(key) for key in hint.like])
+                                for track, hint in changed.items()})
+    layout = audio_layout(rows, unit, profile.samples) if heard else None
+    summary = inputs.summary([row.id for row in rows[unit.low:unit.high]])
+    system, user, ids = judge_prompt(rows, unit, title=inputs.title, summary=summary, cast=inputs.pool,
+                                     marks=marks_shown(), profile=profile, audio=layout, shape=shape,
+                                     correct_only=correct_only,
+                                     people=people_io.table_section(table, segment, prepared_notes(inputs.pool))
+                                     if table is not None else None, prepared=prepared_notes(inputs.pool))
+    return UnitPrompt(system, user, ids, layout, table, shown, tuple(carried), tuple(tracks),
+                      on_stage if table is not None else [], rows_on, cuts, changed)
+
+
 def _judge_unit(session: _Session, rows: list, unit: JudgeWindow, inputs: JudgeInputs, *,
                 tracks: Sequence[int], carried: Sequence[Carried], audio: Path | None,
                 limits: Any, counter: Any, may_halve: bool, shape: str | None = None,
-                segments: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+                segments: Sequence[Mapping[str, Any]] = (),
+                moved: Mapping[int, tuple[int, int, Sequence[tuple[int, int]]]] | None = None,
+                table: people_table.Table | None = None, people_keys: Mapping[int, str] | None = None,
+                cuts: CutState | None = None, kept: Mapping[int, Sequence[int]] | None = None,
+                old: Mapping[str, Sequence[int]] | None = None, segment: int) -> dict[str, Any]:
     """One call (and its retries) for one unit. Raises `Cut` when a whole window does not fit; a half
     that does not fit comes back failed (one level only, as the correction's split). `segments` are the
-    rows' own (their words: where a split is cut)."""
+    rows' own (their words: where a split is cut). `kept` (`kept_rows`) makes a cut track's voiceprint its latest
+    piece's and tells which tracks sound unlike their earlier rows here, from which row on (`voice_split`); a hinted
+    track the reply does not cut is cut by the script (`voice_guards`)."""
     session.start_unit()
     entry: dict[str, Any] = {"prompt_version": PROMPT_VERSION, "media": "audio" if audio else "text"}
-    profile = profiles(rows, unit, carried)
-    layout = audio_layout(rows, unit, profile.samples) if audio is not None else None
-    summary = inputs.summary([row.id for row in rows[unit.low:unit.high]])
-    system, user, ids = judge_prompt(rows, unit, title=inputs.title, summary=summary, cast=inputs.pool,
-                                     marks=marks_shown(), profile=profile, audio=layout, shape=shape is not None,
-                                     correct_only=session.profile.correct_only)
+    built = unit_prompt(rows, unit, inputs, tracks=tracks, carried=carried, heard=audio is not None,
+                        shape=shape is not None, correct_only=session.profile.correct_only, moved=moved, table=table,
+                        people_keys=people_keys, cuts=cuts, kept=kept, old=old, segment=segment)
+    system, user, ids, layout, table = built.system, built.user, built.ids, built.layout, built.table
+    shown, carried, tracks, on_stage = built.shown, built.carried, built.tracks, built.on_stage
+    rows_on, cuts, changed = built.rows_on, built.cuts, built.changed
+    if cuts is not None and table is not None and (seen := cuts_seen(cuts, table)):
+        entry["cuts_seen"] = seen  # only the cuts it was shown reach its rows (`judgments.resolve`)
+    if table is not None and len(people_io.render_table(table)) > people_io.TABLE_CHARS:
+        entry["people_table_over"] = len(people_io.render_table(table))  # only noted (owner: 8000 tokens)
     if _too_long(system, user, layout.seconds if layout else 0.0, limits, counter):
         if may_halve:
             raise Cut()
@@ -607,47 +1083,85 @@ def _judge_unit(session: _Session, rows: list, unit: JudgeWindow, inputs: JudgeI
         clip = extract_spliced_audio(audio, layout.pieces, SAMPLE_GAP,
                                      session.artifact_dir / "clips" / f"speaker-judge-{unit.id}.aac")
         file_ref = session.upload(clip, speech=layout.speech(rows))
-    shown = {track for index in unit.shown(rows) for track in cell_tracks(rows[index], marks=marks_shown())}
     known = [*tracks, *shown, *(track.track for track in carried)]
     carry = {track.track: (track.window, track.label, track.of) for track in carried}
+    # an answer naming a track an earlier unit cut is its latest piece: a row's, a split's second half, an insert
+    cut_carry = dict(cuts.carry) if table is not None else {}
 
     def read(text: str) -> dict[str, Any]:
-        """The reply's answers; raises `AnswerError` for one that does not read."""
+        """The reply's answers; raises `AnswerError` for one that does not read. With the person table a row
+        answered `pN` opens a new track for that person (`people_io.answers_with_people`)."""
         heard = shape is not None and layout is not None
-        return {"verdicts": parse_judge(text, ids, known),
+        implied: dict[str, str] = {}
+        if table is not None:
+            text, implied = people_io.answers_with_people(text, table)
+        return {"verdicts": parse_judge(text, ids, known), "implied": implied,
                 "acts": parse_acts(text, ids) if shape is not None else None,
                 "splits": parse_splits(text, ids, known) if heard else ({}, []),
                 "fills": parse_fills(text, ids) if heard else {},
                 "inserts": parse_inserts(text, ids, known) if heard else ({}, []),
-                "names": parse_tracks(text)}
+                "names": parse_tracks(text), "people": parse_block(text, "people") if table is not None else None}
 
-    def settle(answer: dict[str, Any], thinking: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def settle(answer: dict[str, Any], redo: Mapping[str, Any] | None = None) -> dict[str, Any]:
         verdicts, acts = answer["verdicts"], answer["acts"]
         entry.update(model=answer["model"], usage=dict(session.local.usage), status="success")
         if answer["repairs"]:
             entry["repairs"] = answer["repairs"]
-        if thinking is not None:
-            entry["thinking"] = dict(thinking)
+        if redo is not None:
+            entry["redo"] = dict(redo)
         if answer["stripped"]:
             entry["thought_stripped"] = answer["stripped"]
         taken, gated = _short_row_gate(rows, unit, verdicts, carry) if layout is not None else (verdicts, [])
-        entry.update(names=answer["names"], results=results(rows, unit, taken, carry))
-        if gated:
-            entry["gated"] = gated
+        entry.update(names=answer["names"], results=results(rows, unit, taken, {**carry, **cut_carry}))
         if acts is not None:  # a split is checked against the verdict that stands (a gated row keeps its track)
-            placed, refused = _placed_splits(segments, rows, unit, taken, acts.acts, answer["splits"][0], carry,
-                                             {move["row"]: move["track"] for move in gated})
+            placed, refused = _placed_splits(segments, rows, unit, taken, acts.acts, answer["splits"][0],
+                                             {**carry, **cut_carry}, {move["row"]: move["track"] for move in gated})
             ignored = [*acts.ignored, *answer["splits"][1], *refused]
             if layout is not None:
                 filled, unfilled = _placed_fills(rows, acts.acts, answer["fills"], {split["row"] for split in placed})
                 entry.update(splits=placed, fills=filled,
-                             inserts=_placed_inserts(rows, answer["inserts"][0], layout, carry))
+                             inserts=_placed_inserts(rows, answer["inserts"][0], layout, {**carry, **cut_carry}))
                 ignored += [*unfilled, *answer["inserts"][1]]
             entry.update(acts=acts.acts, ignored=ignored)
+        if table is not None:  # the unit's `@` labels: its rows', and its placed splits' second halves' and inserts'
+            heard_labels = [edit["label"] for edit in (*entry.get("splits", ()), *entry.get("inserts", ()))
+                            if "label" in edit]
+            labels = list(dict.fromkeys([*(verdict.label for verdict in verdicts.values()
+                                           if verdict.kind == "new" and verdict.label), *heard_labels]))
+
+            def people(voice_cuts: Mapping[int, str] | None = None) -> dict[str, Any]:
+                return people_io.read_people(answer["names"], answer["people"], table, unit.id, answer["implied"],
+                                             labels, segment, rows_on=rows_on, guard=cuts.guard,
+                                             voice_cuts=voice_cuts)
+
+            said = people()
+            if changed:  # a hinted track the reply left whole is cut by the script, its lines this unit dropped
+                guards = voice_guards(rows, unit, inputs.voices, changed, taken,
+                                      {int(cut["track"]) for cut in said.get("cuts") or ()}, kept or {})
+                if guards:
+                    said = people(guards)
+            entry.update(segment=segment, stage=on_stage, **said)
+            if changed:  # for the audit: where the hint pointed, per track, and the earlier pieces it named
+                entry["voice_hints"] = {str(track): rows[hint.at].id for track, hint in changed.items()}
+                if like := {str(track): [table.handle(key) for key in hint.like]
+                            for track, hint in changed.items() if hint.like}:
+                    entry["voice_like"] = like
+        if carry:  # what the numbers it was shown stood for: a later re-judge before it renumbers them (`merges`)
+            entry["shown_tracks"] = {f"s{number}": {"window": window, "label": label, "of": of}
+                                     for number, (window, label, of) in carry.items()}
+        if gated:
+            entry["gated"] = gated
+        if entry.get("cuts"):  # what this unit put on a track it cut, from the cut's row on, is the new piece's
+            position = {row.id: index for index, row in enumerate(rows)}
+            for name in ("results", "splits", "inserts"):
+                if name in entry:
+                    entry[name] = cut_results(entry[name], entry["cuts"], position)
         return entry
 
     answer_tracks = sorted(set(known))
-    validator = {"id": VALIDATOR_ID, "params": {"ids": list(ids), "tracks": answer_tracks}}
+    validator = {"id": VALIDATOR_ID, "params": {"ids": list(ids), "tracks": answer_tracks,
+                                                **({"people": sorted(people_io.pickable(table))}
+                                                   if table is not None else {})}}
     # An answer that read but reported no thinking although it was asked to waits here for one more call in a
     # fresh session, past the attempt budget; the unit keeps one of the two (`degeneration`, owner 2026-10-17).
     held: dict[str, Any] | None = None
@@ -665,13 +1179,13 @@ def _judge_unit(session: _Session, rows: list, unit: JudgeWindow, inputs: JudgeI
                                   repair=sent, validator=validator, repairs=max(0, MAX_ATTEMPTS - attempt))
         except JudgeStopped as stop:
             if held is not None:  # the answer it had stands; the stop goes on up
-                raise JudgeStopped(str(stop), kept=settle(held, zero_thinking_record(
-                    held["thinking"], None, "original", error=f"stopped: {stop}"))) from stop
+                raise JudgeStopped(str(stop), kept=settle(held, redo_record(
+                    Draw(held["thinking"]), None, "original", error=f"stopped: {stop}"))) from stop
             raise
         except Exception as error:  # noqa: BLE001 - a transient error: try again (with the same repair)
             if held is not None:
-                return settle(held, zero_thinking_record(held["thinking"], None, "original",
-                                                         error=f"{type(error).__name__}: {error}"))
+                return settle(held, redo_record(Draw(held["thinking"]), None, "original",
+                                                error=f"{type(error).__name__}: {error}"))
             continue
         rounds = int(getattr(result, "agent_repair_rounds", 0) or 0)  # run inside the call: on the budget
         attempt += rounds
@@ -685,7 +1199,7 @@ def _judge_unit(session: _Session, rows: list, unit: JudgeWindow, inputs: JudgeI
                       "thinking": thinking_of(result), "repairs": repairs}
         except AnswerError as refused:
             if held is not None:
-                return settle(held, zero_thinking_record(held["thinking"], thinking_of(result), "original"))
+                return settle(held, redo_record(Draw(held["thinking"]), Draw(thinking_of(result)), "original"))
             # The output ceiling, by the API's usage (an agent's usage is the whole session's: never compared)
             ceiling = getattr(result, "requested_output_tokens", 0) or (limits.output_limit if limits else 0)
             if ceiling and is_likely_output_limited(result.raw_response, max_tokens=ceiling):
@@ -696,12 +1210,19 @@ def _judge_unit(session: _Session, rows: list, unit: JudgeWindow, inputs: JudgeI
             if merge is not None and merge.mode == "invalid":
                 repair = replace(sent, patch_errors=refused.errors)  # the same base, the patch's own errors first
             else:
-                repair = _repair_of(text, refused.errors, ids, answer_tracks)
+                # a row answered pN reads as its new track, so the repair asks only for the rows that went wrong
+                swapped = people_io.swap_people(text, set(people_io.pickable(table)))[0] \
+                    if table is not None else text
+                repair = _repair_of(swapped, refused.errors, ids, answer_tracks)
+                if repair is not None and swapped is not text:  # the model is shown what it wrote, pN as pN
+                    repair = replace(repair, text=text)
+                if repair is not None and table is not None:
+                    repair = replace(repair, people=True)
             continue
         if held is not None:
-            chosen = pick_after_retry(0, answer["thinking"], 0)
+            chosen = pick_after_retry(Draw(held["thinking"]), Draw(answer["thinking"]), True)
             return settle(answer if chosen == "retry" else held,
-                          zero_thinking_record(held["thinking"], answer["thinking"], chosen))
+                          redo_record(Draw(held["thinking"]), Draw(answer["thinking"]), chosen))
         # A patch is a few rows: not thinking over it is normal (owner 2026-10-24, as the correction's).
         if answer["thinking"].skipped and not (merge is not None and merge.mode == "patch"):
             held = answer

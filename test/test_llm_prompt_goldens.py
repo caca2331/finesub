@@ -223,6 +223,7 @@ def _pass_cases():
     from finesub.llm.stages.proofread.run import PROMPT_VERSION as PROOFREAD_VERSION
     from finesub.llm.stages.speaker_judge import prompt as judge
     from finesub.llm.stages.speaker_judge.run import PROMPT_VERSION as JUDGE_VERSION
+    from finesub.llm.stages.speaker_judge.run import JudgeInputs, unit_prompt
     from finesub.llm.stages.speaker_judge.windows import JudgeWindow
 
     from .support.speaker_judge import segments_of, speaker
@@ -247,10 +248,28 @@ def _pass_cases():
            JUDGE_VERSION)
     # a cloud task's rows: the tracks are its transcription's speakers
     cloud = [replace(row, group_key=f"S0{row.speaker.track + 1}") for row in rows]
-    cloud_profile = judge.profiles(cloud, window)
-    yield ("speaker-judge-cloud-shape-heard.txt",
-           lambda: joined(judge.judge_prompt(cloud, window, marks=False, profile=cloud_profile, shape=True,
-                                             audio=judge.audio_layout(cloud, window, cloud_profile.samples), **common)),
+    # (as production builds a unit's prompt, `run.unit_prompt`: the first unit, the person table only the candidate)
+    inputs = JudgeInputs(common["title"], common["cast"], lambda ids: common["summary"])
+
+    def unit(rows_, inputs_, **options):
+        built = unit_prompt(rows_, window, inputs_, tracks=(), carried=(), shape=True, correct_only=False, segment=1,
+                            **options)
+        return joined((built.system, built.user))
+
+    yield ("speaker-judge-cloud-shape-heard.txt", lambda: unit(cloud, inputs, heard=True), JUDGE_VERSION)
+    # a split transcription's: a label first heard after a seam, one from a re-asked piece, the lines with no speaker,
+    # and how alike the labels sound (`speech.joint.voices`)
+    seams = ("w0:A", "w1:B", "c1:w0:C", "unknown")
+    split = judge.rows_of(segments_of([(speaker(i % 4), 2, f"台词{i}") for i in range(1, 9)]))
+    split = [replace(row, group_key=seams[row.speaker.track],
+                     speaker=replace(row.speaker, extras={**row.speaker.extras, "joint_speaker": seams[row.speaker.track]}))
+             for row in split]
+    voices = {"labels": {"w0:A": {"printed": True}, "w1:B": {"printed": True}, "c1:w0:C": {"printed": False}},
+              "pairs": [{"a": "w0:A", "b": "w1:B", "cos": 0.8, "overlap": 0.0},
+                        {"a": "w0:A", "b": "c1:w0:C", "cos": None, "overlap": 0.0},
+                        {"a": "w1:B", "b": "c1:w0:C", "cos": None, "overlap": 0.0}],
+              "tiers": {"high": 0.90, "mid": 0.75}}  # MAI2's (`voices.TIERS`)
+    yield ("speaker-judge-cloud-seams.txt", lambda: unit(split, replace(inputs, voices=voices), heard=False),
            JUDGE_VERSION)
     lines = [proofread.Line(2.0, "そうだね", f"行{n}", f"译{n}", None, "") for n in range(1, 6)]
     context = ContextPack(general_context={"global_summary": "雑談", "entities": [{"name": "佐藤", "zh": "佐藤"}]},

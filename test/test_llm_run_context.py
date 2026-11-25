@@ -24,7 +24,7 @@ from finesub.llm.agent.agent_session_host import (
     agent_session_scope,
     current_registry,
 )
-from finesub.llm.knowledge.base import active_generation_pins, bind_generation_pins
+from finesub.llm.knowledge.base import KnowledgeRun, active_generation_pins, bind_knowledge_run
 from finesub.llm.run_context import (
     LaneOrdinalPool,
     bind_llm_worker,
@@ -38,7 +38,7 @@ def _clear_pins_after():
     """Pins bound on the test thread's context outlive the test otherwise."""
 
     yield
-    bind_generation_pins({})
+    bind_knowledge_run(KnowledgeRun(pins={}))
 
 
 def _fake_host(builds: list[str], label: str) -> SimpleNamespace:
@@ -95,7 +95,7 @@ def test_pool_workers_inherit_pins_and_registry_concurrently() -> None:
     """W1 acceptance 5/6: workers read the run's pin and registry, and the
     binding survives many work items running concurrently in one pool."""
 
-    bind_generation_pins({"root-x": 7})
+    bind_knowledge_run(KnowledgeRun(pins={"root-x": 7}))
     with agent_session_scope() as registry:
         context = llm_worker_context()
         barrier = threading.Barrier(3, timeout=10)
@@ -383,7 +383,7 @@ def test_mcp_spec_carries_the_pins_captured_at_construction(tmp_path) -> None:
         ),
         driver_id="fake",
     )
-    bind_generation_pins({"C:/kb-root-of-this-run": 5})
+    bind_knowledge_run(KnowledgeRun(pins={"C:/kb-root-of-this-run": 5}))
     host = AgentSessionHost(
         driver,
         root=tmp_path / "assignment",

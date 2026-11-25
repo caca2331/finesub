@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -209,6 +210,16 @@ def test_aggregate_reads_artifacts_last_wins_and_scores(tmp_path) -> None:
     assert scores[("common", "原神")] == 1.0
     assert "星野灯" in aggregate.feedback_slice_text("0001")
     assert aggregate.research_slice_text()
+
+
+def test_a_window_asked_again_whose_committed_answer_gave_no_feedback_has_none(tmp_path) -> None:
+    for feedback in (json.dumps({"uncertainties": ["旧答案的"]}), ""):
+        append_task_artifact(tmp_path, kind="correction_window_task_feedback", task_id="t",
+                             payload={"chunk_id": "0001", "feedback": feedback, "retrieval_urls": ["https://x.example"]})
+
+    aggregate = aggregate_task_update_feedback([tmp_path])
+
+    assert "0001" not in aggregate.window_feedback and aggregate.is_empty
 
 
 def test_retrieval_urls_backfill_from_ledger_not_from_model(tmp_path) -> None:
@@ -610,29 +621,37 @@ def _materials(chunk_id: str, csv_chars: int) -> WindowMaterials:
         context_slice="",
         feedback_slice="",
         rows=(),
-        refined_csv="x" * csv_chars,
+        refined_csv="■" * csv_chars,
     )
 
 
 def _count_x(text: str) -> int:
-    """Counts the filler alone: the empty window_csv's header would otherwise count too."""
-    return text.count("x")
+    """Counts the filler alone: the pack's headers would otherwise count too."""
+    return text.count("■")
 
 
 def test_plan_knowledge_chunks_cuts_on_window_boundaries() -> None:
     windows = [_materials("0001", 60), _materials("0002", 60), _materials("0003", 10)]
 
-    chunks = plan_knowledge_chunks(windows, count_tokens=_count_x, csv_token_budget=100)
+    chunks = plan_knowledge_chunks(windows, count_tokens=_count_x, token_budget=100)
 
     assert [chunk.window_ids for chunk in chunks] == [("0001",), ("0002", "0003")]
-    assert chunks[0].csv_tokens == 60
-    assert chunks[1].csv_tokens == 70
+    assert chunks[0].material_tokens == 60
+    assert chunks[1].material_tokens == 70
+
+
+def test_a_chunk_counts_what_travels_with_its_windows_not_only_their_csv() -> None:
+    windows = [replace(_materials("0001", 30), feedback_slice="■" * 40), _materials("0002", 40)]
+
+    chunks = plan_knowledge_chunks(windows, count_tokens=_count_x, token_budget=100)
+
+    assert [chunk.window_ids for chunk in chunks] == [("0001",), ("0002",)], "70 + 40 is over 100; the CSVs alone are not"
 
 
 def test_plan_knowledge_chunks_oversized_window_gets_own_chunk() -> None:
     windows = [_materials("0001", 500), _materials("0002", 10)]
 
-    chunks = plan_knowledge_chunks(windows, count_tokens=_count_x, csv_token_budget=100)
+    chunks = plan_knowledge_chunks(windows, count_tokens=_count_x, token_budget=100)
 
     assert [chunk.window_ids for chunk in chunks] == [("0001",), ("0002",)]
 
@@ -743,13 +762,12 @@ def test_build_knowledge_materials_artifacts_only(tmp_path) -> None:
         final_srt=final_srt,
         research_context=context,
         artifact_dirs=[artifact_dir],
-        count_tokens=_count,
     )
 
     assert materials.mode == MODE_ARTIFACTS_ONLY
     assert materials.window_count == 2
     assert not materials.warnings
-    pack = materials.chunks[0].packs_text()
+    pack = materials.windows[0].pack_text()
     assert "--- window 0001" in pack
     assert "<context_slice>\n第一窗背景" in pack
     assert "星野灯" in pack  # feedback slice
@@ -770,11 +788,10 @@ def test_build_knowledge_materials_refined_mode(tmp_path) -> None:
         research_context=context,
         artifact_dirs=[artifact_dir],
         refined_srt=refined,
-        count_tokens=_count,
     )
 
     assert materials.mode == MODE_REFINED_ALIGNED
-    pack = materials.chunks[0].packs_text()
+    pack = "\n".join(window.pack_text() for window in materials.windows)
     assert "<refined_csv>" in pack
     assert "你好呀" in pack and "拜拜" in pack
 
@@ -790,10 +807,9 @@ def test_build_knowledge_materials_degrades_without_artifacts(tmp_path) -> None:
         final_srt=final_srt,
         research_context=context,
         artifact_dirs=[tmp_path / "missing-artifacts"],
-        count_tokens=_count,
     )
 
     assert materials.window_count == 1
-    assert materials.chunks[0].windows[0].chunk_id == "all"
+    assert materials.windows[0].chunk_id == "all"
     assert any("fallback window" in warning for warning in materials.warnings)
     assert any("task_update_feedback" in warning for warning in materials.warnings)

@@ -54,25 +54,25 @@ EXPECTED_GROUPS = {
         "gemini-free-3_8-flash",
         "local-agy-sonnet-5_5",
         "local-agy-gemini-4-hydrogen",
-        "local-agy-gemini-4-argon",
+        "local-agy-gemini-4-neon",
     ],
     "agy-basic": [
         "gemini-free-3_6-flash",
         "local-agy-sonnet-5_5",
         "local-agy-gemini-4-hydrogen",
-        "local-agy-gemini-4-argon",
+        "local-agy-gemini-4-neon",
     ],
     # The `agy` preset's pair: the same rosters with the API head removed.
     "agy-only-capable": [
         "local-agy-sonnet-5_5",
         "local-agy-gemini-4-hydrogen",
-        "local-agy-gemini-4-argon",
+        "local-agy-gemini-4-neon",
     ],
-    "agy-only-fast": ["local-agy-gemini-4-hydrogen", "local-agy-gemini-4-argon"],
+    "agy-only-fast": ["local-agy-gemini-4-hydrogen", "local-agy-gemini-4-neon"],
     "agy-only-basic": [
         "local-agy-sonnet-5_5",
         "local-agy-gemini-4-hydrogen",
-        "local-agy-gemini-4-argon",
+        "local-agy-gemini-4-neon",
     ],
     # Tool-protocol only, so bound by nothing out of the box: `dsh --profile
     # headless` takes its task from its command line, which a whole window
@@ -336,12 +336,14 @@ def test_catalog_rejects_an_capability_that_is_neither(tmp_path: Path, cell: str
         load_effective_catalog(path)
 
 
-def test_the_old_score_key_is_refused_with_its_new_name(tmp_path: Path) -> None:
+@pytest.mark.parametrize("old, new", [("quality_score", "capability"),
+                                      ("knowledge_csv_tokens", "knowledge_chunk_tokens")])
+def test_an_old_key_is_refused_with_its_new_name(tmp_path: Path, old: str, new: str) -> None:
     path = tmp_path / "model_catalog.toml"
     path.write_text(
-        "[models.gemini-free-3_6-flash]\nquality_score = 82\n", encoding="utf-8"
+        f"[models.gemini-free-3_6-flash]\n{old} = 82\n", encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="quality_score is now called capability"):
+    with pytest.raises(ValueError, match=f"{old} is now called {new}"):
         load_effective_catalog(path)
 
 
@@ -570,14 +572,8 @@ def test_a_media_cell_with_nothing_that_can_hear_still_warns() -> None:
     assert any("没有成员支持音频" in message for message in warnings), warnings
 
 
-def test_a_media_cell_with_one_hearing_member_reports_its_depth() -> None:
-    """"Someone can hear" is not the same as "this chain has any depth".
-
-    Collapsing the per-member warning to a boolean removed the noise but also
-    the signal: a four-member cell whose media calls have exactly one real
-    candidate reads as healthy while being one failure from having nowhere to
-    go. So the warning reports the count instead.
-    """
+def test_a_media_cell_with_one_hearing_member_is_not_a_warning() -> None:
+    """One member that can hear is a choice, not a fault (owner 2026-11-23)."""
 
     routes = load_model_routes(
         user_config={
@@ -599,10 +595,7 @@ def test_a_media_cell_with_one_hearing_member_reports_its_depth() -> None:
         }
     )
 
-    warnings = routes.preset_binding_warnings("thin-mm")
-    depth = [m for m in warnings if "链长为 1" in m]
-    assert depth, warnings
-    assert "local-agy-sonnet-5_5" in depth[0]
+    assert not any("音频" in m for m in routes.preset_binding_warnings("thin-mm"))
 
 
 def test_binding_warnings_fire_on_floor_envelope_and_media(tmp_path: Path) -> None:
@@ -880,9 +873,9 @@ def test_a_group_plans_with_its_smallest_quality_cap_a_blank_one_counting_as_the
     blank = _capped_routes(tmp_path)
     assert blank.facts["ds-flash"].window_subtitle_tokens is None
     limits = planning_limits_for("correction-text", "quality", routes=blank)
-    assert (limits.max_window_subtitle_tokens, limits.research_transcript_max_tokens, limits.knowledge_csv_tokens) == (
-        10_000, 50_000, 100_000) == (DEFAULT_LIMITS.max_window_subtitle_tokens,
-                                     DEFAULT_LIMITS.research_transcript_max_tokens, DEFAULT_LIMITS.knowledge_csv_tokens)
+    assert (limits.max_window_subtitle_tokens, limits.research_transcript_max_tokens, limits.knowledge_chunk_tokens) == (
+        10_000, 50_000, 110_000) == (DEFAULT_LIMITS.max_window_subtitle_tokens,
+                                     DEFAULT_LIMITS.research_transcript_max_tokens, DEFAULT_LIMITS.knowledge_chunk_tokens)
     smaller = _capped_routes(tmp_path, window="6000")
     assert planning_limits_for("correction-text", "quality", routes=smaller).max_window_subtitle_tokens == 6000
     # raising it takes every member: the blank Gemini member still counts as 10000

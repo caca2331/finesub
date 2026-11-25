@@ -1,23 +1,26 @@
 """Speakers by voice, for the joint-ASR backends.
 
 MOSS (Pro and local) numbers its speakers per call, and within one call often splits one person into several labels.
-Once a MOSS transcript is put together -- its parts stitched (overlap co-speaking links the parts' labels), each
+Once a MOSS transcript is put together -- its parts stitched (each part's labels kept apart, `stitch`), each
 gap re-request's labels renamed apart (`renumber`) -- `merge_by_voice` merges, over the whole transcript, the
 labels that are one person: a WeSpeaker ResNet34 voiceprint (the model the default speaker diarization uses; on
 the CPU, local MOSS's on CUDA) per segment, put in PLDA space; per label, the mean weighted by clean seconds; then
-`merge_labels` at THETA. Without the model nothing is merged and every re-request's labels stay new people.
+`merge_labels` at MERGE_THETA. Before that, a re-request's label with too little voice to tell becomes unknown
+(`unknown_rescues`). Without the model nothing is merged and every re-request's labels stay new people.
 
 The research behind it is `docs/joint-asr.md`「设计取舍」: across parts, windows and re-requests this one step beat
 matching re-requests one-to-one by voice and clustering windows with a same-window ban, since it also merges the
 labels one call split a person into.
 
-MAI2 merges the same way only under `--asr-speaker-merge on`, at MAI2_THETA (`speaker_merge`; owner 2026-11-16).
+35t, MAI2 and Scribe are not merged: at no cosine were their merges right often enough (owner 2026-11-21,
+`docs/joint-asr.md`「设计取舍」); the speaker judge merges them, the close pairs shown as a hint (`voices`).
 
 `Voices` serves the word-level backends' repairs (35t, MAI2, Scribe).
 """
 
 from __future__ import annotations
 
+import re
 import threading
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
@@ -33,14 +36,20 @@ MIN_CLEAN_FRAMES = 50
 WEIGHT_CAP = 10.0
 #: A label with less embedded speech than this is not matched.
 MIN_LABEL = 3.0
+#: `merge_by_voice`'s: of the merges at 0.90 and above about 1% joined two people, at 0.75-0.90 about 9% (owner
+#: 2026-11-21, measured per backend on real seams; MOSS Pro's set as local MOSS's). The rest go to the speaker judge.
+MERGE_THETA = 0.9
+#: `Voices`' match of a repair's piece or label to a known one.
 THETA = 0.8
-#: MAI2's labels mix people far more than MOSS's: at 0.8 a third of the merges joined two people, at 0.95 none of
-#: the 17 merges on transcripts with speaker truth did but one, between two labels that each held the same two
-#: people (owner 2026-11-16: offered, off under `auto`, since it fires on few sources).
-MAI2_THETA = 0.95
-#: `--asr-speaker-merge` (`[asr] speaker_merge`): `auto` is off for every backend it applies to (MAI2); the MOSS
-#: backends merge regardless.
-SPEAKER_MERGE_MODES = ("auto", "on", "off")
+#: A re-request's label (`renumber`'s `c<k>:`) with less voice than this (clean seconds, weighed as `centroids`
+#: weighs them) is nobody it can be told to be: its segments become unknown, for the speaker judge to place. On
+#: pieces cut short of known labels, a match at cosine >= 0.9 was wrong about 1% of the time from 5 s and 9% at
+#: 3-5 s (owner 2026-11-19).
+RESCUE_MIN = 5.0
+#: The key of a re-request's segment holding the label of the segment it says again (local MOSS's gap windows,
+#: `moss_local.rules.twin`): the label it takes instead of unknown.
+TWIN = "twin"
+_RESCUE = re.compile(r"(?:^|:)c\d+:")
 #: What an unmerged MOSS transcript leaves: every re-request's labels are new people (`renumber`).
 REUSE_UNMERGED = "，续调、补调回来的都当新人"
 #: Two labels talking over each other for more than this share of the smaller one's time are two people.
@@ -137,7 +146,7 @@ VOICEPRINTS = Voiceprints()
 VOICEPRINTS_CUDA = Voiceprints("cuda")
 
 
-class _Prints:
+class Prints:
     """Per segment (by identity: a relabelled segment is the same dict), its voiceprint and clean seconds,
     computed once per transcript."""
 
@@ -177,22 +186,44 @@ class _Prints:
         return self.embed(piece, mask), float(mask.sum()) / 100
 
 
-def _centroids(segs: Sequence[dict], every: Sequence[dict], prints: _Prints) -> dict[str, np.ndarray]:
-    import numpy as np
-
-    sums: dict[str, np.ndarray] = {}
-    weights: dict[str, float] = {}
+def _weighed(segs: Sequence[dict], every: Sequence[dict], prints: Prints):
+    """(label, voiceprint, weight) of each labelled segment of `segs` long enough to embed (masked by `every`)."""
     for s in segs:
         if s["speaker"] is None:
             continue
         got = prints.of(s, every)
-        if got is None:
-            continue
-        vec, clean = got
-        w = min(clean, WEIGHT_CAP)
-        sums[s["speaker"]] = sums.get(s["speaker"], 0) + w * vec
-        weights[s["speaker"]] = weights.get(s["speaker"], 0.0) + w
-    return {lab: v / np.linalg.norm(v) for lab, v in sums.items() if weights[lab] >= MIN_LABEL}
+        if got is not None:
+            yield s["speaker"], got[0], min(got[1], WEIGHT_CAP)
+
+
+def centroids(segs: Sequence[dict], every: Sequence[dict], prints: Prints,
+              least: float = MIN_LABEL) -> dict[str, np.ndarray]:
+    """Each label's mean voiceprint (unit vector), over labels with `least` s of embedded speech or more."""
+    import numpy as np
+
+    sums: dict[str, np.ndarray] = {}
+    weights: dict[str, float] = {}
+    for lab, vec, w in _weighed(segs, every, prints):
+        sums[lab] = sums.get(lab, 0) + w * vec
+        weights[lab] = weights.get(lab, 0.0) + w
+    return {lab: v / np.linalg.norm(v) for lab, v in sums.items() if weights[lab] >= least}
+
+
+def unknown_rescues(segs: list[dict], prints: Prints) -> list[tuple[str, float]]:
+    """Sets the segments of each re-request's label with under RESCUE_MIN s of voice to unknown (None), in place,
+    or to the label of the segment they say again (TWIN) unless that label is one of these or a re-request's label
+    no segment carries any more (a later window replaced them all: its voice cannot be told either); returns those
+    labels and their seconds."""
+    seconds = {s["speaker"]: 0.0 for s in segs if s["speaker"] is not None and _RESCUE.search(s["speaker"])}
+    for lab, _, w in _weighed([s for s in segs if s["speaker"] in seconds], segs, prints):
+        seconds[lab] += w
+    short = {lab: round(t, 1) for lab, t in seconds.items() if t < RESCUE_MIN}
+    for s in segs:
+        if s["speaker"] in short:
+            twin = s.get(TWIN)
+            gone = twin is not None and _RESCUE.search(twin) and twin not in seconds
+            s["speaker"] = None if twin in short or gone else twin
+    return sorted(short.items())
 
 
 def renumber(extra: Sequence[dict], k: int) -> dict[str, str]:
@@ -204,12 +235,24 @@ def renumber(extra: Sequence[dict], k: int) -> dict[str, str]:
     return mapping
 
 
+_PART = re.compile(r"^w(\d+):")
+
+
+def _origin(label: str) -> tuple[bool, int]:
+    """Where a label was first heard, earlier first: a re-ask's (`c<k>:`) after the main transcript's, a later
+    part's (`w<k>:`) after an earlier one's."""
+    part = _PART.match(label)
+    return _RESCUE.search(label) is not None, int(part.group(1)) if part else 0
+
+
 def merge_labels(segs: list[dict], centroids: Callable[[list[dict]], Mapping[str, np.ndarray]],
                  theta: float) -> list[tuple[str, str, float]]:
     """Relabels `segs` in place and returns the merges (absorbed, kept, cosine): repeatedly, of the labels'
     voiceprint `centroids` (unit vectors, recomputed after each merge), the closest pair at cosine >= `theta` goes
-    into the one with more speech -- unless the two talk over each other for more than MERGE_OVERLAP of the smaller
-    one's time (one person does not overlap themselves)."""
+    into the one heard first (`_origin`: the main transcript's before a re-ask's, an earlier part's before a later
+    one's; the judge's profile says where a label came from), the one with more speech on a tie -- unless the two
+    talk over each other for more than MERGE_OVERLAP of the smaller one's time (one person does not overlap
+    themselves)."""
     import itertools
 
     talk: dict[str, float] = {}
@@ -233,7 +276,7 @@ def merge_labels(segs: list[dict], centroids: Callable[[list[dict]], Mapping[str
         if best is None:
             return merges
         a, b, sim = best
-        keep, gone = (a, b) if talk[a] >= talk[b] else (b, a)
+        keep, gone = (a, b) if (_origin(a), -talk[a]) <= (_origin(b), -talk[b]) else (b, a)
         for s in segs:
             if s["speaker"] == gone:
                 s["speaker"] = keep
@@ -241,32 +284,45 @@ def merge_labels(segs: list[dict], centroids: Callable[[list[dict]], Mapping[str
         merges.append((gone, keep, round(sim, 3)))
 
 
-def speaker_merge(value: str) -> bool:
-    """Whether `--asr-speaker-merge` (resolved through `[asr] speaker_merge`) merges MAI2's labels."""
-    if value not in SPEAKER_MERGE_MODES:
-        raise ValueError(f"--asr-speaker-merge must be one of {', '.join(SPEAKER_MERGE_MODES)} (got {value!r})")
-    return value == "on"
-
-
-def merge_by_voice(segs: list[dict], audio: Callable[[], np.ndarray], voiceprints: Voiceprints,
-                   backend: str, theta: float = THETA, unmerged: str = "") -> list[tuple[str, str, float]]:
-    """`merge_labels` at `theta` over the whole transcript `segs` (in place; `audio` gives its int16 PCM at SR).
-    Without the model, or if comparing fails, nothing is merged and the report says so (`unmerged`: what that
-    leaves, after the backend's name)."""
+def merge_by_voice(segs: list[dict], audio: Callable[[], np.ndarray], voiceprints: Voiceprints, backend: str,
+                   theta: float = MERGE_THETA, unmerged: str = "",
+                   ) -> tuple[list[tuple[str, str, float]], list[tuple[str, float]]]:
+    """`unknown_rescues`, then `merge_labels` at `theta`, over the whole transcript `segs` (in place; `audio` gives
+    its int16 PCM at SR); returns the merges and the labels made unknown. Without the model, or if comparing fails,
+    nothing is merged and the report says so (`unmerged`: what that leaves, after the backend's name)."""
     labels = {s["speaker"] for s in segs if s["speaker"] is not None}
-    if len(labels) < 2:
-        return []
+    if len(labels) < 2 and not any(_RESCUE.search(lab) for lab in labels):
+        return [], []
     embed = voiceprints.embed()
     if embed is None:
         current_reporter().warning(
             "joint-voice-merge", f"声纹模型拿不到（{voiceprints.error}）：{backend} 的说话人不按声音合并{unmerged}")
-        return []
-    prints = _Prints(audio(), embed)
+        return [], []
+    prints = Prints(audio(), embed)
+    unknown: list[tuple[str, float]] = []
     try:
-        return merge_labels(segs, lambda s: _centroids(s, s, prints), theta)
+        unknown = unknown_rescues(segs, prints)
+        return merge_labels(segs, lambda s: centroids(s, s, prints), theta), unknown
     except Exception as error:  # noqa: BLE001 - the labels degrade, the transcript does not
         current_reporter().warning("joint-voice-merge", f"声纹比对失败（{error}）：{backend} 的说话人不按声音合并")
-        return []
+        return [], unknown
+
+
+def linked(parts: Sequence[tuple[float, float, list[dict]]], *, segments: bool, audio: Callable[[], np.ndarray],
+           backend: str, unmerged: str = "", orphans: str | None = None,
+           ) -> tuple[list[dict], list[tuple[str, str, float]], list[tuple[str, float]]]:
+    """Local MOSS's speakers across its parts, for both backends that decode with it: the parts stitched (`stitch`:
+    each part's labels kept apart), then `merge_by_voice` at MERGE_THETA over the whole, on CUDA, and the rescue twins
+    (TWIN) dropped. -> (units, merges, the re-requests' labels made unknown). `segments`: `moss-local`'s free decodes
+    (True: each seam reconciled by text) or the forced decode's one set of lines (False, with `orphans` its line
+    field). How MOSS links people across parts is changed here, for both."""
+    from .stitch import stitch
+
+    units = parts[0][2] if len(parts) == 1 else stitch(parts, segments=segments, orphans=orphans)
+    merges, unknown = merge_by_voice(units, audio, VOICEPRINTS_CUDA, backend, unmerged=unmerged)
+    for u in units:
+        u.pop(TWIN, None)
+    return units, merges, unknown
 
 
 class Voices:
@@ -283,7 +339,7 @@ class Voices:
             by.setdefault(b["speaker"], []).append(b)
         self._known = [b for bs in by.values()
                        for b in sorted(bs, key=lambda b: b["start"] - b["end"])[:MAX_BLOCKS]]
-        self._prints: _Prints | None = None
+        self._prints: Prints | None = None
         self._centroids: dict[str, np.ndarray] | None = None
         self._failed = False
 
@@ -294,9 +350,9 @@ class Voices:
             embed = self._voiceprints.embed()
             if embed is None:
                 return self._fail(f"声纹模型拿不到（{self._voiceprints.error}）")
-            self._prints = _Prints(self._audio(), embed)
+            self._prints = Prints(self._audio(), embed)
             try:
-                self._centroids = _centroids(self._known, self._known, self._prints)
+                self._centroids = centroids(self._known, self._known, self._prints)
             except Exception as error:  # noqa: BLE001 - the labels degrade, the transcript does not
                 return self._fail(f"声纹比对失败（{error}）")
         return True
@@ -308,7 +364,7 @@ class Voices:
 
     def nearest(self, piece: dict) -> str | None:
         """The label of the closest centroid at THETA or above for `piece` (start, end; `voiced` spans to mask
-        the rest), else None."""
+        the rest), else None; None too for a piece with under RESCUE_MIN s of voice (owner 2026-11-21)."""
         import numpy as np
 
         if not self._ready() or not self._centroids:
@@ -318,7 +374,7 @@ class Voices:
         except Exception as error:  # noqa: BLE001
             self._fail(f"声纹比对失败（{error}）")
             return None
-        if got is None:
+        if got is None or got[1] < RESCUE_MIN:
             return None
         labels = list(self._centroids)
         sims = np.array([float(got[0] @ self._centroids[k]) for k in labels])
@@ -326,24 +382,45 @@ class Voices:
         return labels[best] if sims[best] >= THETA else None
 
     def match(self, new: Sequence[dict]) -> dict[str, str]:
-        """A re-ask's labels (its blocks, `new`) one-to-one onto the known ones by voice (Hungarian, THETA)."""
+        """A re-ask's labels (its blocks, `new`) one-to-one onto the known ones by voice (Hungarian, THETA); a label
+        with under RESCUE_MIN s of voice is matched to no one (owner 2026-11-21, as `unknown_rescues`)."""
         if not new or not self._ready():
             return {}
         try:
             # Masked only by the re-ask's own other labels: the known blocks are the same speech in the padding.
-            return _match(self._centroids, _centroids(new, new, self._prints))
+            return _match(self._centroids, centroids(new, new, self._prints, RESCUE_MIN))
         except Exception as error:  # noqa: BLE001
             self._fail(f"声纹比对失败（{error}）")
             return {}
+
+
+    def voiced(self, new: Sequence[dict]) -> set[str] | None:
+        """The labels of a re-ask's blocks (`new`) with RESCUE_MIN s of voice or more: who may be a new person. None
+        when there are no voiceprints to tell (the model missing or failing): then any of them may be."""
+        if not new:
+            return set()
+        if not self._ready():
+            return None
+        try:
+            return set(centroids(new, new, self._prints, RESCUE_MIN))
+        except Exception as error:  # noqa: BLE001
+            self._fail(f"声纹比对失败（{error}）")
+            return None
 
 
 def _match(known: dict[str, np.ndarray], new: dict[str, np.ndarray]) -> dict[str, str]:
     if not known or not new:
         return {}
     import numpy as np
-    from scipy.optimize import linear_sum_assignment
 
     old, fresh = list(known), list(new)
     sim = np.array([[float(new[n] @ known[k]) for k in old] for n in fresh])
-    rows, cols = linear_sum_assignment(-sim)
+    rows, cols = _assign(sim)
     return {fresh[r]: old[c] for r, c in zip(rows, cols) if sim[r, c] >= THETA}
+
+
+def _assign(sim: np.ndarray) -> tuple[Sequence[int], Sequence[int]]:
+    """The one-to-one pairing of `sim`'s rows and columns with the largest total (Hungarian)."""
+    from scipy.optimize import linear_sum_assignment
+
+    return linear_sum_assignment(-sim)

@@ -92,10 +92,10 @@ def test_the_aligner_widens_the_threads_only_on_the_cpu(monkeypatch, device: str
         pytest.skip("needs at least two intra-op threads")
     _widen_setup(monkeypatch, baseline * 2)
     model = types.SimpleNamespace(device=types.SimpleNamespace(type=device))
-    monkeypatch.setattr(aligner, "_model", lambda: (model, None))
+    monkeypatch.setattr(aligner, "_model", lambda requested: (model, None))
     monkeypatch.setattr(aligner, "_kept", lambda unit: unit)
     seen = []
-    monkeypatch.setattr(aligner, "_aligned", lambda *a: seen.append(torch.get_num_threads()) or {})
+    monkeypatch.setattr(aligner, "_decoded", lambda *a: seen.append(torch.get_num_threads()) or {})
 
     seg = {"start": 0.0, "end": 1.0, "text": "abc"}
     aligner.aligned_units([seg], all_segments=[seg], pcm16k=np.zeros(16000, dtype=np.int16))

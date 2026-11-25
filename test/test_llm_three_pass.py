@@ -444,7 +444,7 @@ def test_a_three_pass_window_record_names_a_missing_pass_1_and_every_record_its_
         "pass1": "missing"}
     assert _pass_fields(SimpleNamespace(grouping=grouping), grouped, SimpleNamespace(segments=rows)) == {
         "over_cap_rows": [["1", "2", "3"]],  # counted in original lines
-        "degeneration": {"may_seams": 0, "may_merged": 0, "signals": []}}
+        "degeneration": {"may_seams": 0, "may_merged": 0, "tight_seams": 0, "tight_merged": 0, "signals": []}}
     # the version a window record carries, whatever the task's mode: a grouped window its own
     assert window_prompt_version(grouped) == GROUPED_PROMPT_VERSION
     assert window_prompt_version(replace(grouped, grouped=False)) == PROMPT_VERSION

@@ -24,6 +24,12 @@ from .store import KnowledgeStore
 
 ALGO_VERSION = "exact-1"
 
+#: The node kinds a correct-only task is given: the entry itself and its term
+#: lines. Every other node -- a free sentence, a relation line inside a
+#: section -- does not exist for it, on any read path (the injected
+#: projection, the title matches, the kb tools).
+CORRECT_ONLY_NODE_KINDS = ("subject", "term")
+
 _KATAKANA_DELTA = ord("か") - ord("カ")
 
 
@@ -44,7 +50,7 @@ def scan_normalize(text: str) -> str:
 @dataclass(frozen=True)
 class MatchKey:
     text: str  # normalized form actually matched
-    kind: str  # surface | alias | misheard
+    kind: str  # surface | alias | misheard | zh (a term's 中文定名: only with ``zh_names``)
     node_id: str
     subject_id: str
     item_id: str | None = None
@@ -69,12 +75,23 @@ class ExactIndex:
 
     @classmethod
     def build(
-        cls, store: KnowledgeStore, rev: int | None = None, *, include_tentative: bool = False
+        cls,
+        store: KnowledgeStore,
+        rev: int | None = None,
+        *,
+        include_tentative: bool = False,
+        zh_names: bool = False,
     ) -> "ExactIndex":
         """``include_tentative=False`` is the model-facing corpus (kb_search:
         tentative entities are shadow-only, plan §11.5); the shadow scanners
         pass True — matching tentative content is exactly how it earns its
-        corroboration."""
+        corroboration.
+
+        ``zh_names`` adds each term's 中文定名 (payload ``zh``) as a key. Only a
+        correct-only task's readers pass it: a Chinese source says the
+        canonical name itself, where a translated one says the first column or
+        an alias -- and a Japanese title or note would hit two-character
+        canonical names by their kanji alone."""
 
         at = store.current_rev() if rev is None else rev
         subject_of: dict[str, str] = {}
@@ -107,6 +124,9 @@ class ExactIndex:
                 continue
             surface = term.payload.get("surface", "")
             add(MatchKey(scan_normalize(surface), "surface", term.local_id, subject_id, raw=surface))
+            zh = str(term.payload.get("zh") or "") if zh_names else ""
+            if zh and scan_normalize(zh) != scan_normalize(surface):
+                add(MatchKey(scan_normalize(zh), "zh", term.local_id, subject_id, raw=zh))
         for relation in store.nodes_of_kind("relation", at):
             # Relation targets are spoken names too (plan §11.2): パパベルト
             # gets misheard like any term, so the target joins the corpus and

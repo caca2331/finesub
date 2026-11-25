@@ -29,7 +29,8 @@ from .node.repo import KnowledgeRepo
 # Per docs/knowledge.md: at most 20 prefetched entries per chunk, each capped
 # at its category's `max_entry_tokens`, the whole block ≤60k tokens (owner
 # 2026-10-02: 40k left a compress-worthy entry over ~20k without a whole share;
-# 60k still keeps a full 100k material chunk under the 194k input limit).
+# 60k still keeps a full 110k chunk of window material under the 194k input limit; a chunk is budgeted with
+# the block at this cap, `update._plan_chunks`).
 MAX_PREFETCH_ENTRIES = 20
 ENTRY_EXCERPT_BLOCK_MAX_TOKENS = 60_000
 

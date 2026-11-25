@@ -1,7 +1,8 @@
 """Joint ASR backends: one model hands back the whole transcript with its times and speakers, in place of
 separation, VAD, Whisper and acoustic diarization. In the cloud: MAI2, ElevenLabs Scribe, Gemini 3.5 Transcribe ("35t")
 and MOSS Pro;
-on this machine's GPU: open MOSS-Transcribe-Diarize with run-time rescues (`moss_local`).
+on this machine's GPU: open MOSS-Transcribe-Diarize with run-time rescues (`moss_local`), or the same model choosing
+only the speakers of another backend's lines (`moss-diarization-aligner`, `moss_local.forced`).
 
 Each provider module turns the source audio into a `model.Transcript` -- the
 provider's words (or, for the two MOSS, its segments) grouped into speaker turns in
@@ -23,8 +24,15 @@ GEMINI_35T = "gemini-35t"
 MOSS_PRO = "moss-pro"
 MOSS_LOCAL = "moss-local"
 SCRIBE = "scribe"
+MOSS_DIAR_ALIGNER = "moss-diarization-aligner"
 
-BACKENDS = (LOCAL, MAI2, GEMINI_35T, MOSS_PRO, MOSS_LOCAL, SCRIBE)
+BACKENDS = (LOCAL, MAI2, GEMINI_35T, MOSS_PRO, MOSS_LOCAL, SCRIBE, MOSS_DIAR_ALIGNER)
+#: Where `moss-diarization-aligner` takes its lines from (`--asr-rows`): the word backends.
+ROWS_BACKENDS = (MAI2, SCRIBE, GEMINI_35T)
+#: Backends computing on this machine's GPU: their batch items go on the GPU lane.
+GPU_BACKENDS = (LOCAL, MOSS_LOCAL, MOSS_DIAR_ALIGNER)
+#: Backends running local MOSS: they need its card (checked before anything is spent) and take GPU_LOCK.
+LOCAL_MOSS_BACKENDS = (MOSS_LOCAL, MOSS_DIAR_ALIGNER)
 #: Backends whose transcript comes in segments (segment times, one speaker each, overlapping across speakers):
 #: their units are timed by Silero (S5b) or the forced aligner (S6b), and each turn is split on its own.
 SEGMENT_BACKENDS = (MOSS_PRO, MOSS_LOCAL)
@@ -32,7 +40,8 @@ SEGMENT_BACKENDS = (MOSS_PRO, MOSS_LOCAL)
 #: newer model moves the alias instead of renaming the option. `moss` is MOSS Pro.
 ALIASES = {"gemini": GEMINI_35T, "moss": MOSS_PRO}
 #: One joint model computing on the GPU at a time: the forced aligner (`--asr-aligner`, cloud items on the batch's
-#: network lane) and local MOSS (the GPU lane).
+#: network lane) and local MOSS (the GPU lane; `moss-diarization-aligner` only around its decode, since getting its
+#: lines may run the aligner, and the lock is not re-entrant).
 GPU_LOCK = threading.Lock()
 CHOICES = (*BACKENDS, *ALIASES)
 

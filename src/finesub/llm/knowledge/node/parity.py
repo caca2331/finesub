@@ -13,12 +13,13 @@ from typing import Any
 
 from ..base import parse_index_text
 from .importer import EMPTY_SLOT_RE
+from .name_trust import strip_check_note
 from .render import render_index_line, render_subject, subject_aliases
 from .store import KnowledgeStore
 
 WHITELIST = (
     "trailing-whitespace", "blank-after-heading", "term-line-form", "entry-bullet",
-    "full-preview-scaffold",
+    "full-preview-scaffold", "check-note",
 )
 
 _ENTRY_BULLET_RE = re.compile(r"^- ")
@@ -105,6 +106,11 @@ def _classify_human_diff(original: str, rendered: str) -> list[str]:
     debulleted = [_ENTRY_BULLET_RE.sub("", line) for line in new_nonblank]
     if debulleted != new_nonblank:
         classes.add("entry-bullet")
+    # ...and ends term lines in a check note worked out from evidence (`name_trust.check_note`), never content
+    unnoted = [strip_check_note(line) for line in debulleted]
+    if unnoted != debulleted:
+        classes.add("check-note")
+        debulleted = unnoted
     unslotted = [line for line in debulleted if not EMPTY_SLOT_RE.match(line)]
     if unslotted != debulleted:
         classes.add("full-preview-scaffold")

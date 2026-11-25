@@ -57,3 +57,19 @@ class GpuStageGate:
 
 
 GPU_STAGE_GATE = GpuStageGate()
+
+
+def clear_frames(error: BaseException) -> None:
+    """Clear the frames of `error`'s traceback and of every exception in its chain: until whoever catches it is
+    done they hold a GPU user's model and buffers, which must be freed before the GPU goes to the next user."""
+    import traceback
+
+    seen: set[int] = set()
+    todo: list[BaseException | None] = [error]
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        traceback.clear_frames(e.__traceback__)
+        todo += [e.__cause__, e.__context__]

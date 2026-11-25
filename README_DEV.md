@@ -70,7 +70,7 @@ pip install -e ".[asr]"
 $env:FINESUB_CT2_FLASH_ATTENTION = "off"; python -m finesub.pipeline ...   # 对照：标准 attention
 ```
 
-- **一体转写的分句模型**：`FINESUB_SBD=off`（或 `0`）时 MAI2、35t、Scribe 的行不带分句模型（`speech/joint/sbd.py`），
+- **一体转写的分句模型**：`FINESUB_SBD=off`（或 `0`）时 五家一体转写后端的行都不带分句模型（`speech/joint/sbd.py`），
   只用于量「不带」的那一臂；产物的 `metadata.joint_asr.sentence_boundary_model` 记为 false。用户没有这个开关（owner 2026-11-11）。
 
 `faster-whisper` 与 `ctranslate2` 在 `asr` extra 里**精确钉版**（1.2.1 / 4.8.1）。fw-refine
@@ -614,11 +614,15 @@ out/input/
 ├── input-speaker-judge.json     # LLM 说话人裁判的结果（仅 --diarize judge-text / judge-audio）：窗列表、每窗的钥匙与状态、挪轨 / 新建轨 / 弃权与理由。
 │                                # ⚠ 同理不可复现；spk 列与分轨导出读它（被挪的行 `s7<s3`），删掉即回到声学标签。
 │                                # 三个 pass 的任务里它也是 pass 1 的结果：每窗多 acts（join / may_join / drop 与理由）
+├── input-joint-voices.json     # 一体转写任务开了说话人裁判时：各轨的声纹与两两的声音相似度（裁判看的高、中两档与整份合并的闸门由它算）。
+│                                # ⚠ 记录、不删：换台机器或缺过的模型回来之后重算，门槛附近的一对可能落到另一边，裁判的合并就对不上了
 ├── input-pass2-translated.srt   # 三个 pass 且开着 pass 3 时 pass 2 的成品，-pass2-corrected.srt / -pass2-annotated.csv /
 │                                # -pass2.srt 同理；留作与 pass 3 之后的成品对照，可删（pass 3 续跑不读它们，从窗口缓存重放 pass 2）
 ├── input.srt                    # 最终 SRT（translated 后处理后）
 ├── input-metadata.json          # pipeline 元数据：核心阶段耗时、worker、LLM logical-round 耗时
 ├── input-cloud/                 # 云端 ASR 任务（--asr）的原始回答，按调用缓存：重跑不再上传；保留，见「任务目录的清理与保留」
+├── input-moss-diar.json         # --asr moss-diarization-aligner 的记录：第一步拿到的行（带词）、每段的选择与各候选标签的 log 概率、
+│                                # 拼接与声纹合并后的标签、合了哪几处重叠 cue；续跑不读，可删（docs/joint-asr.md「给别家的行配说话人」）
 └── input.llm-artifacts/         # task artifact 目录（默认 = 输出去后缀 + .llm-artifacts）
     ├── resolved-switches.json   # 纠错任务开始时写：{switches: 五个开关的取值, sources: 各自出处}；出处取值
     │                            #   explicit / preset:<id> / default / caller（ingest 给整条向量）；
@@ -686,17 +690,18 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
 派生规则互相钉住（这个模块不能 import 管线，所以是**复述**，测试保证复述不变成分歧）：
 
 - **`RECORD_SUFFIXES`（记录，永远保留）**：`-stable.json` 与 `-annotated.csv`，外加开了
-  `--diarize` 才有的 `-diar.json`、`-diar-rows.json` 与 `-speaker-judge.json`。前者是 ASR 结果，删了就要从音频重做
+  `--diarize` 才有的 `-diar.json`、`-diar-rows.json` 与 `-speaker-judge.json`，以及一体转写任务开了裁判才有的 `-joint-voices.json`。前者是 ASR 结果，删了就要从音频重做
   分离与识别；`-annotated.csv` 是知识库读的东西，只有再跑一次 LLM 才能重新产出；时间线与裁判结果
   的理由更硬——**根本不可复现**，重跑给的是另一份同样合理的答案，人工校对对不上了；`-diar-rows.json`
-  虽能从时间线算出来，但置信标与切点要可删的证据文件，下游产物又数着它定下的行。
+  虽能从时间线算出来，但置信标与切点要可删的证据文件，下游产物又数着它定下的行；`-joint-voices.json`
+  能从源音频重算，但它是裁判合并的闸门，换台机器或缺过的模型回来之后重算，门槛附近的一对可能落到另一边。
   `finesub` 把它们抄进任务目录，作为这次工作的记录。`test_paths.py` 逐字段枚举 `PipelinePaths`，
   每个字段必须落进可删、记录或保留目录之一（`-diar.json` 当初就是因为测试只查手写清单而漏登记的）。
 - **`KEPT_DIRECTORY_SUFFIXES`（保留的目录）**：`<stem>-cloud/`，云端 ASR 的原始回答
   （[`docs/manual/asr-backend-choice.md`](docs/manual/asr-backend-choice.md)）。再问一次要花额度或钱、回答也会不同，所以同记录一样
   不可复现；清理不碰它。不抄进任务目录：重跑读的是 `-stable.json`，只有它和 `-aligned.json` 都没了才用得上。
 - **`REMOVABLE_SUFFIXES`（可删）**：人声轨、VAD 两件、对齐 JSON、raw/translated 字幕、
-  metadata、解码副本、三个 pass 时 pass 2 的四件成品（`-pass2-*`，记录是最终的 `-annotated.csv`）；外加 `<stem>.llm-artifacts/` 整目录——session/window checkpoint 存在的意义是
+  metadata、解码副本、三个 pass 时 pass 2 的四件成品（`-pass2-*`，记录是最终的 `-annotated.csv`）、`--asr moss-diarization-aligner` 的 `-moss-diar.json`（结果已在 `-aligned.json`，它只供查错与离线重拼）；外加 `<stem>.llm-artifacts/` 整目录——session/window checkpoint 存在的意义是
   熬过一次**失败**，而清理只发生在没有失败的时候。
 - **故意不删、机制不同的两类**：URL 输入下载到 `out/<stem>/` 的源媒体（`<stem>.mp4`/`.ogg`，
   往往是目录里最大的一块）与 `-annotated.csv`/`-corrected.srt`。它们不在 `PipelinePaths` 里，

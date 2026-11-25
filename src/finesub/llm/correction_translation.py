@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 import sys
 import time
-from typing import Any, ContextManager, Dict, Mapping, Sequence
+from typing import Any, Callable, ContextManager, Dict, Mapping, Sequence
 
 from finesub import jsonl
 from finesub.run_metadata import (
@@ -200,8 +200,10 @@ def run_post_correction_knowledge_update(
     style_names: Sequence[str] = (),
     user_summary: bool = False,
     parse_retries: int | None = None,
+    correct_only: bool = False,
 ) -> Dict[str, Any]:
-    """Run the unified knowledge update right after a correction task.
+    """Run the knowledge update stage right after a correction task: the name check first
+    (`knowledge/name_check_step.py`), then the unified update (the check alone for a correct-only task).
 
     ``difficulty`` is the run's own: it selects the knowledge cell, so a preset
     binding a cheaper group at intermediate has to reach this call rather than
@@ -218,15 +220,12 @@ def run_post_correction_knowledge_update(
     out = Path(output_path).expanduser().resolve()
     base = out.with_suffix("")
     artifact_path = Path(artifact_dir).expanduser().resolve()
+    context_path = ensure_research_context_path(artifact_dir=artifact_path, stem=base.name, run_dir=out.parent)
     report = run_knowledge_update(
         final_srt=result_srt_path,
         stable_json=stable_json,
         annotated_csv=base.with_name(f"{base.name}-annotated.csv"),
-        research_context=ensure_research_context_path(
-            artifact_dir=artifact_path,
-            stem=base.name,
-            run_dir=out.parent,
-        ),
+        research_context=context_path,
         artifact_dir=artifact_path,
         refined_srt=refined_srt,
         task_id=task_id,
@@ -238,6 +237,7 @@ def run_post_correction_knowledge_update(
         style_names=style_names,
         user_summary=user_summary,
         parse_retries=parse_retries,
+        correct_only=correct_only,
     )
     write_task_report(
         artifact_path,
@@ -294,6 +294,7 @@ def _record_dispatch(
         prepare_strategy=prepare_strategy,
         fast_enabled=fast_decision.enabled,
         grant=grant_for_run(profile, knowledge=knowledge, style_selected=style_selected),
+        correct_only=profile.correct_only,
     )
     append_task_artifact(
         artifact_dir,
@@ -664,7 +665,8 @@ class CorrectionOutcome:
     #: the caller, through ``context_file``) had already prepared it.
     research_context: Path | None = None
     research_reused: bool = False
-    #: The post-task knowledge update's report, when ``knowledge="update"``.
+    #: The post-task knowledge update's report, when ``knowledge="update"`` (its ``name_check``: the stage's first
+    #: step, `knowledge/name_check_step.py`).
     knowledge_update: Dict[str, Any] | None = None
     artifact_dir: Path | None = None
 
@@ -721,7 +723,7 @@ def run_correction_task(request: CorrectionRequest) -> CorrectionOutcome:
     outcome: CorrectionOutcome | None = None
     try:
         with _task_slots(request.test_profile), agent_session_scope() as sessions, _generation_pin(
-            str(request.knowledge), request.knowledge_root
+            str(request.knowledge), request.knowledge_root, correct_only=request.profile.correct_only
         ):
             if artifact_dir is not None:
                 # Said once, while the scope is open: it files what the
@@ -958,25 +960,10 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None, language: s
     )
 
     def knowledge_update(result: Path) -> None:
-        if knowledge != "update":
-            return
-        outcome.knowledge_update = run_post_correction_knowledge_update(
-            task_id=task_id,
-            task_summary=task_summary,
-            result_srt_path=result,
-            output_path=out,
-            stable_json=request.stable_json,
-            artifact_dir=artifact_dir,
-            refined_srt=request.refined_srt,
-            knowledge_root=root,
-            test_profile=request.test_profile,
-            difficulty=profile.difficulty,
-            style_names=_writable_style_names(
-                style_selection, style_catalog, context_path=context_path, artifact_dir=artifact_dir
-            ),
-            user_summary=bool(request.task_summary.strip()),
-            parse_retries=request.max_retries_per_window,
-        )
+        _finish_knowledge(request, outcome, result, out=out, artifact_dir=artifact_dir, task_id=task_id,
+                          task_summary=task_summary,
+                          style_names=lambda: _writable_style_names(style_selection, style_catalog,
+                                                                    context_path=context_path, artifact_dir=artifact_dir))
 
     if execute:
         finished = _finished_output(request, out, artifact_dir=artifact_dir, task_id=task_id)
@@ -1369,19 +1356,20 @@ def _with_task_mode(request: CorrectionRequest, artifact_dir: Path | None) -> tu
     (`TranslationProfile.correct_only`), and the source language read. Decided first of all: the knowledge
     base, the style, the finished-task shortcuts and the plan all follow it.
 
-    A correct-only task neither reads nor writes the knowledge base (owner 2026-11-06): its entries and its
-    update are written for translating, and what a Chinese task should keep there is not designed yet; nor does it
-    ask the model for feedback to update it with. Said once when the user asked for it (`--knowledge read|update`,
-    `--refined-srt`); the default `read` turns off silently."""
+    A correct-only task reads the knowledge base and runs no knowledge update: the update and the feedback it
+    is fed are written for translating, and what a Chinese task should keep there is not designed yet
+    (owner 2026-11-06; reading opened 2026-11-12). What it reads is its own projection of the entries, which
+    the run's knowledge context carries (`_generation_pin`). Under `--knowledge update` its one write is the
+    name check that opens its knowledge-update stage (owner 2026-11-20): its searching prompts ask for the
+    name-check records alone. `--refined-srt` is said once and dropped."""
     correct_only, language = three_pass.task_correct_only(request, artifact_dir, warn=_correct_only_warning)
     if correct_only != request.profile.correct_only:
         request = replace(request, profile=replace(request.profile, correct_only=correct_only))
     if correct_only:
-        if request.knowledge != "none" and (request.switch_sources or {}).get("knowledge", "caller") != "default":
-            _correct_only_warning(f"中文素材只纠错，不读写知识库：--knowledge {request.knowledge} 这次按 none")
         if request.refined_srt:
-            _correct_only_warning("中文素材只纠错，不读写知识库：--refined-srt 这次不用")
-        request = replace(request, knowledge="none", refined_srt=None, collect_feedback=False)
+            _correct_only_warning("中文素材只纠错，不跑知识更新：--refined-srt 这次不用")
+        # under ``update`` it still collects feedback, but only the name checks (`prompts._name_checks_feedback_block`)
+        request = replace(request, refined_srt=None)
     return request, language
 
 
@@ -1442,6 +1430,34 @@ def _drop_untagged_record(knowledge_root: Any, selection: StyleSelection) -> Sty
             "（多半是按翻译跑时选的），中文素材只纠错时不注入"
         )
     return replace(selection, names=tagged)
+
+
+def _finish_knowledge(
+    request: CorrectionRequest, outcome: CorrectionOutcome, result: Path, *, out: Path | None,
+    artifact_dir: Path | None, task_id: str, task_summary: str, style_names: Callable[[], Sequence[str]],
+) -> None:
+    """The task's knowledge writes once its result is there: under `update` the knowledge update stage
+    (`run_post_correction_knowledge_update`: the name check, then the update -- the check alone for a correct-only
+    task)."""
+
+    if request.knowledge != "update":
+        return
+    outcome.knowledge_update = run_post_correction_knowledge_update(
+        task_id=task_id,
+        task_summary=task_summary,
+        result_srt_path=result,
+        output_path=out,
+        stable_json=request.stable_json,
+        artifact_dir=artifact_dir,
+        refined_srt=request.refined_srt,
+        knowledge_root=request.knowledge_root,
+        test_profile=request.test_profile,
+        difficulty=request.profile.difficulty,
+        style_names=style_names(),
+        user_summary=bool(request.task_summary.strip()),
+        parse_retries=request.max_retries_per_window,
+        correct_only=request.profile.correct_only,
+    )
 
 
 def _correct_only_warning(message: str) -> None:
@@ -1563,8 +1579,12 @@ def _book_run(out: Path, artifact_dir: Path, *, task_id: str, status: str, start
         )
 
 
-def _generation_pin(knowledge: str, knowledge_root: str | Path | None) -> ContextManager[Any]:
-    """Pin every knowledge read of this run to one revision (plan §2.5).
+def _generation_pin(
+    knowledge: str, knowledge_root: str | Path | None, *, correct_only: bool = False
+) -> ContextManager[Any]:
+    """Pin every knowledge read of this run to one revision (plan §2.5), and
+    say with it how the run reads: ``correct_only`` gives every reader the
+    correct-only projection of the entries (`knowledge.base.KnowledgeRun`).
 
     research, the windows and the query rounds all read through the pin; the
     post-run knowledge update passes its own explicit ``working_rev`` per
@@ -1584,7 +1604,8 @@ def _generation_pin(knowledge: str, knowledge_root: str | Path | None) -> Contex
         harvest_rendered_edits_at_run_start(root)
     except Exception as exc:
         current_reporter().warning("knowledge-rendered-harvest-failed", str(exc))
-    return pinned_generation_rev(root)
+    # every correction task reads the 未核 marks (owner 2026-11-20); the knowledge update renders its own full preview
+    return pinned_generation_rev(root, correct_only=correct_only, trust_marks=True)
 
 
 def _task_slots(test_profile: bool) -> ContextManager[Any]:
@@ -1630,9 +1651,8 @@ def _task_glossaries(knowledge_root: str | Path | None, notes: str, context_path
             picks = json.loads(context_path.read_text(encoding="utf-8")).get("glossary_selection") or []
         except (OSError, json.JSONDecodeError):
             picks = []
-    if not picks:
-        return None
-    return GlossaryPick(tuple(glossary_store.load_selection(knowledge_root, picks)), language or "")
+    glossaries = tuple(glossary_store.load_selection(knowledge_root, picks)) if picks else ()
+    return GlossaryPick(glossaries, language or "") if glossaries else None
 
 
 def parse_args() -> argparse.Namespace:

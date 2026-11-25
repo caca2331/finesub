@@ -773,28 +773,16 @@ class ModelRouteCatalog:
                             owner=f"{task_group_id}/{difficulty}",
                         )
                     )
-                if task_group_id.endswith("-mm"):
-                    # Report the *count*, not a boolean. Warning per text-only
-                    # member made the shipped `agy` preset print six lines a run
-                    # for a deliberate pattern (Sonnet first so text windows
-                    # prefer it, media windows skip past it for free). But
-                    # collapsing that to "does anyone here hear?" threw away the
-                    # thing worth knowing: a four-member cell whose media calls
-                    # have exactly one real candidate looks perfectly healthy,
-                    # and its chain is one failure deep.
-                    deaf = [fact.fact_id for fact in facts if not fact.supports_audio]
-                    hearing = len(facts) - len(deaf)
-                    if hearing == 0:
-                        messages.append(
-                            f"{task_group_id}/{difficulty}: 组内没有成员支持音频"
-                            f"（{', '.join(deaf)}），带媒体的调用会在能力过滤后无候选可用"
-                        )
-                    elif hearing == 1 and deaf:
-                        messages.append(
-                            f"{task_group_id}/{difficulty}: {len(facts)} 个成员里只有 1 个"
-                            f"支持音频，带媒体的调用链长为 1"
-                            f"（纯文本成员：{', '.join(deaf)}）"
-                        )
+                # Only a media cell nothing in can hear: a text-only member is
+                # skipped for free, and a single hearing member is a choice, not
+                # a fault -- warning about its depth was noise (owner 2026-11-23).
+                if task_group_id.endswith("-mm") and not any(
+                    fact.supports_audio for fact in facts
+                ):
+                    messages.append(
+                        f"{task_group_id}/{difficulty}: 组内没有成员支持音频"
+                        f"（{', '.join(fact.fact_id for fact in facts)}），带媒体的调用会在能力过滤后无候选可用"
+                    )
                 if group.id not in seen_groups:
                     seen_groups.add(group.id)
                     input_ceiling, min_output = self.group_planning_envelope(

@@ -231,4 +231,30 @@ def test_submit_holds_the_window_to_the_absolute_threshold_of_its_ratio(tmp_path
         assert first.get("accepted_task_id") == "window"
         return
     assert first["status"] == "repairable" and "5.6s" in first["repair_instruction"]
+    # the split guidance rides along once, at the window's tier, and the round stays a patch
+    assert first["repair_instruction"].count("上面越过绝对门槛的合并行要拆开") == 1
+    # the reply lists the errors beside the instruction; the guidance is not repeated there, nor kept on the task
+    assert not any("上面越过绝对门槛" in error for error in first["validation_errors"])
+    assert "16 字、3.2 秒左右" in first["repair_instruction"] and "<patch>" in first["repair_instruction"]
     assert _submit(runtime, lease, "s2", _patch(1, 2)).get("accepted_task_id") == "window"
+
+
+def test_a_style_error_sends_the_whole_answer_back_with_the_split_guidance_still_in_it() -> None:
+    """A style error belongs to no row, so the round asks for the whole answer (no patch instruction); a long merge in
+    the same answer still gets its split guidance, in the errors the agent is shown."""
+
+    from dataclasses import replace
+
+    from finesub.llm.agent.agent_validators import _correction_window
+
+    window = replace(_window(), segments=[SubtitleSegment("1", 0.0, 3.0, "1。"), SubtitleSegment("2", 3.1, 7.5, "2。"),
+                                          SubtitleSegment("3", 8.5, 9.5, "3。"), SubtitleSegment("4", 10.0, 11.0, "4。")])
+    validate = _correction_window({"metadata": {"validator": {"window": serialize_window(window),
+                                                              "style_pick": {"candidates": ["a"]}},
+                                                "variant": "capableC"}})
+    merged = f"<translated>\n{HEADER}\nsub|1,2|1。2。|12|high|同一句\n{_rows(3, 4)}\n</translated>"
+    verdict = validate(merged, {})
+    errors = list(verdict.errors)
+    assert "repair_instruction" not in (verdict.metadata or {})
+    assert sum(error.startswith("上面越过绝对门槛的合并行要拆开") for error in errors) == 1
+    assert any("absolute limit" in error for error in errors) and len(errors) >= 3  # long row, style, guidance

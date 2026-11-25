@@ -15,6 +15,7 @@ from finesub.speech.joint import lines as L
 from finesub.speech.joint import moss_timing as T
 from finesub.speech.joint import sbd
 from finesub.speech.joint import stage as joint_stage
+from finesub.speech.joint import whisper_align
 from finesub.speech.joint.model import Transcript, Unit, turns_from_units
 from finesub.speech.postprocessing import segmentation as seg
 
@@ -35,6 +36,58 @@ def unit(start, end, text, speaker="A"):
 def test_units_keep_a_latin_word_or_number_inside_cjk_text_whole():
     assert L.units_of("第一个bug。拿20分，3.5倍 Hide Together") == [
         "第", "一", "个", "bug。", "拿", "20", "分，", "3.5", "倍", "Hide", "Together"]
+
+
+def test_japanese_words_split_by_nagisa_and_spell_the_text():
+    pytest.importorskip("nagisa")
+    ja = "出てギミクが作用する。斜め45度、OK？"
+    assert [w for w, _ in L._words(ja)] == ["出", "て", "ギミク", "が", "作用", "する。", "斜め", "45", "度、", "OK？"]
+    assert "".join(w for w, _ in L._words(ja)) == "".join(L.units_of(ja))  # nagisa's ？ -> ? does not leak
+    assert L.japanese(ja) and not L.japanese("我们今天来玩原神") and not L.japanese("长夜月・ー")
+
+
+def test_japanese_groups_keep_particles_auxiliaries_and_compounds_with_their_word():
+    pytest.importorskip("nagisa")
+    text = "なんか最初は出てギミクが作用するファーストコンタクト、ちょっと待ってください"
+    units = [unit(k, k + 0.5, u) for k, u in enumerate(L.units_of(text))]
+    got = L.groups(units, text, language=None)
+    assert [g["text"] for g in got] == ["なんか", "最初は", "出て", "ギミクが", "作用する", "ファーストコンタクト、",
+                                        "ちょっと", "待ってください"]
+    assert (got[1]["start"], got[1]["end"]) == (units[3]["start"], units[5]["end"])
+    zh = "我们今天来玩原神"
+    zh_units = [unit(k, k + 0.5, u) for k, u in enumerate(L.units_of(zh))]
+    assert L.groups(zh_units, zh, language=None) == zh_units
+    stray = "我们今天来玩原神の新角色"  # kana in a Chinese task: by character, as in Chinese
+    stray_units = [unit(k, k + 0.5, u) for k, u in enumerate(L.units_of(stray))]
+    assert L.groups(stray_units, stray, language="zh") == stray_units
+
+
+@pytest.mark.parametrize("text, cut_before, glued_to", [
+    ("ゲームで遊ぶ", "遊ぶ", None),  # で after a noun is the case particle: a cut may go before the verb
+    ("本を読んで遊ぶ", None, "読んで遊ぶ"),  # a te-form keeps the verb after it
+    ("ちょっと待ってください", None, "待ってください"),
+    ("急に走り出すんだ", None, "走り出すんだ"),  # a compound verb is one word
+])
+def test_japanese_groups_tell_the_te_form_from_the_case_particle(text, cut_before, glued_to):
+    pytest.importorskip("nagisa")
+    got = [g["text"] for g in L.groups([unit(k, k + 0.5, u) for k, u in enumerate(L.units_of(text))], text,
+                                       language="ja")]
+    assert "".join(got) == text
+    if cut_before:
+        assert any(g.startswith(cut_before) for g in got)
+    if glued_to:
+        assert glued_to in got
+
+
+def test_japanese_groups_keep_the_text_when_nagisa_would_change_it_or_a_word_starts_inside_a_unit():
+    pytest.importorskip("nagisa")
+    for text in ("ｶﾞﾝﾀﾞﾑ見たよ", "これは3.5倍だね"):  # half-width kana: nagisa changes the length; 3.5 is one unit
+        units = [unit(k, k + 0.5, u) for k, u in enumerate(L.units_of(text))]
+        got = L.groups(units, text, language="ja")
+        assert "".join(g["text"] for g in got) == text
+        cuts = lambda xs: {sum(len(x["text"]) for x in xs[:k]) for k in range(len(xs) + 1)}
+        assert cuts(got) <= cuts(units)  # a group edge is always a unit edge: no unit is split
+    assert any("3.5" in g["text"] for g in got)
 
 
 def test_dp_words_fold_punctuation_and_space_latin_words_only():
@@ -237,6 +290,7 @@ def test_the_sentence_boundary_model_is_tried_once_and_a_failure_builds_the_line
 
 
 def test_moss_lines_never_span_two_merged_segments():
+    pytest.importorskip("nagisa")  # Japanese lines split by word group
     segs = [
         {"start": 0.0, "end": 3.0, "text": "今日はいい天気ですね散歩に", "speaker": "S01"},
         {"start": 3.1, "end": 6.0, "text": "行きましょうか公園まで歩いて", "speaker": "S01"},
@@ -312,6 +366,7 @@ def test_a_segment_the_aligner_gave_up_on_is_timed_by_silero():
 
 
 def test_segment_lines_merge_short_same_speaker_segments_and_keep_every_unit():
+    pytest.importorskip("nagisa")  # Japanese lines split by word group
     segs = [
         {"start": 0.0, "end": 0.6, "text": "ええ。", "speaker": "S01"},
         {"start": 0.8, "end": 2.4, "text": "そうですね。", "speaker": "S01"},
@@ -323,6 +378,49 @@ def test_segment_lines_merge_short_same_speaker_segments_and_keep_every_unit():
     assert [line[L.LINE_SPEAKER] for line in lines] == ["S01", "S02"]
 
 
+def test_moss_japanese_lines_cut_only_between_groups_and_take_sentence_evidence():
+    pytest.importorskip("nagisa")
+    seg_ = {"start": 0.0, "end": 12.0, "speaker": "S01",
+            "text": "なんか最初は出てギミクが作用するみたいなやつもあれもなかったかもしれないもんなそれでさあ次のやつも見ようか"}
+    timed = [dict(seg_, units=L.interpolated(seg_))]
+    groups = [g["text"] for g in L.groups(timed[0]["units"], seg_["text"], language="ja")]
+    seen = []
+
+    def ends(words):
+        seen.append([w["word"] for w in words])
+
+    lines, _vad = L.segment_lines(timed, duration=20, params=PARAMS, language="ja", sentence_ends=ends)
+    assert len(lines) > 1 and "".join(line["text"] for line in lines) == seg_["text"]
+    assert seen == [groups]
+    assert all(w["word"] in groups for line in lines for w in line["words"])
+
+
+def test_moss_sentence_evidence_is_asked_for_every_turn_in_any_language():
+    pytest.importorskip("nagisa")  # Japanese lines split by word group
+    segs = [
+        {"start": 0.0, "end": 3.0, "text": "今日はいい天気ですね散歩に行きましょう", "speaker": "S01"},
+        {"start": 4.0, "end": 6.0, "text": "okay let us go for a walk", "speaker": "S02"},
+        {"start": 7.0, "end": 9.0, "text": "我们去公园走走吧", "speaker": "S03"},
+    ]
+    timed = [dict(s, units=L.interpolated(s)) for s in segs]
+    for language in (None, "zh", "en"):
+        seen = []
+        L.segment_lines(timed, duration=10, params=PARAMS, language=language, sentence_ends=seen.append)
+        assert len(seen) == 1  # one call over all the turns' words, in order
+        assert "".join(w["word"] for w in seen[0]).replace(" ", "") == "".join(s["text"] for s in segs).replace(" ", "")
+
+
+def test_moss_chinese_lines_take_the_clause_evidence():
+    seg = {"start": 0.0, "end": 9.0, "text": "孟老师好，两位老师好，呃，女嘉宾们大家好，我叫卢嘉林，今年27岁，来自哈尔滨。",
+           "speaker": "S01"}
+    timed = [dict(seg, units=L.interpolated(seg))]
+    plain, _ = L.segment_lines(timed, duration=10, params=PARAMS, language="zh")
+    clauses, _ = L.segment_lines(timed, duration=10, params=PARAMS, language="zh", clauses=L.CLAUSE_BONUS)
+    assert len(clauses) > len(plain)
+    assert all(line["text"].strip() != "呃，" for line in clauses)
+    assert "".join(line["text"] for line in clauses) == "".join(line["text"] for line in plain) == seg["text"]
+
+
 def same_key_overlaps(lines):
     """Pairs of one speaker's lines that overlap in time (the timeline contract allows none)."""
     return [(a["text"], b["text"]) for i, a in enumerate(lines) for b in lines[i + 1:]
@@ -330,6 +428,7 @@ def same_key_overlaps(lines):
 
 
 def test_one_speakers_overlapping_lines_are_pulled_back_and_two_speakers_kept():
+    pytest.importorskip("nagisa")  # Japanese lines split by word group
     segs = [
         {"start": 0.0, "end": 4.0, "text": "今日はとても良い天気ですね本当に", "speaker": "S01"},
         {"start": 3.6, "end": 7.0, "text": "それでは始めましょうかみなさん", "speaker": "S01"},
@@ -377,6 +476,50 @@ def test_the_ordered_decode_keeps_boundaries_in_order_and_words_one_class_long()
     # Classes past the audio's end are never chosen; with too few classes there is no path.
     assert max(A.ordered_classes(peaks(1, 2, 6, 7), 5)) < 5
     assert A.ordered_classes(peaks(0, 1, 2, 3), 1) is None
+    # With no floor, words may share a class: the decode is then the argmax wherever it is ordered.
+    assert A.ordered_classes(peaks(1, 1, 1, 2), 8, floor=0).tolist() == [1, 1, 1, 2]
+    assert A.ordered_classes(peaks(0, 0, 0, 0), 1, floor=0).tolist() == [0, 0, 0, 0]
+
+
+def test_boundary_times_refine_sure_boundaries_in_their_class_and_move_unsure_ones_to_their_mean():
+    from finesub.speech.joint import aligner as A
+
+    def row(*pairs, width=8):
+        r = np.full(width, -30.0)
+        for k, v in pairs:
+            r[k] = v
+        return r
+
+    # a sure boundary with even neighbours keeps its class; one with a stronger right neighbour moves right, < 0.5
+    rows = np.array([row((2, 10.0), (1, 6.0), (3, 6.0)), row((4, 10.0), (3, 6.0), (5, 8.0))])
+    path = A.ordered_classes(rows, 8)
+    got = A.boundary_times(rows, 8, path)
+    assert path.tolist() == [2, 4] and got[0] == 2.0 and 4.0 < got[1] < 4.5
+    # an unsure end, split evenly between classes 5 and 7, takes its mean over the allowed paths: 6
+    rows = np.array([row((2, 10.0)), row((5, 1.0), (7, 1.0))])
+    got = A.boundary_times(rows, 8, A.ordered_classes(rows, 8))
+    assert got[0] == 2.0 and abs(got[1] - 6.0) < 1e-6
+    # back in order, each unit at least MIN_UNIT long
+    assert A._ordered_seconds(np.array([0.5, 0.5, 0.4, 0.6])).tolist() == [0.5, 0.5 + A.MIN_UNIT, 0.5 + A.MIN_UNIT, 0.6]
+
+
+def test_zero_length_units_share_the_span_of_the_unit_before_them():
+    from finesub.speech.joint import aligner as A
+
+    units = [{"text": "a", "start": 1.0, "end": 1.08}, {"text": "b", "start": 1.08, "end": 1.08},
+             {"text": "、"}, {"text": "c", "start": 1.08, "end": 1.08}, {"text": "d", "start": 1.2, "end": 1.3}]
+    A._shared(units)
+    assert [(round(u["start"], 3), round(u["end"], 3)) for u in units if "start" in u] == [
+        (1.0, 1.027), (1.027, 1.053), (1.053, 1.08), (1.2, 1.3)]
+    lead = [{"text": "a", "start": 0.5, "end": 0.5}, {"text": "b", "start": 0.5, "end": 0.5},
+            {"text": "c", "start": 0.5, "end": 0.68}]
+    A._shared(lead)
+    assert [(round(u["start"], 3), round(u["end"], 3)) for u in lead] == [(0.5, 0.56), (0.56, 0.62), (0.62, 0.68)]
+    gap = [{"text": "a", "start": 0.0, "end": 0.1}, {"text": "b", "start": 0.2, "end": 0.2},
+           {"text": "c", "start": 0.2, "end": 0.2}, {"text": "d", "start": 0.2, "end": 0.38}]
+    A._shared(gap)
+    assert [(round(u["start"], 3), round(u["end"], 3)) for u in gap] == [
+        (0.0, 0.1), (0.2, 0.26), (0.26, 0.32), (0.32, 0.38)]
 
 
 # --- the cloud task ------------------------------------------------------------------------------------------
@@ -448,7 +591,7 @@ def cloud_source(tmp_path, monkeypatch) -> Path:
     calls = []
 
     def transcribe(backend, source, *, cache_root, language, duration, repair, aligner, gpu_tier, device, speech,
-                   merge_speakers=False):
+                   **_):
         calls.append(backend)
         return Transcript(backend, "fake-model", duration, "word", turns_from_units(words)), {}
 
@@ -564,32 +707,6 @@ def test_the_repair_level_reaches_the_backend_and_only_a_repairing_run_records_i
     assert records[0]["repair"] == "on" and "repair" not in records[1]
 
 
-@pytest.mark.parametrize("asr, asked, merged", [("mai2", None, False), ("mai2", "auto", False), ("mai2", "on", True),
-                                                ("mai2", "off", False), ("gemini-35t", "on", False)])
-def test_the_speaker_merge_is_mai2_s_only_under_on(cloud_source, tmp_path, monkeypatch, asr, asked, merged):
-    """`--asr-speaker-merge`: `auto` is off (owner 2026-11-16), and only MAI2 reads it; a merging run records it."""
-    from finesub.stages import run_pipeline
-
-    fake, seen = joint_stage.transcribe, []
-
-    def transcribe(backend, source, **kwargs):
-        seen.append(kwargs["merge_speakers"])
-        return fake(backend, source, **kwargs)
-
-    monkeypatch.setattr(joint_stage, "transcribe", transcribe)
-    paths = run_pipeline(cloud_source[0], output_path=tmp_path / "talk.srt", stage="raw-srt", asr=asr, language="en",
-                         asr_speaker_merge=asked)
-    record = json.loads(paths.aligned_json.read_text(encoding="utf-8"))["metadata"][joint_stage.METADATA_KEY]
-    assert seen == [merged] and record.get("speaker_merge") == ("on" if merged else None)
-
-
-def test_a_bad_speaker_merge_setting_is_refused():
-    from finesub.speech.joint import relink
-
-    with pytest.raises(ValueError, match="--asr-speaker-merge"):
-        relink.speaker_merge("yes")
-
-
 def test_local_products_under_a_cloud_request_say_so(tmp_path, capsys):
     from finesub.stages import _note_task_backend, default_pipeline_paths
 
@@ -619,29 +736,88 @@ def test_upload_notice_is_one_reporter_warning_before_the_first_call(monkeypatch
 
     monkeypatch.setattr(joint_stage, "current_reporter", lambda: WarningCodeRecorder(warned))
     calls = []
-    call = joint_stage._announcing("moss-pro", lambda *a, **k: calls.append(warned[:]) or "ok")
+    uploads = joint_stage._Uploads("moss-pro")
+    call = uploads(lambda *a, **k: calls.append(warned[:]) or "ok")
+    assert not uploads.sent
     assert call() == "ok" and call() == "ok"
     assert calls == [["cloud-asr-upload"], ["cloud-asr-upload"]]  # said before the first upload, and only once
+    assert uploads.sent
 
 
-def test_auto_aligns_local_moss_always_the_others_on_a_gpu_and_only_in_the_aligners_languages(monkeypatch):
+def test_no_key_means_no_upload_notice_and_no_request_recorded(monkeypatch):
+    """MAI2, 35t and Live read their key inside the call: a missing key fails before anything is announced, so a
+    task the cache served but whose repair found no key does not say its audio left, nor record `api`."""
+    from finesub import api_keys
+    from finesub.speech.joint import gemini35t
+    from finesub.speech.joint.live import Live, LiveError
+
+    warned = []
+    monkeypatch.setattr(joint_stage, "current_reporter", lambda: WarningCodeRecorder(warned))
+    monkeypatch.setattr(api_keys, "read_dotenv", lambda *a, **k: {})
+    for backend in ("mai2", "gemini-35t"):
+        monkeypatch.delenv(joint_stage.AZURE_ENDPOINT_ENV, raising=False)
+        uploads = joint_stage._Uploads(backend)
+        callers = {"mai2": [joint_stage._Mai2Bill(60.0, "on", uploads(lambda: None))],
+                   "gemini-35t": [gemini35t.Caller(entries=[], announce=uploads(lambda: None)),
+                                  Live(entries=[], announce=uploads(lambda: None))]}[backend]
+        for caller in callers:
+            with pytest.raises((joint_stage.JointAsrError, LiveError, RuntimeError)):
+                if isinstance(caller, Live):
+                    caller(b"", language="ja")
+                elif backend == "mai2":
+                    caller(Path("x.wav"), locale="ja-JP")
+                else:
+                    caller(Path("x.wav"), language="ja", seconds=1.0)
+        assert not uploads.sent and warned == []
+
+
+def test_the_aligner_modes_choose_the_device_and_whether_whisper_re_times(monkeypatch):
+    """Owner 2026-11-20: `auto` aligns on the GPU or else the CPU, and on a GPU adds Whisper except in English;
+    `on` adds Whisper in English too; Whisper only for the MOSS segments, never 35t's repairs, never on the CPU."""
+    import importlib.util
+
+    from finesub.speech.joint.stage import AlignerUse
+
     backends = ("moss-local", "moss-pro", "gemini-35t", "mai2", "scribe")
     gpu = []
     monkeypatch.setattr(joint_stage, "gpu_allowed", lambda tier, device: gpu.append((tier, device)) or bool(gpu_on))
-    gpu_on = False
-    assert [joint_stage.uses_aligner("auto", b, "ja") for b in backends] == [True, False, False, False, False]
+    real = importlib.util.find_spec
+    missing: set[str] = set()
+    installed = {"transformers", "faster_whisper"}  # as with [asr], whatever this environment has
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name in missing else
+                        (object() if name in installed else real(name, *a)))
+    use = joint_stage.uses_aligner
+    cuda_ja, cuda_on = AlignerUse("cuda", whisper=True), AlignerUse("cuda", whisper=True, english=True)
+    gpu_on = False  # no usable card: the aligner asks for CUDA and `resolve_device` says it runs on the CPU
+    assert [use("auto", b, "ja") for b in backends] == [cuda_ja, AlignerUse("cuda"), AlignerUse("cuda"), None, None]
+    assert use("auto", "moss-pro", "ja", device="cpu") == AlignerUse("cpu")  # asked for the CPU: quietly there
+    assert use("auto", "moss-pro", "ja", gpu_tier="cpu") == AlignerUse("cpu")
+    # an Intel card: the aligner asks for it, and its xpu branch says it runs on the CPU (`cpu-fallback`)
+    assert use("auto", "moss-pro", "ja", device="xpu") == AlignerUse("xpu")
+    assert use("on", "moss-pro", "ja", device="xpu") == AlignerUse("xpu")
+    assert use("on", "moss-pro", "en") == AlignerUse("cuda")  # no Whisper without a card, even under `on`
     gpu_on = True
-    assert [joint_stage.uses_aligner("auto", b, "ja", gpu_tier="standard", device="cuda")
-            for b in backends] == [True, True, True, False, False]
+    assert [use("auto", b, "ja", gpu_tier="standard", device="cuda") for b in backends] == [
+        cuda_ja, cuda_ja, AlignerUse("cuda"), None, None]
     assert ("standard", "cuda") in gpu
-    assert not joint_stage.uses_aligner("auto", "moss-pro", "th")
-    assert [joint_stage.uses_aligner("on", b, "ja") for b in backends] == [True, True, True, False, False]
-    assert not joint_stage.uses_aligner("off", "moss-local", "ja")
-    assert joint_stage.uses_aligner("auto", "moss-local", None)  # no --language: most likely one it knows
-    assert not joint_stage.uses_aligner("auto", "moss-local", "th")  # local MOSS transcribes it, the aligner does not
-    assert joint_stage.uses_aligner("on", "moss-local", "th")
+    assert use("auto", "moss-pro", "en") == AlignerUse("cuda")  # English: the aligner alone is closer
+    assert use("auto", "moss-pro", None) == cuda_ja  # Whisper detects each segment's language, skips English
+    assert use("on", "moss-pro", "en") == cuda_on
+    assert [use("on", b, "ja") for b in backends] == [cuda_on, cuda_on, AlignerUse("cuda"), None, None]
+    assert use("auto", "moss-pro", "th") is None  # not one of the aligner's languages
+    assert use("on", "moss-local", "th") == cuda_on
+    assert use("off", "moss-local", "ja") is None
+    assert use("auto", "moss-local", None) == cuda_ja  # no --language: most likely one it knows
+    missing.add("faster_whisper")
+    assert use("auto", "moss-pro", "ja") == AlignerUse("cuda")
+    missing.add("transformers")  # a `[cloud]`-only install: no aligner under `auto`, and no warning about it
+    gpu_on = False
+    assert use("auto", "moss-pro", "ja") is None and use("auto", "moss-local", "ja") == AlignerUse("cuda")
+    assert use("on", "moss-pro", "ja") == AlignerUse("cuda")  # asked for: it fails with a warning
+    assert AlignerUse("cuda", whisper=True).retime("ja") == whisper_align.Retime("ja", False)
+    assert AlignerUse("cuda").retime("ja") is None
     with pytest.raises(ValueError, match="--asr-aligner must be one of"):
-        joint_stage.uses_aligner("true", "moss-local", "ja")
+        use("true", "moss-local", "ja")
 
 
 def test_the_aligners_gpu_check_says_yes_only_with_a_gpu_tier_a_usable_card_and_transformers(monkeypatch):
@@ -672,6 +848,7 @@ def test_the_aligners_gpu_check_says_yes_only_with_a_gpu_tier_a_usable_card_and_
 def test_a_failing_aligner_leaves_local_moss_on_silero_and_is_released(tmp_path, monkeypatch):
     """Local MOSS aligns by default, and an aligner that cannot load (no download, no memory) costs the long
     segments their aligned times, not the task: its transcript is not cached, so failing would mean decoding again."""
+    pytest.importorskip("nagisa")  # Japanese lines split by word group
     from finesub.media import ffmpeg
     from finesub.speech.joint import aligner as A
 
@@ -692,16 +869,26 @@ def test_a_failing_aligner_leaves_local_moss_on_silero_and_is_released(tmp_path,
     monkeypatch.setattr(A, "release", lambda: released.append(True))
 
     monkeypatch.setattr(joint_stage, "current_reporter", lambda: WarningCodeRecorder(warned))
+
+    asked = []
+    monkeypatch.setattr(sbd, "loaded", lambda: "model")
+    monkeypatch.setattr(sbd, "sentence_ends", lambda model, words: asked.append(len(words)))
     out = joint_stage.run(source, backend="moss-local", output_path=tmp_path / "a-aligned.json",
                           cache_root=tmp_path / "c", language="ja")
     record = json.loads(out.read_text(encoding="utf-8"))["metadata"][joint_stage.METADATA_KEY]
     assert (record["timing"], record["aligned"], record["aligner_error"]) == ("S5b", 0, "no weights")
+    assert asked and record["sentence_boundary_model"] is True  # MOSS lines take the sentence evidence
+    assert "clause_bonus" not in record  # Chinese only
     assert warned == ["joint-aligner"] and released == [True]
     assert "".join(s["text"] for s in json.loads(out.read_text(encoding="utf-8"))["segments"]) == units[0].text
 
 
-def test_moss_pro_and_its_line_timing_decode_the_source_once(tmp_path, monkeypatch):
-    """MOSS Pro reads the samples for its gap check and the stage again for the timing: one decode for both."""
+@pytest.mark.parametrize("language", ["ja", "zh"])
+def test_moss_pro_and_its_line_timing_decode_the_source_once(tmp_path, monkeypatch, language):
+    """MOSS Pro reads the samples for its gap check and the stage again for the timing: one decode for both. Its
+    Chinese lines take the clause evidence, as every backend's do."""
+    if language == "ja":
+        pytest.importorskip("nagisa")  # Japanese lines split by word group
     from finesub.media import ffmpeg
     from finesub.speech.joint import mosspro
 
@@ -720,9 +907,14 @@ def test_moss_pro_and_its_line_timing_decode_the_source_once(tmp_path, monkeypat
 
     monkeypatch.setattr(mosspro, "transcribe", transcribe)
     monkeypatch.setattr(joint_stage, "gpu_allowed", lambda tier, device: False)
-    joint_stage.run(source, backend="moss-pro", output_path=tmp_path / "a-aligned.json", cache_root=tmp_path / "c",
-                    language="ja")
+    from finesub.speech.joint import sbd
+
+    monkeypatch.setattr(sbd, "loaded", lambda: None)  # the model is a large download; not what this test is about
+    out = joint_stage.run(source, backend="moss-pro", output_path=tmp_path / "a-aligned.json",
+                          cache_root=tmp_path / "c", language=language)
     assert decodes == [source]
+    record = json.loads(out.read_text(encoding="utf-8"))["metadata"][joint_stage.METADATA_KEY]
+    assert record.get("clause_bonus") == (L.CLAUSE_BONUS if language == "zh" else None)
 
 
 def test_mai2_route_is_the_first_configured_vercel_openrouter_azure(monkeypatch):
@@ -737,3 +929,24 @@ def test_mai2_route_is_the_first_configured_vercel_openrouter_azure(monkeypatch)
     assert (via, caller.endpoint) == ("azure", azure[joint_stage.AZURE_ENDPOINT_ENV])
     with pytest.raises(joint_stage.JointAsrError, match="FINESUB_KEY_VERCEL_STT"):
         joint_stage._mai2_caller({})
+
+
+def test_mai2_without_a_route_keeps_the_route_its_cache_was_made_with(tmp_path, monkeypatch):
+    """No MAI2 key: the via is the cache's (a cache-served task warns of no changed route), else Vercel's."""
+    from finesub import api_keys
+    from finesub.speech.joint import mai2
+    from finesub.speech.joint.cache import audio_fingerprint
+
+    source = tmp_path / "talk.wav"
+    source.write_bytes(b"x" * 100)
+    seen = []
+    monkeypatch.setattr(api_keys, "read_dotenv", lambda *a, **k: {})
+    monkeypatch.delenv(joint_stage.AZURE_ENDPOINT_ENV, raising=False)
+    monkeypatch.setattr(mai2, "transcribe", lambda src, *, via, **_: seen.append(via) or "t")
+    args = dict(language="ja", duration=8.0, repair="on", aligner=None)
+    joint_stage.transcribe("mai2", source, cache_root=tmp_path / "a", **args)
+    (tmp_path / "b" / "mai2").mkdir(parents=True)
+    (tmp_path / "b" / "mai2" / "identity.json").write_text(
+        json.dumps({"audio": audio_fingerprint(source), "via": "azure"}), encoding="utf-8")
+    joint_stage.transcribe("mai2", source, cache_root=tmp_path / "b", **args)
+    assert seen == ["vercel", "azure"]

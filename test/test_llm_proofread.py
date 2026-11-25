@@ -39,6 +39,7 @@ def test_a_reply_lists_the_changed_lines():
     ("2|1|a||c", "纠错文或译文是空的"),
     ("2|1|a|\\n|c", "纠错文或译文是空的"),
     ("1|1|草稿|草稿|最终答案：<proofread>\n2|1|a|b|c", "又写了 <proofread>"),
+    ("2|1|=|=|没改", "都写了 =，这一行什么也没改"),
 ])
 def test_a_reply_that_does_not_read_is_refused_with_its_reason(body, reason):
     with pytest.raises(answers.AnswerError, match=reason):
@@ -52,6 +53,9 @@ def test_the_agent_validator_refuses_what_the_harness_refuses():
     assert validate("<proofread>\n2|1|a|b|c\n</proofread>", {}).status == "accepted"
     refused = validate("<proofread>\n3|1|a|b|c\n</proofread>", {})
     assert refused.status != "accepted" and "序号不在 1–2 里" in " ".join(refused.errors)
+    assert validate("<proofread>\n2|1|=|b|c\n</proofread>", {}).status == "accepted"
+    unchanged = validate("<proofread>\n2|1|=|=|c\n</proofread>", {})
+    assert unchanged.status != "accepted" and "这一行什么也没改" in " ".join(unchanged.errors)
     # leaked reasoning: judged by its answer, handed back as submitted for the harness to strip and record
     leaked = "thought\nThe <proofread> block.\n<proofread>\n2|1|a|b|c\n</proofread>"
     assert validate(leaked, {}).artifact == leaked
@@ -232,6 +236,20 @@ def test_changes_rewrite_the_text_and_keep_the_rest_of_the_row(tmp_path):
     dumped = json.loads((tmp_path / proofread_run.INPUT_NAME).read_text(encoding="utf-8"))
     assert [w["chunk_id"] for w in dumped["windows"]] == ["0001", "0002"] and dumped["lines"][0]["corrected"] == "行1"
     assert dumped["profile_id"] == PROFILE.profile_id and dumped["title"] == "clip"
+
+
+def test_a_cell_left_as_equals_keeps_the_rows_own_text(tmp_path):
+    def answer(user, messages):
+        return "<proofread>\n1|1|=|第一行，改长了|漏译\n2|4|行二|=|听错\n</proofread>"
+
+    segments = rows(2)
+    result = proofread(tmp_path, FakeClient(answer), segments, windows([1, 2]))
+    assert [(row.corrected_text, row.translation) for row in result.segments] == [("行1", "第一行，改长了"),
+                                                                                   ("行二", "译2")]
+    assert result.changes == [
+        {"row": 1, "window": "0001", "source_ids": ["1"], "category": 1, "why": "漏译",
+         "translation": ["译1", "第一行，改长了"]},
+        {"row": 2, "window": "0001", "source_ids": ["2"], "category": 4, "why": "听错", "corrected": ["行2", "行二"]}]
 
 
 def test_a_reply_that_does_not_read_is_asked_again_with_the_reason(tmp_path):

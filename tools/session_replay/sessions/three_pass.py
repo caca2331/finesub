@@ -26,6 +26,7 @@ from finesub.llm.stages.speaker_judge import run as judge_run
 from finesub.llm.stages.speaker_judge.prompt import Candidate, rows_of
 from finesub.llm.stages.speaker_judge.windows import JudgeWindow
 from finesub.speech.diarization import judgments as sidecar
+from finesub.speech.joint import voices as joint_voices
 from finesub.subtitles.stable_rows import read_rows
 
 from ..fixture import resolve_run_layout
@@ -140,11 +141,14 @@ class SpeakerJudgeSessionAdapter:
         if shape not in (None, sidecar.SHAPE_TRACKED):
             raise ValueError(f"裁判记的 pass 1 是 {shape!r}，生产里只有带轨号的 pass 1（{sidecar.SHAPE_TRACKED!r}），重放不了")
         serial = task_profile.continuity == "serial"
-        carried = judge_run.carried_tracks(segments, found, unit) if serial else []
         summaries = dump.get("summaries") or {}
         inputs = judge_run.JudgeInputs(dump["title"],
-                                       tuple(Candidate(c["name"], tuple(c.get("others") or ())) for c in dump["pool"]),
-                                       summary=lambda _ids: summaries.get(unit.id, summaries.get(chunk, "")))
+                                       tuple(Candidate(c["name"], tuple(c.get("others") or ()), c.get("note") or "") for c in dump["pool"]),
+                                       summary=lambda _ids: summaries.get(unit.id, summaries.get(chunk, "")),
+                                       # the comparison the run wrote beside the stable (a cloud task's), as it saw it
+                                       voices=joint_voices.read(stable, segments))
+        # what the units before it left this one (a cloud task's person table among it), and its number
+        relay = judge_run.relayed(segments, found, unit, rows, inputs.pool, serial)
         audio = Path(dump["audio"]) if dump.get("audio") else None
         if audio is not None and not audio.is_file():
             raise FileNotFoundError(f"裁判听的音频不在了：{audio}")
@@ -160,8 +164,8 @@ class SpeakerJudgeSessionAdapter:
             try:
                 return judge_run._judge_unit(
                     session, rows, JudgeWindow(unit.id, chunk, unit.low, unit.high), inputs,
-                    tracks=sidecar.profile_tracks([row.speaker for row in rows]), carried=carried, audio=audio,
-                    limits=None, counter=None, may_halve=False, shape=shape, segments=segments)
+                    tracks=sidecar.profile_tracks([row.speaker for row in rows]), audio=audio,
+                    limits=None, counter=None, may_halve=False, shape=shape, segments=segments, **relay)
             finally:
                 if previous is None:
                     os.environ.pop(judge_run.MARKS_SWITCH, None)
